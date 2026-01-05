@@ -54,5 +54,7 @@ func (h *CommandHandler) HandleMessage(msg *tgbotapi.Message) {
 		go h.handleSetDNSCommand(args)
 	case "csv":
 		go h.handleCSVCommand(args)
+	case "originssl":
+		go h.handleOriginSSLCommand(args)
 	}
 }

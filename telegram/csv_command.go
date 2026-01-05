@@ -98,7 +98,7 @@ func (h *CommandHandler) csvPromptText() string {
 		}
 		sb.WriteString("- " + a.Label + "\n")
 	}
-	sb.WriteString("- all\n\n请输入：\n/csv all\n或者：\n/csv AAAAA")
+	sb.WriteString("- all\n\n请输入：\n/csv all\n或者：\n/csv 账号标签")
 	return sb.String()
 }
 
