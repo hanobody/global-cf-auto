@@ -156,18 +156,25 @@ func (h *CommandHandler) handleDeleteCommand(args []string) {
 	}
 	domain := strings.ToLower(args[0])
 
-	account, err := h.deleteZone(domain)
+	op := formatOperator(h.operator)
+	account, _, err := h.findZone(domain)
 	if err != nil {
 		if errors.Is(err, cfclient.ErrZoneNotFound) {
-			h.sendText(fmt.Sprintf("域名 %s 不属于任何 Cloudflare 账号，无法删除。", domain))
+			h.sendText(fmt.Sprintf("域名 %s 不存在于 Cloudflare。", domain))
 			return
 		}
-		h.sendText(fmt.Sprintf("删除域名失败: %v", err))
+		h.sendText(fmt.Sprintf("查询域名失败: %v", err))
 		return
 	}
+	confirmMsg := fmt.Sprintf(
+		"⚠️【删除二次确认】\n操作人: %s\n域名: %s\n账号: %s\n\n此操作不可逆，确认要删除该域名（Cloudflare Zone）吗？", op, domain, account.Label,
+	)
 
-	operator := formatOperator(h.operator)
-	h.sendText(fmt.Sprintf("已从账号 %s 删除域名 %s\n操作人: %s", account.Label, domain, operator))
+	buttons := [][]Button{{
+		{Text: "✅ 确认删除", CallbackData: fmt.Sprintf("delete_confirm|%s|%s", account.Label, domain)},
+		{Text: "❌ 取消", CallbackData: fmt.Sprintf("delete_cancel|%s|%s", account.Label, domain)},
+	}}
+	SendTelegramAlertWithButtons(confirmMsg, buttons)
 }
 
 func (h *CommandHandler) handleSetDNSCommand(args []string) {
@@ -176,7 +183,7 @@ func (h *CommandHandler) handleSetDNSCommand(args []string) {
 		return
 	}
 	domain := strings.ToLower(args[0])
-	params := cfclient.DNSRecordParams{  // 直接使用 cfclient 包中的类型
+	params := cfclient.DNSRecordParams{ // 直接使用 cfclient 包中的类型
 		Type:    strings.ToUpper(args[1]),
 		Name:    args[2],
 		Content: args[3],
