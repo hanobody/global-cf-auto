@@ -37,6 +37,7 @@ type Client interface {
 	GetZoneDetails(ctx context.Context, account config.CF, domain string) (ZoneDetail, error)
 	CreateZone(ctx context.Context, account config.CF, domain string) (ZoneDetail, error)
 	UpsertDNSRecord(ctx context.Context, account config.CF, domain string, params DNSRecordParams) (cloudflare.DNSRecord, error)
+	ListZones(ctx context.Context, acc config.CF) ([]ZoneDetail, error)
 }
 
 type apiClient struct{}
@@ -367,4 +368,35 @@ func ensureTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, 30*time.Second)
+}
+func (c *apiClient) ListZones(ctx context.Context, account config.CF) ([]ZoneDetail, error) {
+	ctx, cancel := ensureTimeout(ctx)
+	defer cancel()
+
+	api, err := cloudflare.NewWithAPIToken(account.APIToken)
+	if err != nil {
+		return nil, fmt.Errorf("初始化 Cloudflare 客户端失败 [%s]: %v", account.Label, err)
+	}
+
+	accountID, err := c.GetAccountID(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+
+	zones, err := api.ListZonesContext(ctx, cloudflare.WithZoneFilters("", accountID, ""))
+	if err != nil {
+		return nil, fmt.Errorf("列出 Zone 失败 [%s]: %v", account.Label, err)
+	}
+
+	out := make([]ZoneDetail, 0, len(zones.Result))
+	for _, z := range zones.Result {
+		out = append(out, ZoneDetail{
+			ID:          z.ID,
+			Name:        z.Name,
+			NameServers: z.NameServers,
+			Status:      z.Status,
+			Paused:      z.Paused,
+		})
+	}
+	return out, nil
 }

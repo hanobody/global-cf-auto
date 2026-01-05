@@ -14,10 +14,14 @@ type Sender interface {
 	Send(ctx context.Context, msg string) error
 	SendWithButtons(ctx context.Context, msg string, buttons [][]Button) error
 	StartListener(ctx context.Context, handleCallback func(data string, user *tgbotapi.User), handleMessage func(msg *tgbotapi.Message)) error
+	SendDocumentPath(ctx context.Context, filepath string, caption string) error
 }
 
 type NoopSender struct{}
 
+func (NoopSender) SendDocumentPath(ctx context.Context, filepath string, caption string) error {
+	return nil
+}
 func (NoopSender) Send(ctx context.Context, msg string) error { return nil }
 func (NoopSender) SendWithButtons(ctx context.Context, msg string, buttons [][]Button) error {
 	return nil
@@ -133,4 +137,52 @@ func (s *BotSender) StartListener(ctx context.Context, handleCallback func(data 
 			}
 		}
 	}
+}
+func (s *BotSender) SendDocumentPath(ctx context.Context, filepath string, caption string) error {
+	if filepath == "" {
+		return errors.New("filepath is empty")
+	}
+
+	for attempt := 0; attempt <= s.retryTimes; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.rate.C:
+			result := make(chan error, 1)
+
+			sendCtx := ctx
+			cancel := func() {}
+			if s.timeout > 0 {
+				sendCtx, cancel = context.WithTimeout(ctx, s.timeout)
+			}
+
+			go func() {
+				doc := tgbotapi.NewDocument(s.chatID, tgbotapi.FilePath(filepath))
+				if caption != "" {
+					doc.Caption = caption
+				}
+				_, err := s.bot.Send(doc)
+				result <- err
+			}()
+
+			select {
+			case <-sendCtx.Done():
+				cancel()
+				if attempt == s.retryTimes {
+					return fmt.Errorf("发送文件超时: %w", sendCtx.Err())
+				}
+				continue
+			case err := <-result:
+				cancel()
+				if err == nil {
+					return nil
+				}
+				if attempt == s.retryTimes {
+					return fmt.Errorf("发送文件失败: %w", err)
+				}
+				time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+			}
+		}
+	}
+	return nil
 }
