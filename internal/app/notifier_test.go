@@ -39,6 +39,13 @@ func (f *fakeSender) SendWithButtons(ctx context.Context, msg string, buttons []
 	}
 	return nil
 }
+func (f *fakeSender) SendDocumentPath(ctx context.Context, filepath string, caption string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.messages = append(f.messages, "DOC:"+filepath+"|"+caption)
+	return nil
+}
 
 func (f *fakeSender) StartListener(ctx context.Context, handleCallback func(data string, user *tgbotapi.User), handleMessage func(msg *tgbotapi.Message)) error {
 	<-ctx.Done()
@@ -68,6 +75,9 @@ func (f *fakeCF) CreateZone(ctx context.Context, account config.CF, domain strin
 }
 func (f *fakeCF) UpsertDNSRecord(ctx context.Context, account config.CF, domain string, params cfclient.DNSRecordParams) (cloudflare.DNSRecord, error) {
 	return cloudflare.DNSRecord{}, nil
+}
+func (f *fakeCF) ListZones(ctx context.Context, account config.CF) ([]cfclient.ZoneDetail, error) {
+	return nil, nil
 }
 func TestNotifierSendsAlertsAndDeletes(t *testing.T) {
 	sender := &fakeSender{}
