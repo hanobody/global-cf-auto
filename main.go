@@ -10,6 +10,7 @@ import (
 	"DomainC/config"
 	"DomainC/domain"
 	"DomainC/internal/app"
+	"DomainC/registrarclient"
 	"DomainC/scheduler"
 	"DomainC/telegram"
 )
@@ -29,7 +30,7 @@ func main() {
 	defer cancel()
 
 	cfClient := cfclient.NewClient()
-
+	registrarManager := registrarclient.NewManager(nil, config.Cfg.Registrars)
 	var sender telegram.Sender
 	botSender, err := telegram.NewBotSender(
 		config.Cfg.Telegram.BotToken,
@@ -46,7 +47,7 @@ func main() {
 		sender = botSender
 	}
 
-	commandHandler := telegram.NewCommandHandler(cfClient, sender, config.Cfg.CloudflareAccounts, int64(config.Cfg.Telegram.ChatID))
+	commandHandler := telegram.NewCommandHandler(cfClient, registrarManager, sender, config.Cfg.CloudflareAccounts, int64(config.Cfg.Telegram.ChatID))
 
 	go func() {
 		if err := sender.StartListener(ctx, callback.HandleCallback, commandHandler.HandleMessage); err != nil {

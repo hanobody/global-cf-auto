@@ -7,7 +7,6 @@ vpbet3.ph|Shengshi6688|
 vpbet.br.com|Shengshi6688|
 vpbet.jpn.com|Shengshi6688|
 vpbet.sa.com|Shengshi6688|
-vpgame1.us|Shengshi6688|
 vpgame1.us.com|Shengshi6688|
 vpgame2.us.com|Shengshi6688|
 vpgame3.us.com|Shengshi6688|
@@ -23,7 +22,6 @@ vpbet8.ph|yuang6496|
 vpbet.eu.com|yuang6496|
 vpbet.ph|yuang6496|
 vpbet.us.com|yuang6496|
-vpgame8.us|yuang6496|
 vpgame.us.com|yuang6496|
 vpjili.ph|yuang6496|
 vpwin.ph|yuang6496|
