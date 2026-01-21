@@ -58,6 +58,14 @@ func (h *CommandHandler) HandleMessage(msg *tgbotapi.Message) {
 		go h.handleOriginSSLCommand(args)
 	case "domainsource":
 		go h.handleDomainSourceCommand(args)
+	case "cls":
+		go h.handleCLSCommand(args)
+	case "record":
+		go h.handleRecordCommand(args)
+	case "checkcf":
+		go h.handleCheckCFCommand(args)
+	case "deldns":
+		go h.handleDelDNSCommand(args)
 	}
 
 }

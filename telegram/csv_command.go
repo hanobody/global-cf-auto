@@ -42,7 +42,7 @@ func (h *CommandHandler) handleCSVCommand(args []string) {
 		}
 		targets = []config.CF{*acc}
 	}
-
+	h.sendText("要遍历所有账号的所有解析记录，且要控制查询速度，避免被 Cloudflare 限制，因此过程较慢，请耐心等待...")
 	// 3) 拉取数据并生成 CSV
 	ctx := context.Background()
 	csvBytes, filename, err := h.buildDNSExportCSV(ctx, targets)
