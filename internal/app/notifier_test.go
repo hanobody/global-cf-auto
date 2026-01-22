@@ -76,8 +76,14 @@ func (f *fakeCF) CreateZone(ctx context.Context, account config.CF, domain strin
 func (f *fakeCF) UpsertDNSRecord(ctx context.Context, account config.CF, domain string, params cfclient.DNSRecordParams) (cloudflare.DNSRecord, error) {
 	return cloudflare.DNSRecord{}, nil
 }
+func (f *fakeCF) DeleteDNSRecord(ctx context.Context, account config.CF, domain string, recordName string) (int, error) {
+	return 0, nil
+}
 func (f *fakeCF) ListZones(ctx context.Context, account config.CF) ([]cfclient.ZoneDetail, error) {
 	return nil, nil
+}
+func (f *fakeCF) PurgeZoneCache(ctx context.Context, account config.CF, zoneID string) error {
+	return nil
 }
 
 func (f *fakeCF) CreateOriginCertificate(ctx context.Context, account config.CF, hostnames []string) (cfclient.OriginCert, error) {

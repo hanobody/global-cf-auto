@@ -60,9 +60,11 @@ type Client interface {
 	GetZoneDetails(ctx context.Context, account config.CF, domain string) (ZoneDetail, error)
 	CreateZone(ctx context.Context, account config.CF, domain string) (ZoneDetail, error)
 	UpsertDNSRecord(ctx context.Context, account config.CF, domain string, params DNSRecordParams) (cloudflare.DNSRecord, error)
+	DeleteDNSRecord(ctx context.Context, account config.CF, domain string, recordName string) (int, error)
 	ListZones(ctx context.Context, acc config.CF) ([]ZoneDetail, error)
 	CreateOriginCertificate(ctx context.Context, account config.CF, hostnames []string) (OriginCert, error)
 	ListOriginCACertificates(ctx context.Context, account config.CF) ([]OriginCACertInfo, error)
+	PurgeZoneCache(ctx context.Context, account config.CF, zoneID string) error
 }
 
 type apiClient struct{}
@@ -149,6 +151,59 @@ func (c *apiClient) CreateZone(ctx context.Context, account config.CF, domain st
 		Status:      zone.Status,
 		Paused:      zone.Paused,
 	}, nil
+}
+func (c *apiClient) DeleteDNSRecord(ctx context.Context, account config.CF, domain string, recordName string) (int, error) {
+	ctx, cancel := ensureTimeout(ctx)
+	defer cancel()
+
+	api, err := cloudflare.NewWithAPIToken(account.APIToken)
+	if err != nil {
+		return 0, fmt.Errorf("初始化客户端失败 [%s]: %v", account.Label, err)
+	}
+
+	zones, err := api.ListZonesContext(ctx, cloudflare.WithZoneFilters(domain, "", ""))
+	if err != nil {
+		return 0, fmt.Errorf("获取 Zone 失败: %v", err)
+	}
+	if len(zones.Result) == 0 {
+		return 0, fmt.Errorf("%w: %s", ErrZoneNotFound, domain)
+	}
+	zoneID := cloudflare.ZoneIdentifier(zones.Result[0].ID)
+
+	searchParams := cloudflare.ListDNSRecordsParams{
+		Name: fqdn(recordName, domain),
+	}
+	records, _, err := api.ListDNSRecords(ctx, zoneID, searchParams)
+	if err != nil {
+		return 0, fmt.Errorf("查询解析记录失败: %v", err)
+	}
+	if len(records) == 0 {
+		return 0, nil
+	}
+
+	deleted := 0
+	for _, record := range records {
+		if err := api.DeleteDNSRecord(ctx, zoneID, record.ID); err != nil {
+			return deleted, fmt.Errorf("删除解析记录失败: %v", err)
+		}
+		deleted++
+	}
+
+	return deleted, nil
+}
+func (c *apiClient) PurgeZoneCache(ctx context.Context, account config.CF, zoneID string) error {
+	ctx, cancel := ensureTimeout(ctx)
+	defer cancel()
+
+	api, err := cloudflare.NewWithAPIToken(account.APIToken)
+	if err != nil {
+		return fmt.Errorf("初始化 Cloudflare 客户端失败 [%s]: %v", account.Label, err)
+	}
+	_, err = api.PurgeCache(ctx, zoneID, cloudflare.PurgeCacheRequest{Everything: true})
+	if err != nil {
+		return fmt.Errorf("清理缓存失败: %v", err)
+	}
+	return nil
 }
 
 // GetZoneDetails 获取 Zone 详情（修复版：使用 Account ID 过滤）
@@ -237,8 +292,6 @@ func (c *apiClient) PauseDomain(ctx context.Context, account config.CF, domain s
 	}
 
 	zoneID := zones.Result[0].ID
-
-	// 使用 ZoneSetPaused 方法直接设置 paused 状态（v0.116.0 支持此方法）
 	_, err = api.ZoneSetPaused(ctx, zoneID, pause)
 	if err != nil {
 		return fmt.Errorf("设置暂停状态失败（pause=%v）: %v", pause, err)
