@@ -92,6 +92,21 @@ func (f *fakeCF) CreateOriginCertificate(ctx context.Context, account config.CF,
 func (f *fakeCF) ListOriginCACertificates(ctx context.Context, account config.CF) ([]cfclient.OriginCACertInfo, error) {
 	return nil, nil
 }
+func (f *fakeCF) ListCustomLists(ctx context.Context, account config.CF) ([]cloudflare.List, error) {
+	return nil, nil
+}
+func (f *fakeCF) GetCustomList(ctx context.Context, account config.CF, listID string) (cloudflare.List, error) {
+	return cloudflare.List{}, nil
+}
+func (f *fakeCF) ListCustomListItems(ctx context.Context, account config.CF, listID string) ([]cloudflare.ListItem, error) {
+	return nil, nil
+}
+func (f *fakeCF) CreateCustomListItem(ctx context.Context, account config.CF, listID string, ip string, comment string) ([]cloudflare.ListItem, error) {
+	return nil, nil
+}
+func (f *fakeCF) DeleteCustomListItem(ctx context.Context, account config.CF, listID string, itemID string) ([]cloudflare.ListItem, error) {
+	return nil, nil
+}
 
 func TestNotifierSendsAlertsAndDeletes(t *testing.T) {
 	sender := &fakeSender{}
