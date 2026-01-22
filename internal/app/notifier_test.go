@@ -46,8 +46,16 @@ func (f *fakeSender) SendDocumentPath(ctx context.Context, filepath string, capt
 	f.messages = append(f.messages, "DOC:"+filepath+"|"+caption)
 	return nil
 }
-
-func (f *fakeSender) StartListener(ctx context.Context, handleCallback func(data string, user *tgbotapi.User), handleMessage func(msg *tgbotapi.Message)) error {
+func (f *fakeSender) EditButtons(ctx context.Context, chatID int64, messageID int, buttons [][]telegram.Button) error {
+	return nil
+}
+func (f *fakeSender) ClearButtons(ctx context.Context, chatID int64, messageID int) error {
+	return nil
+}
+func (f *fakeSender) AnswerCallback(ctx context.Context, callbackID, text string) error {
+	return nil
+}
+func (f *fakeSender) StartListener(ctx context.Context, handleCallback func(cb *tgbotapi.CallbackQuery), handleMessage func(msg *tgbotapi.Message)) error {
 	<-ctx.Done()
 	return nil
 }

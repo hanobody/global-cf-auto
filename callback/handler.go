@@ -14,7 +14,9 @@ import (
 
 // HandleCallback 处理来自 Notifier 的内联按钮回调
 // callbackData 格式：action|accountLabel|domain|[paused yes/no]
-func HandleCallback(callbackData string, user *tgbotapi.User) {
+func HandleCallback(cb *tgbotapi.CallbackQuery) {
+	callbackData := cb.Data
+	user := cb.From
 	parts := strings.Split(callbackData, "|")
 	if len(parts) < 1 {
 		log.Printf("无效的回调数据: %s", callbackData)
@@ -23,11 +25,14 @@ func HandleCallback(callbackData string, user *tgbotapi.User) {
 
 	action := parts[0]
 
-	if strings.HasPrefix(action, "iplist_") {
-		handleIPListCallback(action, parts, user)
+	// 避免“处理中”按钮再触发一堆日志
+	if action == "noop" {
 		return
 	}
-
+	if strings.HasPrefix(action, "iplist_") {
+		handleIPListCallback(action, parts, user, cb)
+		return
+	}
 	if len(parts) < 3 {
 		log.Printf("无效的回调数据: %s", callbackData)
 		return
@@ -131,7 +136,7 @@ func HandleCallback(callbackData string, user *tgbotapi.User) {
 		}()
 	}
 }
-func handleIPListCallback(action string, parts []string, user *tgbotapi.User) {
+func handleIPListCallback(action string, parts []string, user *tgbotapi.User, cb *tgbotapi.CallbackQuery) {
 	if len(parts) < 2 {
 		log.Printf("无效的 iplist 回调数据: %v", parts)
 		return
@@ -152,6 +157,7 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User) {
 	}
 
 	client := cfclient.NewClient()
+	sender := telegram.DefaultSender()
 	switch action {
 	case "iplist_edit":
 		listID := payload.ListID
@@ -167,38 +173,13 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User) {
 				return
 			}
 			pages := telegram.BuildIPListPages(accountLabel, list.Name, listID, items, true)
-			sender := telegram.DefaultSender()
 			for _, page := range pages {
 				if err := sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
 					log.Printf("发送 IP 列表失败: %v", err)
 				}
 			}
 		}()
-	// case "iplist_delete":
-	// 	listID := payload.ListID
-	// 	itemID := payload.ItemID
-	// 	if itemID == "" {
-	// 		telegram.SendTelegramAlert("删除失败：缺少条目 ID。")
-	// 		return
-	// 	}
-	// 	go func() {
-	// 		items, err := client.DeleteCustomListItem(context.Background(), *account, listID, itemID)
-	// 		if err != nil {
-	// 			telegram.SendTelegramAlert(fmt.Sprintf("删除 IP 失败: %v", err))
-	// 			return
-	// 		}
-	// 		listName := listID
-	// 		if list, err := client.GetCustomList(context.Background(), *account, listID); err == nil && list.Name != "" {
-	// 			listName = list.Name
-	// 		}
-	// 		pages := telegram.BuildIPListPages(accountLabel, listName, listID, items, true)
-	// 		sender := telegram.DefaultSender()
-	// 		for _, page := range pages {
-	// 			if err := sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
-	// 				log.Printf("发送 IP 列表失败: %v", err)
-	// 			}
-	// 		}
-	// 	}()
+
 	case "iplist_delete":
 		listID := payload.ListID
 		itemID := payload.ItemID
@@ -226,6 +207,17 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User) {
 			telegram.SendTelegramAlertWithButtons(confirmMsg, buttons)
 		}()
 	case "iplist_confirm":
+
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(),
+				cb.Message.Chat.ID,
+				cb.Message.MessageID,
+				[][]telegram.Button{{
+					{Text: "✅ 已确认，处理中…", CallbackData: "noop"},
+				}},
+			)
+		}
+
 		listID := payload.ListID
 		itemID := payload.ItemID
 		if itemID == "" {
@@ -240,18 +232,25 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User) {
 				return
 			}
 
+			telegram.SendTelegramAlert(fmt.Sprintf("✅ 删除 IP 成功（操作人: %s）", user.UserName))
+
+			if cb.Message != nil {
+				_ = sender.EditButtons(context.Background(),
+					cb.Message.Chat.ID,
+					cb.Message.MessageID,
+					[][]telegram.Button{{
+						{Text: "✅ 已完成", CallbackData: "noop"},
+					}},
+				)
+
+				_ = sender.ClearButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID)
+			}
+
 			listName := listID
 			if list, err := client.GetCustomList(context.Background(), *account, listID); err == nil && list.Name != "" {
 				listName = list.Name
 			}
-
-			telegram.SendTelegramAlert(fmt.Sprintf("✅ 删除 IP 成功\n操作人: %s\n账号: %s\n列表: %s\n条目ID: %s",
-				user.UserName, accountLabel, listName, itemID,
-			))
-
-			// 删除后刷新列表页面
 			pages := telegram.BuildIPListPages(accountLabel, listName, listID, items, true)
-			sender := telegram.DefaultSender()
 			for _, page := range pages {
 				if err := sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
 					log.Printf("发送 IP 列表失败: %v", err)
