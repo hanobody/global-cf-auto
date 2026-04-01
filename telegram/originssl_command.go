@@ -1,7 +1,7 @@
 package telegram
 
 import (
-	"bytes"
+	// "bytes"
 	"context"
 	"fmt"
 	"os"
@@ -129,10 +129,10 @@ func (h *CommandHandler) handleOriginSSLCommand(args []string) {
 		}
 		sb.WriteString("\nACM 导入结果：\n")
 		if len(okLines) > 0 {
-			sb.WriteString("✅ 成功：\n" + strings.Join(okLines, "\n") + "\n")
+			sb.WriteString("✅ 成功：\n```text\n" + strings.Join(okLines, "\n") + "\n```\n")
 		}
 		if len(failLines) > 0 {
-			sb.WriteString("\n❌ 失败：\n" + strings.Join(failLines, "\n") + "\n")
+			sb.WriteString("\n❌ 失败：\n```text\n" + strings.Join(failLines, "\n") + "\n```\n")
 		}
 	}
 	h.sendText(sb.String())
@@ -140,69 +140,69 @@ func (h *CommandHandler) handleOriginSSLCommand(args []string) {
 	// --------- 发回两个文件：cert+csr 与 key ---------
 
 	// (1) cert 文件：头信息 + CERT + CSR（不包含私钥）
-	var certOut bytes.Buffer
-	certOut.WriteString("### Cloudflare Origin CA Certificate\n")
-	certOut.WriteString(fmt.Sprintf("Account: %s\n", acc.Label))
-	certOut.WriteString(fmt.Sprintf("Zone: %s\n", domain))
-	certOut.WriteString(fmt.Sprintf("Hostnames: %s\n", strings.Join(hostnames, ", ")))
-	if cert.ID != "" {
-		certOut.WriteString(fmt.Sprintf("CertID: %s\n", cert.ID))
-	}
-	if !cert.ExpiresOn.IsZero() {
-		certOut.WriteString(fmt.Sprintf("ExpiresOn: %s\n", cert.ExpiresOn.Format(time.RFC3339)))
-	}
-	certOut.WriteString("\n")
+	// var certOut bytes.Buffer
+	// certOut.WriteString("### Cloudflare Origin CA Certificate\n")
+	// certOut.WriteString(fmt.Sprintf("Account: %s\n", acc.Label))
+	// certOut.WriteString(fmt.Sprintf("Zone: %s\n", domain))
+	// certOut.WriteString(fmt.Sprintf("Hostnames: %s\n", strings.Join(hostnames, ", ")))
+	// if cert.ID != "" {
+	// 	certOut.WriteString(fmt.Sprintf("CertID: %s\n", cert.ID))
+	// }
+	// if !cert.ExpiresOn.IsZero() {
+	// 	certOut.WriteString(fmt.Sprintf("ExpiresOn: %s\n", cert.ExpiresOn.Format(time.RFC3339)))
+	// }
+	// certOut.WriteString("\n")
 
-	certOut.WriteString("-----BEGIN CERTIFICATE-----\n")
-	certOut.WriteString(strings.TrimSpace(cert.CertificatePEM))
-	certOut.WriteString("\n-----END CERTIFICATE-----\n\n")
+	// certOut.WriteString("-----BEGIN CERTIFICATE-----\n")
+	// certOut.WriteString(strings.TrimSpace(cert.CertificatePEM))
+	// certOut.WriteString("\n-----END CERTIFICATE-----\n\n")
 
-	if strings.TrimSpace(cert.CSRPEM) != "" {
-		certOut.WriteString("-----BEGIN CERTIFICATE REQUEST-----\n")
-		certOut.WriteString(strings.TrimSpace(cert.CSRPEM))
-		certOut.WriteString("\n-----END CERTIFICATE REQUEST-----\n")
-	}
+	// if strings.TrimSpace(cert.CSRPEM) != "" {
+	// 	certOut.WriteString("-----BEGIN CERTIFICATE REQUEST-----\n")
+	// 	certOut.WriteString(strings.TrimSpace(cert.CSRPEM))
+	// 	certOut.WriteString("\n-----END CERTIFICATE REQUEST-----\n")
+	// }
 
-	// (2) key 文件：仅私钥
-	var keyOut bytes.Buffer
-	keyOut.WriteString("-----BEGIN PRIVATE KEY-----\n")
-	keyOut.WriteString(strings.TrimSpace(cert.PrivateKeyPEM))
-	keyOut.WriteString("\n-----END PRIVATE KEY-----\n")
+	// // (2) key 文件：仅私钥
+	// var keyOut bytes.Buffer
+	// keyOut.WriteString("-----BEGIN PRIVATE KEY-----\n")
+	// keyOut.WriteString(strings.TrimSpace(cert.PrivateKeyPEM))
+	// keyOut.WriteString("\n-----END PRIVATE KEY-----\n")
 
-	ts := time.Now().Format("20060102-150405")
-	certFilename := sanitizeFilename(fmt.Sprintf("origin-ca-%s-%s-cert.pem", domain, ts))
-	keyFilename := sanitizeFilename(fmt.Sprintf("origin-ca-%s-%s-key.pem", domain, ts))
+	// ts := time.Now().Format("20060102-150405")
+	// certFilename := sanitizeFilename(fmt.Sprintf("origin-ca-%s-%s-cert.pem", domain, ts))
+	// keyFilename := sanitizeFilename(fmt.Sprintf("origin-ca-%s-%s-key.pem", domain, ts))
 
-	certPath, err := writeTempAndMove(certFilename, certOut.Bytes(), 0644)
-	if err != nil {
-		h.sendText(fmt.Sprintf("写入证书文件失败: %v", err))
-		return
-	}
-	defer os.Remove(certPath)
+	// certPath, err := writeTempAndMove(certFilename, certOut.Bytes(), 0644)
+	// if err != nil {
+	// 	h.sendText(fmt.Sprintf("写入证书文件失败: %v", err))
+	// 	return
+	// }
+	// defer os.Remove(certPath)
 
-	keyPath, err := writeTempAndMove(keyFilename, keyOut.Bytes(), 0600)
-	if err != nil {
-		h.sendText(fmt.Sprintf("写入私钥文件失败: %v", err))
-		return
-	}
-	defer os.Remove(keyPath)
+	// keyPath, err := writeTempAndMove(keyFilename, keyOut.Bytes(), 0600)
+	// if err != nil {
+	// 	h.sendText(fmt.Sprintf("写入私钥文件失败: %v", err))
+	// 	return
+	// }
+	// defer os.Remove(keyPath)
 
-	certCaption := "📄 Cloudflare Origin CA 证书（Certificate + CSR）"
-	if !cert.ExpiresOn.IsZero() {
-		certCaption = fmt.Sprintf("📄 Cloudflare Origin CA 证书（Certificate + CSR）\n到期：%s", cert.ExpiresOn.Format(time.RFC3339))
-	}
-	keyCaption := "🔐 Cloudflare Origin CA 私钥（Private Key）"
+	// certCaption := "📄 Cloudflare Origin CA 证书（Certificate + CSR）"
+	// if !cert.ExpiresOn.IsZero() {
+	// 	certCaption = fmt.Sprintf("📄 Cloudflare Origin CA 证书（Certificate + CSR）\n到期：%s", cert.ExpiresOn.Format(time.RFC3339))
+	// }
+	// keyCaption := "🔐 Cloudflare Origin CA 私钥（Private Key）"
 
-	if err := h.Sender.SendDocumentPath(context.Background(), certPath, certCaption); err != nil {
-		h.sendText(fmt.Sprintf("发送证书文件失败: %v", err))
-		return
-	}
-	if err := h.Sender.SendDocumentPath(context.Background(), keyPath, keyCaption); err != nil {
-		h.sendText(fmt.Sprintf("发送私钥文件失败: %v", err))
-		return
-	}
+	// if err := h.Sender.SendDocumentPath(context.Background(), certPath, certCaption); err != nil {
+	// 	h.sendText(fmt.Sprintf("发送证书文件失败: %v", err))
+	// 	return
+	// }
+	// if err := h.Sender.SendDocumentPath(context.Background(), keyPath, keyCaption); err != nil {
+	// 	h.sendText(fmt.Sprintf("发送私钥文件失败: %v", err))
+	// 	return
+	// }
 
-	h.sendText(fmt.Sprintf("✅ 源站证书处理完成：%s（账号：%s）", domain, acc.Label))
+	// h.sendText(fmt.Sprintf("✅ 源站证书处理完成：%s（账号：%s）", domain, acc.Label))
 }
 
 // 写临时文件并移动到 /tmp（最终路径），返回最终路径
