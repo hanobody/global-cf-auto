@@ -33,6 +33,10 @@ func HandleCallback(cb *tgbotapi.CallbackQuery) {
 		handleIPListCallback(action, parts, user, cb)
 		return
 	}
+	if strings.HasPrefix(action, "getns_") {
+		handleGetNSCallback(action, parts, user, cb)
+		return
+	}
 	if len(parts) < 3 {
 		log.Printf("无效的回调数据: %s", callbackData)
 		return
@@ -149,45 +153,99 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User, cb
 	}
 
 	accountLabel := payload.AccountLabel
-	account := cfclient.GetAccountByLabel(accountLabel)
-	if account == nil {
-		log.Printf("未找到账号标签: %s", accountLabel)
-		telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", accountLabel))
-		return
-	}
-
 	client := cfclient.NewClient()
 	sender := telegram.DefaultSender()
 	switch action {
-	case "iplist_edit":
-		listID := payload.ListID
+	case "iplist_account":
 		go func() {
-			list, err := client.GetCustomList(context.Background(), *account, listID)
-			if err != nil {
-				telegram.SendTelegramAlert(fmt.Sprintf("获取 Custom List 失败: %v", err))
+			account := cfclient.GetAccountByLabel(accountLabel)
+			if account == nil {
+				log.Printf("未找到账号标签: %s", accountLabel)
+				telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", accountLabel))
 				return
 			}
-			items, err := client.ListCustomListItems(context.Background(), *account, listID)
+
+			lists, err := client.ListCustomLists(context.Background(), *account)
 			if err != nil {
-				telegram.SendTelegramAlert(fmt.Sprintf("获取 Custom List 条目失败: %v", err))
+				telegram.SendTelegramAlert(fmt.Sprintf("查询账号 %s 白名单失败: %v", accountLabel, err))
 				return
 			}
-			pages := telegram.BuildIPListPages(accountLabel, list.Name, listID, items, true)
-			for _, page := range pages {
-				if err := sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
-					log.Printf("发送 IP 列表失败: %v", err)
-				}
+			if len(lists) == 0 {
+				telegram.SendTelegramAlert(fmt.Sprintf("账号 %s 暂无 IP 白名单。", accountLabel))
+				return
+			}
+
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("【IP 白名单】\n账号: %s\n请选择要操作的名单：\n", accountLabel))
+
+			var buttons [][]telegram.Button
+			for i, list := range lists {
+				sb.WriteString(fmt.Sprintf("%d. %s (%d)\n", i+1, list.Name, list.NumItems))
+				listToken := telegram.SetIPListCallbackPayload(telegram.IPListCallbackPayload{
+					AccountLabel: accountLabel,
+					ListID:       list.ID,
+					ListName:     list.Name,
+				})
+				buttons = append(buttons, []telegram.Button{
+					{Text: "添加 " + list.Name, CallbackData: fmt.Sprintf("iplist_add|%s", listToken)},
+					{Text: "删除 " + list.Name, CallbackData: fmt.Sprintf("iplist_delete|%s", listToken)},
+				})
+			}
+
+			if err := sender.SendWithButtons(context.Background(), sb.String(), buttons); err != nil {
+				log.Printf("发送 IP 白名单列表失败: %v", err)
 			}
 		}()
 
+	case "iplist_edit":
+		go func() {
+			listName := payload.ListName
+			if strings.TrimSpace(listName) == "" {
+				account := cfclient.GetAccountByLabel(accountLabel)
+				if account != nil {
+					if list, err := client.GetCustomList(context.Background(), *account, payload.ListID); err == nil && strings.TrimSpace(list.Name) != "" {
+						listName = list.Name
+					}
+				}
+			}
+			if strings.TrimSpace(listName) == "" {
+				listName = payload.ListID
+			}
+
+			telegram.SendTelegramAlertWithButtons(
+				fmt.Sprintf("账号: %s\n白名单: %s\n请选择操作：", accountLabel, listName),
+				[][]telegram.Button{{
+					{Text: "添加", CallbackData: fmt.Sprintf("iplist_add|%s", token)},
+					{Text: "删除", CallbackData: fmt.Sprintf("iplist_delete|%s", token)},
+				}},
+			)
+		}()
+
 	case "iplist_delete":
-		listID := payload.ListID
-		itemID := payload.ItemID
-		if itemID == "" {
-			telegram.SendTelegramAlert("删除失败：缺少条目 ID。")
+		if payload.ItemID == "" {
+			listName := payload.ListName
+			if strings.TrimSpace(listName) == "" {
+				listName = payload.ListID
+			}
+			telegram.SetPendingIPListInput(user.ID, telegram.IPListInputRequest{
+				AccountLabel: accountLabel,
+				ListID:       payload.ListID,
+				ListName:     listName,
+				Action:       telegram.IPListActionDelete,
+			})
+			telegram.SendTelegramAlert(fmt.Sprintf("已选择白名单 %s（账号: %s）。\n请直接发送要删除的地址，每行一条，只需填写 IP 或 CIDR。\n示例：\n1.2.3.4\n2407:cdc0:b010::/112", listName, accountLabel))
 			return
 		}
 
+		account := cfclient.GetAccountByLabel(accountLabel)
+		if account == nil {
+			log.Printf("未找到账号标签: %s", accountLabel)
+			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", accountLabel))
+			return
+		}
+
+		listID := payload.ListID
+		itemID := payload.ItemID
 		go func() {
 			listName := listID
 			if list, err := client.GetCustomList(context.Background(), *account, listID); err == nil && list.Name != "" {
@@ -207,6 +265,12 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User, cb
 			telegram.SendTelegramAlertWithButtons(confirmMsg, buttons)
 		}()
 	case "iplist_confirm":
+		account := cfclient.GetAccountByLabel(accountLabel)
+		if account == nil {
+			log.Printf("未找到账号标签: %s", accountLabel)
+			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", accountLabel))
+			return
+		}
 
 		if cb.Message != nil {
 			_ = sender.EditButtons(context.Background(),
@@ -226,7 +290,7 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User, cb
 		}
 
 		go func() {
-			items, err := client.DeleteCustomListItem(context.Background(), *account, listID, itemID)
+			_, err := client.DeleteCustomListItem(context.Background(), *account, listID, itemID)
 			if err != nil {
 				telegram.SendTelegramAlert(fmt.Sprintf("删除 IP 失败: %v", err))
 				return
@@ -245,17 +309,6 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User, cb
 
 				_ = sender.ClearButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID)
 			}
-
-			listName := listID
-			if list, err := client.GetCustomList(context.Background(), *account, listID); err == nil && list.Name != "" {
-				listName = list.Name
-			}
-			pages := telegram.BuildIPListPages(accountLabel, listName, listID, items, true)
-			for _, page := range pages {
-				if err := sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
-					log.Printf("发送 IP 列表失败: %v", err)
-				}
-			}
 		}()
 
 	case "iplist_cancel":
@@ -263,13 +316,58 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User, cb
 			telegram.SendTelegramAlert(fmt.Sprintf("已取消删除（操作人: %s）", user.UserName))
 		}()
 	case "iplist_add":
-		listID := payload.ListID
-		go func() {
-			telegram.SetPendingIPListAdd(user.ID, telegram.IPListAddRequest{
-				AccountLabel: accountLabel,
-				ListID:       listID,
-			})
-			telegram.SendTelegramAlert("请输入要添加的 IP 地址（支持 IPv4/IPv6/CIDR）。\n可选备注：在 IP 后用空格输入。\n示例：\n175.145.84.252/32\n2407:cdc0:b010::/112 备注")
-		}()
+		listName := payload.ListName
+		if strings.TrimSpace(listName) == "" {
+			listName = payload.ListID
+		}
+		telegram.SetPendingIPListInput(user.ID, telegram.IPListInputRequest{
+			AccountLabel: accountLabel,
+			ListID:       payload.ListID,
+			ListName:     listName,
+			Action:       telegram.IPListActionAdd,
+		})
+		telegram.SendTelegramAlert(fmt.Sprintf("已选择白名单 %s（账号: %s）。\n请直接发送要添加的地址，每行一条，格式：IP 或 CIDR，备注可选。\n示例：\n1.2.3.4 办公网\n2407:cdc0:b010::/112 香港", listName, accountLabel))
 	}
+}
+
+func handleGetNSCallback(action string, parts []string, user *tgbotapi.User, cb *tgbotapi.CallbackQuery) {
+	if len(parts) < 2 {
+		log.Printf("无效的 getns 回调数据: %v", parts)
+		return
+	}
+
+	token := parts[1]
+	payload, ok := telegram.GetGetNSCallbackPayload(token)
+	if !ok {
+		telegram.SendTelegramAlert("操作已过期，请重新执行 /getns。")
+		return
+	}
+
+	if action != "getns_select" {
+		log.Printf("未知的 getns 回调动作: %s", action)
+		return
+	}
+
+	accountLabel := payload.AccountLabel
+	if cfclient.GetAccountByLabel(accountLabel) == nil {
+		log.Printf("未找到账号标签: %s", accountLabel)
+		telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", accountLabel))
+		return
+	}
+
+	telegram.SetPendingGetNSInput(user.ID, telegram.GetNSInputRequest{
+		AccountLabel: accountLabel,
+	})
+
+	if cb.Message != nil {
+		_ = telegram.DefaultSender().EditButtons(context.Background(),
+			cb.Message.Chat.ID,
+			cb.Message.MessageID,
+			[][]telegram.Button{{
+				{Text: "已选择 " + accountLabel, CallbackData: "noop"},
+			}},
+		)
+	}
+
+	telegram.SendTelegramAlert(fmt.Sprintf("已选择账号 %s。\n请直接发送要添加的域名，支持多行、空格、逗号或分号分隔。\n示例：\nexample.com\nexample.net", accountLabel))
 }
