@@ -24,6 +24,11 @@ type GetNSInputRequest struct {
 	AccountLabel string
 }
 
+type OriginSSLInputRequest struct {
+	AccountLabels []string
+	AWSAliases    []string
+}
+
 type IPListCallbackPayload struct {
 	AccountLabel string
 	ListID       string
@@ -35,23 +40,39 @@ type GetNSCallbackPayload struct {
 	AccountLabel string
 }
 
+type OriginSSLSelection struct {
+	AccountLabels map[string]bool
+	AWSAliases    map[string]bool
+}
+
+type OriginSSLCallbackPayload struct {
+	Value string
+}
+
 var interactionState = struct {
-	mu              sync.Mutex
-	pendingIPList   map[int64]IPListInputRequest
-	pendingGetNS    map[int64]GetNSInputRequest
-	ipListCallbacks map[string]IPListCallbackPayload
-	getNSCallbacks  map[string]GetNSCallbackPayload
+	mu                  sync.Mutex
+	pendingIPList       map[int64]IPListInputRequest
+	pendingGetNS        map[int64]GetNSInputRequest
+	pendingOriginSSL    map[int64]OriginSSLInputRequest
+	originSSLSelections map[int64]OriginSSLSelection
+	ipListCallbacks     map[string]IPListCallbackPayload
+	getNSCallbacks      map[string]GetNSCallbackPayload
+	originSSLCallbacks  map[string]OriginSSLCallbackPayload
 }{
-	pendingIPList:   make(map[int64]IPListInputRequest),
-	pendingGetNS:    make(map[int64]GetNSInputRequest),
-	ipListCallbacks: make(map[string]IPListCallbackPayload),
-	getNSCallbacks:  make(map[string]GetNSCallbackPayload),
+	pendingIPList:       make(map[int64]IPListInputRequest),
+	pendingGetNS:        make(map[int64]GetNSInputRequest),
+	pendingOriginSSL:    make(map[int64]OriginSSLInputRequest),
+	originSSLSelections: make(map[int64]OriginSSLSelection),
+	ipListCallbacks:     make(map[string]IPListCallbackPayload),
+	getNSCallbacks:      make(map[string]GetNSCallbackPayload),
+	originSSLCallbacks:  make(map[string]OriginSSLCallbackPayload),
 }
 
 func SetPendingIPListInput(userID int64, req IPListInputRequest) {
 	interactionState.mu.Lock()
 	defer interactionState.mu.Unlock()
 	delete(interactionState.pendingGetNS, userID)
+	delete(interactionState.pendingOriginSSL, userID)
 	interactionState.pendingIPList[userID] = req
 }
 
@@ -72,6 +93,7 @@ func SetPendingGetNSInput(userID int64, req GetNSInputRequest) {
 	interactionState.mu.Lock()
 	defer interactionState.mu.Unlock()
 	delete(interactionState.pendingIPList, userID)
+	delete(interactionState.pendingOriginSSL, userID)
 	interactionState.pendingGetNS[userID] = req
 }
 
@@ -86,6 +108,110 @@ func ClearPendingGetNSInput(userID int64) {
 	interactionState.mu.Lock()
 	defer interactionState.mu.Unlock()
 	delete(interactionState.pendingGetNS, userID)
+}
+
+func SetPendingOriginSSLInput(userID int64, req OriginSSLInputRequest) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	delete(interactionState.pendingIPList, userID)
+	delete(interactionState.pendingGetNS, userID)
+	interactionState.pendingOriginSSL[userID] = OriginSSLInputRequest{
+		AccountLabels: append([]string(nil), req.AccountLabels...),
+		AWSAliases:    append([]string(nil), req.AWSAliases...),
+	}
+}
+
+func GetPendingOriginSSLInput(userID int64) (OriginSSLInputRequest, bool) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	req, ok := interactionState.pendingOriginSSL[userID]
+	if !ok {
+		return OriginSSLInputRequest{}, false
+	}
+	return OriginSSLInputRequest{
+		AccountLabels: append([]string(nil), req.AccountLabels...),
+		AWSAliases:    append([]string(nil), req.AWSAliases...),
+	}, true
+}
+
+func ClearPendingOriginSSLInput(userID int64) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	delete(interactionState.pendingOriginSSL, userID)
+}
+
+func ResetOriginSSLSelection(userID int64) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	delete(interactionState.pendingOriginSSL, userID)
+	interactionState.originSSLSelections[userID] = OriginSSLSelection{
+		AccountLabels: make(map[string]bool),
+		AWSAliases:    make(map[string]bool),
+	}
+}
+
+func GetOriginSSLSelection(userID int64) OriginSSLSelection {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	return cloneOriginSSLSelection(ensureOriginSSLSelectionLocked(userID))
+}
+
+func ToggleOriginSSLAccount(userID int64, label string) OriginSSLSelection {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	selection := ensureOriginSSLSelectionLocked(userID)
+	if selection.AccountLabels[label] {
+		delete(selection.AccountLabels, label)
+	} else {
+		selection.AccountLabels[label] = true
+	}
+	return cloneOriginSSLSelection(selection)
+}
+
+func ToggleOriginSSLAlias(userID int64, alias string) OriginSSLSelection {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	selection := ensureOriginSSLSelectionLocked(userID)
+	if selection.AWSAliases[alias] {
+		delete(selection.AWSAliases, alias)
+	} else {
+		selection.AWSAliases[alias] = true
+	}
+	return cloneOriginSSLSelection(selection)
+}
+
+func ensureOriginSSLSelectionLocked(userID int64) OriginSSLSelection {
+	selection, ok := interactionState.originSSLSelections[userID]
+	if !ok {
+		selection = OriginSSLSelection{
+			AccountLabels: make(map[string]bool),
+			AWSAliases:    make(map[string]bool),
+		}
+		interactionState.originSSLSelections[userID] = selection
+		return selection
+	}
+	if selection.AccountLabels == nil {
+		selection.AccountLabels = make(map[string]bool)
+	}
+	if selection.AWSAliases == nil {
+		selection.AWSAliases = make(map[string]bool)
+	}
+	interactionState.originSSLSelections[userID] = selection
+	return selection
+}
+
+func cloneOriginSSLSelection(selection OriginSSLSelection) OriginSSLSelection {
+	out := OriginSSLSelection{
+		AccountLabels: make(map[string]bool, len(selection.AccountLabels)),
+		AWSAliases:    make(map[string]bool, len(selection.AWSAliases)),
+	}
+	for label, ok := range selection.AccountLabels {
+		out.AccountLabels[label] = ok
+	}
+	for alias, ok := range selection.AWSAliases {
+		out.AWSAliases[alias] = ok
+	}
+	return out
 }
 
 func SetIPListCallbackPayload(payload IPListCallbackPayload) string {
@@ -115,6 +241,21 @@ func GetGetNSCallbackPayload(token string) (GetNSCallbackPayload, bool) {
 	interactionState.mu.Lock()
 	defer interactionState.mu.Unlock()
 	payload, ok := interactionState.getNSCallbacks[token]
+	return payload, ok
+}
+
+func SetOriginSSLCallbackPayload(payload OriginSSLCallbackPayload) string {
+	token := newInteractionToken()
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	interactionState.originSSLCallbacks[token] = payload
+	return token
+}
+
+func GetOriginSSLCallbackPayload(token string) (OriginSSLCallbackPayload, bool) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	payload, ok := interactionState.originSSLCallbacks[token]
 	return payload, ok
 }
 

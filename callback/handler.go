@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"DomainC/cfclient"
+	"DomainC/config"
 	"DomainC/telegram"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -35,6 +37,10 @@ func HandleCallback(cb *tgbotapi.CallbackQuery) {
 	}
 	if strings.HasPrefix(action, "getns_") {
 		handleGetNSCallback(action, parts, user, cb)
+		return
+	}
+	if strings.HasPrefix(action, "ssl_") {
+		handleOriginSSLCallback(action, parts, user, cb)
 		return
 	}
 	if len(parts) < 3 {
@@ -370,4 +376,83 @@ func handleGetNSCallback(action string, parts []string, user *tgbotapi.User, cb 
 	}
 
 	telegram.SendTelegramAlert(fmt.Sprintf("已选择账号 %s。\n请直接发送要添加的域名，支持多行、空格、逗号或分号分隔。\n示例：\nexample.com\nexample.net", accountLabel))
+}
+
+func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User, cb *tgbotapi.CallbackQuery) {
+	if len(parts) < 2 {
+		log.Printf("无效的 ssl 回调数据: %v", parts)
+		return
+	}
+
+	token := parts[1]
+	payload, ok := telegram.GetOriginSSLCallbackPayload(token)
+	if !ok {
+		telegram.SendTelegramAlert("操作已过期，请重新执行 /ssl。")
+		return
+	}
+
+	sender := telegram.DefaultSender()
+	switch action {
+	case "ssl_cf_toggle":
+		selection := telegram.ToggleOriginSSLAccount(user.ID, payload.Value)
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, telegram.BuildOriginSSLAccountButtons(config.Cfg.CloudflareAccounts, selection))
+		}
+
+	case "ssl_cf_next":
+		selection := telegram.GetOriginSSLSelection(user.ID)
+		if len(selection.AccountLabels) == 0 {
+			telegram.SendTelegramAlert("请至少选择一个 Cloudflare 账号。")
+			return
+		}
+
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: fmt.Sprintf("已选择 %d 个 Cloudflare 账号", len(selection.AccountLabels)), CallbackData: "noop"},
+			}})
+		}
+
+		if err := sender.SendWithButtons(context.Background(), telegram.OriginSSLTargetPromptText(), telegram.BuildOriginSSLAWSButtons(selection)); err != nil {
+			log.Printf("发送 /ssl AWS 目标选择失败: %v", err)
+		}
+
+	case "ssl_aws_toggle":
+		selection := telegram.ToggleOriginSSLAlias(user.ID, payload.Value)
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, telegram.BuildOriginSSLAWSButtons(selection))
+		}
+
+	case "ssl_aws_done":
+		selection := telegram.GetOriginSSLSelection(user.ID)
+		if len(selection.AccountLabels) == 0 {
+			telegram.SendTelegramAlert("请至少选择一个 Cloudflare 账号。")
+			return
+		}
+
+		req := telegram.OriginSSLInputRequest{
+			AccountLabels: sortedSelectedKeys(selection.AccountLabels),
+			AWSAliases:    sortedSelectedKeys(selection.AWSAliases),
+		}
+		telegram.SetPendingOriginSSLInput(user.ID, req)
+
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: fmt.Sprintf("已选择 %d 个 AWS 目标", len(req.AWSAliases)), CallbackData: "noop"},
+			}})
+		}
+
+		telegram.SendTelegramAlert(telegram.BuildOriginSSLInputPrompt(req))
+	}
+}
+
+func sortedSelectedKeys(items map[string]bool) []string {
+	out := make([]string, 0, len(items))
+	for key, selected := range items {
+		if !selected || strings.TrimSpace(key) == "" {
+			continue
+		}
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
 }

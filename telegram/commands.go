@@ -38,6 +38,9 @@ func (h *CommandHandler) HandleMessage(msg *tgbotapi.Message) {
 	}
 	if !msg.IsCommand() {
 		if msg.From != nil && msg.Text != "" {
+			if h.handlePendingOriginSSLInput(msg.Text, msg.From.ID) {
+				return
+			}
 			if h.handlePendingGetNSInput(msg.Text, msg.From.ID) {
 				return
 			}

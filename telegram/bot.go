@@ -36,6 +36,19 @@ func SendTelegramAlertWithButtons(msg string, buttons [][]Button) {
 	}
 }
 
+func SendTelegramAlertHTML(msg string) {
+	sender, ok := defaultSender.(HTMLSender)
+	if !ok {
+		if err := defaultSender.Send(context.Background(), msg); err != nil {
+			log.Printf("发送 Telegram HTML 消息失败: %v", err)
+		}
+		return
+	}
+	if err := sender.SendHTML(context.Background(), msg); err != nil {
+		log.Printf("发送 Telegram HTML 消息失败: %v", err)
+	}
+}
+
 func StartListener(handleCallback func(cb *tgbotapi.CallbackQuery), handleMessage func(msg *tgbotapi.Message)) {
 	go func() {
 		if err := defaultSender.StartListener(context.Background(), handleCallback, handleMessage); err != nil {

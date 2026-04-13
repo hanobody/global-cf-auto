@@ -1,14 +1,16 @@
 package telegram
 
 import (
-	// "bytes"
 	"context"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"DomainC/cfclient"
 	"DomainC/config"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -17,192 +19,541 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/acm"
 )
 
-func (h *CommandHandler) handleOriginSSLCommand(args []string) {
-	// /ssl <domain> [aws-alias1] [aws-alias2]
-	if len(args) < 1 {
-		h.sendText(h.originSSLPromptText())
-		return
-	}
+type originSSLImportResult struct {
+	Alias  string
+	Region string
+	ARN    string
+	Err    error
+}
 
-	domain := strings.TrimSpace(args[0])
-	if domain == "" {
-		h.sendText(h.originSSLPromptText())
-		return
-	}
+type originSSLDomainResult struct {
+	Domain       string
+	AccountLabel string
+	ExpiresOn    time.Time
+	StrictErr    error
+	Imports      []originSSLImportResult
+}
 
-	// 解析可选 aws aliases（最多 2 个）
-	aliases := make([]string, 0, 2)
-	seen := map[string]struct{}{}
-	for _, a := range args[1:] {
-		a = strings.TrimSpace(a)
-		if a == "" {
-			continue
-		}
-		if _, ok := seen[a]; ok {
-			continue
-		}
-		seen[a] = struct{}{}
-		aliases = append(aliases, a)
-		if len(aliases) == 2 {
-			break
-		}
-	}
+type originSSLBatchResult struct {
+	AccountLabels []string
+	AWSAliases    []string
+	Success       []originSSLDomainResult
+	ParseErrors   []string
+	Failed        []string
+}
 
-	ctx := context.Background()
-
-	// 自动定位账号：domain 必须是某个账号下的 zone
-	acc, err := h.findAccountByDomain(ctx, domain)
-	if err != nil {
-		h.sendText(fmt.Sprintf("无法定位域名所属账号：%v\n\n%s", err, h.originSSLPromptText()))
-		return
-	}
-
-	// 固定生成：裸域 + 通配
-	hostnames := []string{domain, "*." + domain}
-
-	// 创建 15 年 Origin CA 证书
-	cert, err := h.CFClient.CreateOriginCertificate(ctx, *acc, hostnames)
-	if err != nil {
-		h.sendText(fmt.Sprintf("创建源站证书失败: %v", err))
-		return
-	}
-	if _, zone, zerr := h.findZone(strings.ToLower(strings.TrimSpace(domain))); zerr != nil {
-		// 不阻断主流程
-		h.sendText(fmt.Sprintf("⚠️ 已生成源站证书，但查询 Zone 失败，无法设置 SSL 模式为 Full (Strict): %v", zerr))
+func (r originSSLBatchResult) SummaryText() string {
+	var sb strings.Builder
+	sb.WriteString("✅ /ssl 处理完成")
+	sb.WriteString("\nCloudflare 账号: ")
+	if len(r.AccountLabels) == 0 {
+		sb.WriteString("未选择")
 	} else {
-		if serr := h.CFClient.SetZoneSSLFullStrict(ctx, *acc, zone.ID); serr != nil {
-			// 不阻断主流程
-			h.sendText(fmt.Sprintf("⚠️ 已生成源站证书，但设置 SSL 模式为 Full (Strict) 失败: %v", serr))
-		} else {
-			h.sendText("✅ 已将 Cloudflare SSL/TLS 加密模式设置为 Full (Strict)。")
+		sb.WriteString(strings.Join(r.AccountLabels, ", "))
+	}
+
+	sb.WriteString("\nAWS 目标: ")
+	if len(r.AWSAliases) == 0 {
+		sb.WriteString("未选择（只生成源站证书）")
+	} else {
+		sb.WriteString(strings.Join(formatAWSTargets(r.AWSAliases), ", "))
+	}
+
+	sb.WriteString(fmt.Sprintf("\n成功域名: %d", len(r.Success)))
+
+	var importFailLines []string
+	for _, item := range r.Success {
+		successImports := 0
+		for _, imp := range item.Imports {
+			if imp.Err == nil && strings.TrimSpace(imp.ARN) != "" {
+				successImports++
+				continue
+			}
+			importFailLines = append(importFailLines, fmt.Sprintf("%s / %s (%s): %v", item.Domain, imp.Alias, imp.Region, imp.Err))
+		}
+		strictStatus := "已设置"
+		if item.StrictErr != nil {
+			strictStatus = "失败: " + item.StrictErr.Error()
+		}
+		sb.WriteString(fmt.Sprintf("\n- %s -> %s | Full(Strict): %s | ACM: %d/%d", item.Domain, item.AccountLabel, strictStatus, successImports, len(item.Imports)))
+	}
+
+	if len(r.ParseErrors) > 0 {
+		sb.WriteString("\n\n格式错误:")
+		for _, item := range r.ParseErrors {
+			sb.WriteString("\n- " + item)
 		}
 	}
-	// 可选导入 ACM（0/1/2 个）
-	type importResult struct {
-		alias  string
-		region string
-		arn    string
-		err    error
-	}
-	results := make([]importResult, 0, len(aliases))
 
-	for _, awsAlias := range aliases {
-		target, ok := config.Cfg.AWSTargets[awsAlias]
-		if !ok {
-			results = append(results, importResult{
-				alias: awsAlias,
-				err:   fmt.Errorf("未知 AWS 目标别名：%s", awsAlias),
-			})
+	if len(r.Failed) > 0 {
+		sb.WriteString("\n\n处理失败:")
+		for _, item := range r.Failed {
+			sb.WriteString("\n- " + item)
+		}
+	}
+
+	if len(importFailLines) > 0 {
+		sb.WriteString("\n\nACM 导入失败:")
+		for _, item := range importFailLines {
+			sb.WriteString("\n- " + item)
+		}
+	}
+
+	return sb.String()
+}
+
+func (h *CommandHandler) handleOriginSSLCommand(args []string) {
+	if len(h.Accounts) == 0 {
+		h.sendText("未配置可用的 Cloudflare 账号，无法生成源站证书。")
+		return
+	}
+
+	if len(args) == 0 {
+		h.startOriginSSLInteractive()
+		return
+	}
+
+	domainArgs, awsAliases := splitOriginSSLDirectArgs(args)
+	if len(domainArgs) == 0 {
+		h.startOriginSSLInteractive()
+		return
+	}
+
+	domains, parseErrors := parseGetNSDomainsInput(strings.Join(domainArgs, "\n"))
+	if len(domains) == 0 {
+		h.sendText(h.originSSLRetryPrompt(OriginSSLInputRequest{
+			AccountLabels: accountLabelsFromAccounts(h.Accounts),
+			AWSAliases:    awsAliases,
+		}, parseErrors))
+		return
+	}
+
+	req := OriginSSLInputRequest{
+		AccountLabels: accountLabelsFromAccounts(h.Accounts),
+		AWSAliases:    awsAliases,
+	}
+	result := h.processOriginSSLBatch(req, domains)
+	result.ParseErrors = append(result.ParseErrors, parseErrors...)
+	h.sendOriginSSLResult(result)
+}
+
+func (h *CommandHandler) startOriginSSLInteractive() {
+	if h.operator != nil {
+		ResetOriginSSLSelection(h.operator.ID)
+	}
+	h.sendOriginSSLAccountSelector()
+}
+
+func (h *CommandHandler) sendOriginSSLAccountSelector() {
+	if h.operator == nil {
+		h.sendText(h.originSSLPromptText())
+		return
+	}
+	selection := GetOriginSSLSelection(h.operator.ID)
+	if err := h.Sender.SendWithButtons(context.Background(), h.originSSLPromptText(), BuildOriginSSLAccountButtons(h.Accounts, selection)); err != nil {
+		h.sendText(fmt.Sprintf("发送 /ssl 账号选择失败: %v", err))
+	}
+}
+
+func (h *CommandHandler) sendOriginSSLTargetSelector(userID int64) {
+	selection := GetOriginSSLSelection(userID)
+	if err := h.Sender.SendWithButtons(context.Background(), OriginSSLTargetPromptText(), BuildOriginSSLAWSButtons(selection)); err != nil {
+		h.sendText(fmt.Sprintf("发送 /ssl AWS 目标选择失败: %v", err))
+	}
+}
+
+func BuildOriginSSLAccountButtons(accounts []config.CF, selection OriginSSLSelection) [][]Button {
+	flat := make([]Button, 0, len(accounts))
+	for _, acc := range accounts {
+		label := strings.TrimSpace(acc.Label)
+		if label == "" {
 			continue
 		}
-		acmArn, e := importToACM(ctx, target, cert.CertificatePEM, cert.PrivateKeyPEM)
-		results = append(results, importResult{
-			alias:  awsAlias,
-			region: target.Region,
-			arn:    acmArn,
-			err:    e,
+		mark := "☐"
+		if selection.AccountLabels[label] {
+			mark = "☑"
+		}
+		token := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{Value: label})
+		flat = append(flat, Button{
+			Text:         mark + " " + label,
+			CallbackData: fmt.Sprintf("ssl_cf_toggle|%s", token),
 		})
 	}
 
-	// 文本回执（生成 + 可选导入结果）
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("CF源站证书已生成：%s\n账号：%s\nHostnames: %s\n",
-		domain, acc.Label, strings.Join(hostnames, ", "),
-	))
-	if !cert.ExpiresOn.IsZero() {
-		sb.WriteString(fmt.Sprintf("到期：%s\n", cert.ExpiresOn.Format(time.RFC3339)))
+	buttons := chunkButtons(flat, 2)
+	nextToken := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{})
+	buttons = append(buttons, []Button{{
+		Text:         fmt.Sprintf("下一步（已选 %d）", len(selection.AccountLabels)),
+		CallbackData: fmt.Sprintf("ssl_cf_next|%s", nextToken),
+	}})
+	return buttons
+}
+
+func BuildOriginSSLAWSButtons(selection OriginSSLSelection) [][]Button {
+	aliases := sortedAWSTargetAliases()
+	flat := make([]Button, 0, len(aliases))
+	for _, alias := range aliases {
+		mark := "☐"
+		if selection.AWSAliases[alias] {
+			mark = "☑"
+		}
+		target := config.Cfg.AWSTargets[alias]
+		token := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{Value: alias})
+		flat = append(flat, Button{
+			Text:         fmt.Sprintf("%s %s (%s)", mark, alias, target.Region),
+			CallbackData: fmt.Sprintf("ssl_aws_toggle|%s", token),
+		})
 	}
-	if len(results) == 0 {
-		sb.WriteString("\nACM：未导入（未提供 aws alias）。\n")
+
+	buttons := chunkButtons(flat, 2)
+	doneToken := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{})
+	buttons = append(buttons, []Button{{
+		Text:         fmt.Sprintf("开始输入域名（已选 %d）", len(selection.AWSAliases)),
+		CallbackData: fmt.Sprintf("ssl_aws_done|%s", doneToken),
+	}})
+	return buttons
+}
+
+func chunkButtons(flat []Button, width int) [][]Button {
+	if width <= 0 {
+		width = 1
+	}
+	buttons := make([][]Button, 0, (len(flat)+width-1)/width)
+	for i := 0; i < len(flat); i += width {
+		end := i + width
+		if end > len(flat) {
+			end = len(flat)
+		}
+		row := make([]Button, 0, end-i)
+		row = append(row, flat[i:end]...)
+		buttons = append(buttons, row)
+	}
+	return buttons
+}
+
+func OriginSSLTargetPromptText() string {
+	var sb strings.Builder
+	sb.WriteString("请选择要导入证书的 AWS 目标（可多选，可不选）：\n")
+	for _, alias := range sortedAWSTargetAliases() {
+		target := config.Cfg.AWSTargets[alias]
+		sb.WriteString(fmt.Sprintf("- %s (%s)\n", alias, target.Region))
+	}
+	sb.WriteString("\n完成后直接输入一个或多个主域名。")
+	return sb.String()
+}
+
+func (h *CommandHandler) handlePendingOriginSSLInput(msgText string, userID int64) bool {
+	req, ok := GetPendingOriginSSLInput(userID)
+	if !ok {
+		return false
+	}
+
+	domains, parseErrors := parseGetNSDomainsInput(msgText)
+	if len(domains) == 0 {
+		h.sendText(h.originSSLRetryPrompt(req, parseErrors))
+		return true
+	}
+
+	result := h.processOriginSSLBatch(req, domains)
+	result.ParseErrors = append(result.ParseErrors, parseErrors...)
+	if len(result.ParseErrors) == 0 && len(result.Failed) == 0 {
+		ClearPendingOriginSSLInput(userID)
+	}
+	h.sendOriginSSLResult(result)
+	return true
+}
+
+func (h *CommandHandler) originSSLInputPrompt(req OriginSSLInputRequest) string {
+	return BuildOriginSSLInputPrompt(req)
+}
+
+func BuildOriginSSLInputPrompt(req OriginSSLInputRequest) string {
+	var sb strings.Builder
+	sb.WriteString("已完成 /ssl 选择。\n")
+	sb.WriteString("Cloudflare 账号: ")
+	if len(req.AccountLabels) == 0 {
+		sb.WriteString("未选择")
 	} else {
-		var okLines, failLines []string
-		for _, r := range results {
-			if r.err != nil {
-				if r.region != "" {
-					failLines = append(failLines, fmt.Sprintf("- %s (%s): %v", r.alias, r.region, r.err))
-				} else {
-					failLines = append(failLines, fmt.Sprintf("- %s: %v", r.alias, r.err))
-				}
+		sb.WriteString(strings.Join(req.AccountLabels, ", "))
+	}
+	sb.WriteString("\nAWS 目标: ")
+	if len(req.AWSAliases) == 0 {
+		sb.WriteString("未选择（只生成源站证书）")
+	} else {
+		sb.WriteString(strings.Join(formatAWSTargets(req.AWSAliases), ", "))
+	}
+	sb.WriteString("\n\n请直接发送一个或多个主域名，支持多行、空格、逗号或分号分隔。\n示例：\nexample.com\nexample.net")
+	return sb.String()
+}
+
+func (h *CommandHandler) originSSLRetryPrompt(req OriginSSLInputRequest, errs []string) string {
+	var sb strings.Builder
+	if len(errs) > 0 {
+		sb.WriteString("以下域名未识别：\n")
+		for _, item := range errs {
+			sb.WriteString("- " + item + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString(h.originSSLInputPrompt(req))
+	return strings.TrimSpace(sb.String())
+}
+
+func splitOriginSSLDirectArgs(args []string) ([]string, []string) {
+	domains := make([]string, 0, len(args))
+	aliases := make([]string, 0, len(args))
+	seenAlias := make(map[string]bool)
+
+	for _, arg := range args {
+		token := strings.TrimSpace(arg)
+		if token == "" {
+			continue
+		}
+		if _, ok := config.Cfg.AWSTargets[token]; ok {
+			if seenAlias[token] {
 				continue
 			}
-			okLines = append(okLines, fmt.Sprintf("- %s (%s):\n %s", r.alias, r.region, r.arn))
+			seenAlias[token] = true
+			aliases = append(aliases, token)
+			continue
 		}
-		sb.WriteString("\nACM 导入结果：\n")
-		if len(okLines) > 0 {
-			sb.WriteString("✅ 成功：\n```text\n" + strings.Join(okLines, "\n") + "\n```\n")
-		}
-		if len(failLines) > 0 {
-			sb.WriteString("\n❌ 失败：\n```text\n" + strings.Join(failLines, "\n") + "\n```\n")
-		}
+		domains = append(domains, token)
 	}
-	h.sendText(sb.String())
 
-	// --------- 发回两个文件：cert+csr 与 key ---------
+	return domains, aliases
+}
 
-	// (1) cert 文件：头信息 + CERT + CSR（不包含私钥）
-	// var certOut bytes.Buffer
-	// certOut.WriteString("### Cloudflare Origin CA Certificate\n")
-	// certOut.WriteString(fmt.Sprintf("Account: %s\n", acc.Label))
-	// certOut.WriteString(fmt.Sprintf("Zone: %s\n", domain))
-	// certOut.WriteString(fmt.Sprintf("Hostnames: %s\n", strings.Join(hostnames, ", ")))
-	// if cert.ID != "" {
-	// 	certOut.WriteString(fmt.Sprintf("CertID: %s\n", cert.ID))
-	// }
-	// if !cert.ExpiresOn.IsZero() {
-	// 	certOut.WriteString(fmt.Sprintf("ExpiresOn: %s\n", cert.ExpiresOn.Format(time.RFC3339)))
-	// }
-	// certOut.WriteString("\n")
+func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domains []string) originSSLBatchResult {
+	result := originSSLBatchResult{
+		AccountLabels: append([]string(nil), req.AccountLabels...),
+		AWSAliases:    append([]string(nil), req.AWSAliases...),
+	}
 
-	// certOut.WriteString("-----BEGIN CERTIFICATE-----\n")
-	// certOut.WriteString(strings.TrimSpace(cert.CertificatePEM))
-	// certOut.WriteString("\n-----END CERTIFICATE-----\n\n")
+	accounts := h.accountsByLabels(req.AccountLabels)
+	if len(accounts) == 0 {
+		result.Failed = append(result.Failed, "未找到可用的 Cloudflare 账号")
+		return result
+	}
 
-	// if strings.TrimSpace(cert.CSRPEM) != "" {
-	// 	certOut.WriteString("-----BEGIN CERTIFICATE REQUEST-----\n")
-	// 	certOut.WriteString(strings.TrimSpace(cert.CSRPEM))
-	// 	certOut.WriteString("\n-----END CERTIFICATE REQUEST-----\n")
-	// }
+	ctx := context.Background()
+	for _, domain := range domains {
+		acc, zone, err := h.findAccountByDomainInAccounts(ctx, domain, accounts)
+		if err != nil {
+			result.Failed = append(result.Failed, fmt.Sprintf("%s: %v", domain, err))
+			continue
+		}
 
-	// // (2) key 文件：仅私钥
-	// var keyOut bytes.Buffer
-	// keyOut.WriteString("-----BEGIN PRIVATE KEY-----\n")
-	// keyOut.WriteString(strings.TrimSpace(cert.PrivateKeyPEM))
-	// keyOut.WriteString("\n-----END PRIVATE KEY-----\n")
+		hostnames := []string{domain, "*." + domain}
+		cert, err := h.CFClient.CreateOriginCertificate(ctx, acc, hostnames)
+		if err != nil {
+			result.Failed = append(result.Failed, fmt.Sprintf("%s: 创建源站证书失败: %v", domain, err))
+			continue
+		}
 
-	// ts := time.Now().Format("20060102-150405")
-	// certFilename := sanitizeFilename(fmt.Sprintf("origin-ca-%s-%s-cert.pem", domain, ts))
-	// keyFilename := sanitizeFilename(fmt.Sprintf("origin-ca-%s-%s-key.pem", domain, ts))
+		domainResult := originSSLDomainResult{
+			Domain:       domain,
+			AccountLabel: acc.Label,
+			ExpiresOn:    cert.ExpiresOn,
+		}
 
-	// certPath, err := writeTempAndMove(certFilename, certOut.Bytes(), 0644)
-	// if err != nil {
-	// 	h.sendText(fmt.Sprintf("写入证书文件失败: %v", err))
-	// 	return
-	// }
-	// defer os.Remove(certPath)
+		if serr := h.CFClient.SetZoneSSLFullStrict(ctx, acc, zone.ID); serr != nil {
+			domainResult.StrictErr = serr
+		}
 
-	// keyPath, err := writeTempAndMove(keyFilename, keyOut.Bytes(), 0600)
-	// if err != nil {
-	// 	h.sendText(fmt.Sprintf("写入私钥文件失败: %v", err))
-	// 	return
-	// }
-	// defer os.Remove(keyPath)
+		for _, awsAlias := range req.AWSAliases {
+			target, ok := config.Cfg.AWSTargets[awsAlias]
+			if !ok {
+				domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
+					Alias: awsAlias,
+					Err:   fmt.Errorf("未知 AWS 目标别名"),
+				})
+				continue
+			}
 
-	// certCaption := "📄 Cloudflare Origin CA 证书（Certificate + CSR）"
-	// if !cert.ExpiresOn.IsZero() {
-	// 	certCaption = fmt.Sprintf("📄 Cloudflare Origin CA 证书（Certificate + CSR）\n到期：%s", cert.ExpiresOn.Format(time.RFC3339))
-	// }
-	// keyCaption := "🔐 Cloudflare Origin CA 私钥（Private Key）"
+			arn, importErr := importToACM(ctx, target, cert.CertificatePEM, cert.PrivateKeyPEM)
+			domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
+				Alias:  awsAlias,
+				Region: target.Region,
+				ARN:    arn,
+				Err:    importErr,
+			})
+		}
 
-	// if err := h.Sender.SendDocumentPath(context.Background(), certPath, certCaption); err != nil {
-	// 	h.sendText(fmt.Sprintf("发送证书文件失败: %v", err))
-	// 	return
-	// }
-	// if err := h.Sender.SendDocumentPath(context.Background(), keyPath, keyCaption); err != nil {
-	// 	h.sendText(fmt.Sprintf("发送私钥文件失败: %v", err))
-	// 	return
-	// }
+		result.Success = append(result.Success, domainResult)
+	}
 
-	// h.sendText(fmt.Sprintf("✅ 源站证书处理完成：%s（账号：%s）", domain, acc.Label))
+	return result
+}
+
+func (h *CommandHandler) findAccountByDomainInAccounts(ctx context.Context, domain string, accounts []config.CF) (config.CF, cfclient.ZoneDetail, error) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名为空")
+	}
+
+	type matchedItem struct {
+		Account config.CF
+		Zone    cfclient.ZoneDetail
+	}
+	var matches []matchedItem
+
+	for _, acc := range accounts {
+		zone, err := h.CFClient.GetZoneDetails(ctx, acc, domain)
+		if err != nil {
+			if err == cfclient.ErrZoneNotFound || strings.Contains(strings.ToLower(err.Error()), "zone not found") {
+				continue
+			}
+			return config.CF{}, cfclient.ZoneDetail{}, err
+		}
+		if !strings.EqualFold(strings.TrimSpace(zone.Name), domain) {
+			continue
+		}
+		matches = append(matches, matchedItem{Account: acc, Zone: zone})
+	}
+
+	if len(matches) == 0 {
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名 %s 不在所选 Cloudflare 账号中", domain)
+	}
+	if len(matches) > 1 {
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名 %s 在所选 Cloudflare 账号中重复，无法确定唯一来源", domain)
+	}
+	return matches[0].Account, matches[0].Zone, nil
+}
+
+func (h *CommandHandler) accountsByLabels(labels []string) []config.CF {
+	if len(labels) == 0 {
+		return append([]config.CF(nil), h.Accounts...)
+	}
+
+	out := make([]config.CF, 0, len(labels))
+	seen := make(map[string]bool)
+	for _, label := range labels {
+		acc := h.getAccountByLabel(label)
+		if acc == nil || seen[acc.Label] {
+			continue
+		}
+		seen[acc.Label] = true
+		out = append(out, *acc)
+	}
+	return out
+}
+
+func accountLabelsFromAccounts(accounts []config.CF) []string {
+	out := make([]string, 0, len(accounts))
+	for _, acc := range accounts {
+		label := strings.TrimSpace(acc.Label)
+		if label == "" {
+			continue
+		}
+		out = append(out, label)
+	}
+	return out
+}
+
+func sortedAWSTargetAliases() []string {
+	aliases := make([]string, 0, len(config.Cfg.AWSTargets))
+	for alias := range config.Cfg.AWSTargets {
+		if strings.TrimSpace(alias) == "" {
+			continue
+		}
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	return aliases
+}
+
+func formatAWSTargets(aliases []string) []string {
+	out := make([]string, 0, len(aliases))
+	for _, alias := range aliases {
+		target, ok := config.Cfg.AWSTargets[alias]
+		if !ok {
+			out = append(out, alias)
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s(%s)", alias, target.Region))
+	}
+	return out
+}
+
+func (h *CommandHandler) sendOriginSSLResult(result originSSLBatchResult) {
+	h.sendText(result.SummaryText())
+	h.sendOriginSSLARNBlocks(result)
+}
+
+func (h *CommandHandler) sendOriginSSLARNBlocks(result originSSLBatchResult) {
+	htmlSender, ok := h.Sender.(HTMLSender)
+	for _, item := range result.Success {
+		msg := buildOriginSSLHTMLBlock(item)
+		if strings.TrimSpace(msg) == "" {
+			continue
+		}
+
+		if ok {
+			if err := htmlSender.SendHTML(context.Background(), msg); err == nil {
+				continue
+			}
+		}
+
+		h.sendText(buildOriginSSLFallbackBlock(item))
+	}
+}
+
+func buildOriginSSLHTMLBlock(item originSSLDomainResult) string {
+	var sb strings.Builder
+	hasContent := false
+
+	for _, imp := range item.Imports {
+		if imp.Err != nil || strings.TrimSpace(imp.ARN) == "" {
+			continue
+		}
+		if hasContent {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("<b>域名:</b> " + html.EscapeString(item.Domain) + "\n")
+		sb.WriteString("<b>Cloudflare 账号:</b> " + html.EscapeString(item.AccountLabel) + "\n")
+		sb.WriteString("<b>AWS 目标:</b> " + html.EscapeString(imp.Alias) + "\n")
+		sb.WriteString("<b>区域:</b> " + html.EscapeString(imp.Region) + "\n")
+		sb.WriteString("<pre>" + html.EscapeString(imp.ARN) + "</pre>")
+		hasContent = true
+	}
+
+	return sb.String()
+}
+
+func buildOriginSSLFallbackBlock(item originSSLDomainResult) string {
+	var blocks []string
+	for _, imp := range item.Imports {
+		if imp.Err != nil || strings.TrimSpace(imp.ARN) == "" {
+			continue
+		}
+		blocks = append(blocks, fmt.Sprintf("域名: %s\nCloudflare 账号: %s\nAWS 目标: %s\n区域: %s\nARN:\n%s", item.Domain, item.AccountLabel, imp.Alias, imp.Region, imp.ARN))
+	}
+	return strings.Join(blocks, "\n\n")
+}
+
+func (h *CommandHandler) originSSLPromptText() string {
+	if len(h.Accounts) == 0 {
+		return "未配置可用的 Cloudflare 账号，无法生成源站证书。"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("生成 Cloudflare Origin CA 源站证书（15年）。\n")
+	sb.WriteString("先多选 Cloudflare 账号，再多选 AWS 目标，最后输入一个或多个主域名。\n\n")
+	sb.WriteString("兼容直接命令：/ssl example.com example.net us-aws sg-aws\n")
+	sb.WriteString("说明：每个域名固定签发 domain.com + *.domain.com\n\n")
+	sb.WriteString("可选 Cloudflare 账号：\n")
+	for _, a := range h.Accounts {
+		if strings.TrimSpace(a.Label) == "" {
+			continue
+		}
+		sb.WriteString("- " + a.Label + "\n")
+	}
+	sb.WriteString("\n可选 AWS 目标：\n")
+	for _, alias := range sortedAWSTargetAliases() {
+		target := config.Cfg.AWSTargets[alias]
+		sb.WriteString(fmt.Sprintf("- %s (%s)\n", alias, target.Region))
+	}
+	return sb.String()
 }
 
 // 写临时文件并移动到 /tmp（最终路径），返回最终路径
@@ -231,71 +582,6 @@ func writeTempAndMove(filename string, data []byte, perm os.FileMode) (string, e
 	return finalPath, nil
 }
 
-// 提示文本
-func (h *CommandHandler) originSSLPromptText() string {
-	if len(h.Accounts) == 0 {
-		return "未配置可用的 Cloudflare 账号，无法生成源站证书。"
-	}
-
-	var sb strings.Builder
-	sb.WriteString("生成 Cloudflare Origin CA 源站证书（15年）。\n\n")
-	sb.WriteString("/ssl <主域名> <aws-alias1> <aws-alias2>\n\n")
-	sb.WriteString("示例：\n")
-	sb.WriteString("/ssl example.com us-aws sg-aws\n\n")
-	sb.WriteString("说明：该命令固定签发 example.com + \\*.example.com\n\n")
-	sb.WriteString("可用账号：\n")
-	for _, a := range h.Accounts {
-		if strings.TrimSpace(a.Label) == "" {
-			continue
-		}
-		sb.WriteString("- " + a.Label + "\n")
-	}
-	sb.WriteString("\n可用 AWS 目标：\n")
-	for name, t := range config.Cfg.AWSTargets {
-		if strings.TrimSpace(name) == "" {
-			continue
-		}
-		sb.WriteString(fmt.Sprintf("- %s (%s)\n", name, t.Region))
-	}
-	return sb.String()
-}
-
-// 自动定位域名所属账号：domain 必须精确匹配某个账号下的 zone.Name
-// - 命中 0：域名不在任何账号
-// - 命中 1：返回该账号
-// - 命中 >1：歧义（一般不该发生，但必须阻止）
-func (h *CommandHandler) findAccountByDomain(ctx context.Context, domain string) (*config.CF, error) {
-	domain = strings.ToLower(strings.TrimSpace(domain))
-	if domain == "" {
-		return nil, fmt.Errorf("domain 为空")
-	}
-
-	var matched []*config.CF
-	for i := range h.Accounts {
-		acc := &h.Accounts[i]
-
-		zones, err := h.CFClient.ListZones(ctx, *acc)
-		if err != nil {
-			// 单账号失败不阻断，继续尝试其他账号
-			continue
-		}
-		for _, z := range zones {
-			if strings.EqualFold(strings.TrimSpace(z.Name), domain) {
-				matched = append(matched, acc)
-				break
-			}
-		}
-	}
-
-	if len(matched) == 0 {
-		return nil, fmt.Errorf("域名 %s 不在任何 Cloudflare 账号中", domain)
-	}
-	if len(matched) > 1 {
-		return nil, fmt.Errorf("域名 %s 同时存在于多个 Cloudflare 账号中（歧义），请先清理重复 zone", domain)
-	}
-	return matched[0], nil
-}
-
 // 简单文件名清洗（避免 OS/Telegram 不兼容字符）
 func sanitizeFilename(name string) string {
 	name = strings.ReplaceAll(name, " ", "_")
@@ -304,6 +590,7 @@ func sanitizeFilename(name string) string {
 	name = strings.ReplaceAll(name, ":", "_")
 	return name
 }
+
 func importToACM(ctx context.Context, target config.AWSTarget, certPEM, keyPEM string) (string, error) {
 	if strings.TrimSpace(target.Region) == "" {
 		return "", fmt.Errorf("aws target region 为空")
