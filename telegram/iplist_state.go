@@ -25,8 +25,7 @@ type GetNSInputRequest struct {
 }
 
 type OriginSSLInputRequest struct {
-	AccountLabels []string
-	AWSAliases    []string
+	AWSAliases []string
 }
 
 type IPListCallbackPayload struct {
@@ -41,8 +40,7 @@ type GetNSCallbackPayload struct {
 }
 
 type OriginSSLSelection struct {
-	AccountLabels map[string]bool
-	AWSAliases    map[string]bool
+	AWSAliases map[string]bool
 }
 
 type OriginSSLCallbackPayload struct {
@@ -116,8 +114,7 @@ func SetPendingOriginSSLInput(userID int64, req OriginSSLInputRequest) {
 	delete(interactionState.pendingIPList, userID)
 	delete(interactionState.pendingGetNS, userID)
 	interactionState.pendingOriginSSL[userID] = OriginSSLInputRequest{
-		AccountLabels: append([]string(nil), req.AccountLabels...),
-		AWSAliases:    append([]string(nil), req.AWSAliases...),
+		AWSAliases: append([]string(nil), req.AWSAliases...),
 	}
 }
 
@@ -129,8 +126,7 @@ func GetPendingOriginSSLInput(userID int64) (OriginSSLInputRequest, bool) {
 		return OriginSSLInputRequest{}, false
 	}
 	return OriginSSLInputRequest{
-		AccountLabels: append([]string(nil), req.AccountLabels...),
-		AWSAliases:    append([]string(nil), req.AWSAliases...),
+		AWSAliases: append([]string(nil), req.AWSAliases...),
 	}, true
 }
 
@@ -145,8 +141,7 @@ func ResetOriginSSLSelection(userID int64) {
 	defer interactionState.mu.Unlock()
 	delete(interactionState.pendingOriginSSL, userID)
 	interactionState.originSSLSelections[userID] = OriginSSLSelection{
-		AccountLabels: make(map[string]bool),
-		AWSAliases:    make(map[string]bool),
+		AWSAliases: make(map[string]bool),
 	}
 }
 
@@ -154,18 +149,6 @@ func GetOriginSSLSelection(userID int64) OriginSSLSelection {
 	interactionState.mu.Lock()
 	defer interactionState.mu.Unlock()
 	return cloneOriginSSLSelection(ensureOriginSSLSelectionLocked(userID))
-}
-
-func ToggleOriginSSLAccount(userID int64, label string) OriginSSLSelection {
-	interactionState.mu.Lock()
-	defer interactionState.mu.Unlock()
-	selection := ensureOriginSSLSelectionLocked(userID)
-	if selection.AccountLabels[label] {
-		delete(selection.AccountLabels, label)
-	} else {
-		selection.AccountLabels[label] = true
-	}
-	return cloneOriginSSLSelection(selection)
 }
 
 func ToggleOriginSSLAlias(userID int64, alias string) OriginSSLSelection {
@@ -184,14 +167,10 @@ func ensureOriginSSLSelectionLocked(userID int64) OriginSSLSelection {
 	selection, ok := interactionState.originSSLSelections[userID]
 	if !ok {
 		selection = OriginSSLSelection{
-			AccountLabels: make(map[string]bool),
-			AWSAliases:    make(map[string]bool),
+			AWSAliases: make(map[string]bool),
 		}
 		interactionState.originSSLSelections[userID] = selection
 		return selection
-	}
-	if selection.AccountLabels == nil {
-		selection.AccountLabels = make(map[string]bool)
 	}
 	if selection.AWSAliases == nil {
 		selection.AWSAliases = make(map[string]bool)
@@ -202,11 +181,7 @@ func ensureOriginSSLSelectionLocked(userID int64) OriginSSLSelection {
 
 func cloneOriginSSLSelection(selection OriginSSLSelection) OriginSSLSelection {
 	out := OriginSSLSelection{
-		AccountLabels: make(map[string]bool, len(selection.AccountLabels)),
-		AWSAliases:    make(map[string]bool, len(selection.AWSAliases)),
-	}
-	for label, ok := range selection.AccountLabels {
-		out.AccountLabels[label] = ok
+		AWSAliases: make(map[string]bool, len(selection.AWSAliases)),
 	}
 	for alias, ok := range selection.AWSAliases {
 		out.AWSAliases[alias] = ok

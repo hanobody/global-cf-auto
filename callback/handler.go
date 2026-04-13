@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"DomainC/cfclient"
-	"DomainC/config"
 	"DomainC/telegram"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -393,29 +392,6 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 
 	sender := telegram.DefaultSender()
 	switch action {
-	case "ssl_cf_toggle":
-		selection := telegram.ToggleOriginSSLAccount(user.ID, payload.Value)
-		if cb.Message != nil {
-			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, telegram.BuildOriginSSLAccountButtons(config.Cfg.CloudflareAccounts, selection))
-		}
-
-	case "ssl_cf_next":
-		selection := telegram.GetOriginSSLSelection(user.ID)
-		if len(selection.AccountLabels) == 0 {
-			telegram.SendTelegramAlert("请至少选择一个 Cloudflare 账号。")
-			return
-		}
-
-		if cb.Message != nil {
-			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
-				{Text: fmt.Sprintf("已选择 %d 个 Cloudflare 账号", len(selection.AccountLabels)), CallbackData: "noop"},
-			}})
-		}
-
-		if err := sender.SendWithButtons(context.Background(), telegram.OriginSSLTargetPromptText(), telegram.BuildOriginSSLAWSButtons(selection)); err != nil {
-			log.Printf("发送 /ssl AWS 目标选择失败: %v", err)
-		}
-
 	case "ssl_aws_toggle":
 		selection := telegram.ToggleOriginSSLAlias(user.ID, payload.Value)
 		if cb.Message != nil {
@@ -424,14 +400,8 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 
 	case "ssl_aws_done":
 		selection := telegram.GetOriginSSLSelection(user.ID)
-		if len(selection.AccountLabels) == 0 {
-			telegram.SendTelegramAlert("请至少选择一个 Cloudflare 账号。")
-			return
-		}
-
 		req := telegram.OriginSSLInputRequest{
-			AccountLabels: sortedSelectedKeys(selection.AccountLabels),
-			AWSAliases:    sortedSelectedKeys(selection.AWSAliases),
+			AWSAliases: sortedSelectedKeys(selection.AWSAliases),
 		}
 		telegram.SetPendingOriginSSLInput(user.ID, req)
 

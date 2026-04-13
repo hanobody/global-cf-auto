@@ -4,11 +4,8 @@ import (
 	"context"
 	"fmt"
 	"html"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"DomainC/cfclient"
 	"DomainC/config"
@@ -29,13 +26,11 @@ type originSSLImportResult struct {
 type originSSLDomainResult struct {
 	Domain       string
 	AccountLabel string
-	ExpiresOn    time.Time
 	StrictErr    error
 	Imports      []originSSLImportResult
 }
 
 type originSSLBatchResult struct {
-	AccountLabels []string
 	AWSAliases    []string
 	Success       []originSSLDomainResult
 	ParseErrors   []string
@@ -45,12 +40,7 @@ type originSSLBatchResult struct {
 func (r originSSLBatchResult) SummaryText() string {
 	var sb strings.Builder
 	sb.WriteString("✅ /ssl 处理完成")
-	sb.WriteString("\nCloudflare 账号: ")
-	if len(r.AccountLabels) == 0 {
-		sb.WriteString("未选择")
-	} else {
-		sb.WriteString(strings.Join(r.AccountLabels, ", "))
-	}
+	sb.WriteString("\nCloudflare 账号: 自动按域名识别")
 
 	sb.WriteString("\nAWS 目标: ")
 	if len(r.AWSAliases) == 0 {
@@ -122,14 +112,12 @@ func (h *CommandHandler) handleOriginSSLCommand(args []string) {
 	domains, parseErrors := parseGetNSDomainsInput(strings.Join(domainArgs, "\n"))
 	if len(domains) == 0 {
 		h.sendText(h.originSSLRetryPrompt(OriginSSLInputRequest{
-			AccountLabels: accountLabelsFromAccounts(h.Accounts),
 			AWSAliases:    awsAliases,
 		}, parseErrors))
 		return
 	}
 
 	req := OriginSSLInputRequest{
-		AccountLabels: accountLabelsFromAccounts(h.Accounts),
 		AWSAliases:    awsAliases,
 	}
 	result := h.processOriginSSLBatch(req, domains)
@@ -141,18 +129,11 @@ func (h *CommandHandler) startOriginSSLInteractive() {
 	if h.operator != nil {
 		ResetOriginSSLSelection(h.operator.ID)
 	}
-	h.sendOriginSSLAccountSelector()
-}
-
-func (h *CommandHandler) sendOriginSSLAccountSelector() {
 	if h.operator == nil {
 		h.sendText(h.originSSLPromptText())
 		return
 	}
-	selection := GetOriginSSLSelection(h.operator.ID)
-	if err := h.Sender.SendWithButtons(context.Background(), h.originSSLPromptText(), BuildOriginSSLAccountButtons(h.Accounts, selection)); err != nil {
-		h.sendText(fmt.Sprintf("发送 /ssl 账号选择失败: %v", err))
-	}
+	h.sendOriginSSLTargetSelector(h.operator.ID)
 }
 
 func (h *CommandHandler) sendOriginSSLTargetSelector(userID int64) {
@@ -160,33 +141,6 @@ func (h *CommandHandler) sendOriginSSLTargetSelector(userID int64) {
 	if err := h.Sender.SendWithButtons(context.Background(), OriginSSLTargetPromptText(), BuildOriginSSLAWSButtons(selection)); err != nil {
 		h.sendText(fmt.Sprintf("发送 /ssl AWS 目标选择失败: %v", err))
 	}
-}
-
-func BuildOriginSSLAccountButtons(accounts []config.CF, selection OriginSSLSelection) [][]Button {
-	flat := make([]Button, 0, len(accounts))
-	for _, acc := range accounts {
-		label := strings.TrimSpace(acc.Label)
-		if label == "" {
-			continue
-		}
-		mark := "☐"
-		if selection.AccountLabels[label] {
-			mark = "☑"
-		}
-		token := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{Value: label})
-		flat = append(flat, Button{
-			Text:         mark + " " + label,
-			CallbackData: fmt.Sprintf("ssl_cf_toggle|%s", token),
-		})
-	}
-
-	buttons := chunkButtons(flat, 2)
-	nextToken := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{})
-	buttons = append(buttons, []Button{{
-		Text:         fmt.Sprintf("下一步（已选 %d）", len(selection.AccountLabels)),
-		CallbackData: fmt.Sprintf("ssl_cf_next|%s", nextToken),
-	}})
-	return buttons
 }
 
 func BuildOriginSSLAWSButtons(selection OriginSSLSelection) [][]Button {
@@ -233,6 +187,7 @@ func chunkButtons(flat []Button, width int) [][]Button {
 
 func OriginSSLTargetPromptText() string {
 	var sb strings.Builder
+	sb.WriteString("Cloudflare 账号会按域名自动识别。\n")
 	sb.WriteString("请选择要导入证书的 AWS 目标（可多选，可不选）：\n")
 	for _, alias := range sortedAWSTargetAliases() {
 		target := config.Cfg.AWSTargets[alias]
@@ -270,12 +225,7 @@ func (h *CommandHandler) originSSLInputPrompt(req OriginSSLInputRequest) string 
 func BuildOriginSSLInputPrompt(req OriginSSLInputRequest) string {
 	var sb strings.Builder
 	sb.WriteString("已完成 /ssl 选择。\n")
-	sb.WriteString("Cloudflare 账号: ")
-	if len(req.AccountLabels) == 0 {
-		sb.WriteString("未选择")
-	} else {
-		sb.WriteString(strings.Join(req.AccountLabels, ", "))
-	}
+	sb.WriteString("Cloudflare 账号: 自动按域名识别")
 	sb.WriteString("\nAWS 目标: ")
 	if len(req.AWSAliases) == 0 {
 		sb.WriteString("未选择（只生成源站证书）")
@@ -325,11 +275,10 @@ func splitOriginSSLDirectArgs(args []string) ([]string, []string) {
 
 func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domains []string) originSSLBatchResult {
 	result := originSSLBatchResult{
-		AccountLabels: append([]string(nil), req.AccountLabels...),
 		AWSAliases:    append([]string(nil), req.AWSAliases...),
 	}
 
-	accounts := h.accountsByLabels(req.AccountLabels)
+	accounts := append([]config.CF(nil), h.Accounts...)
 	if len(accounts) == 0 {
 		result.Failed = append(result.Failed, "未找到可用的 Cloudflare 账号")
 		return result
@@ -353,7 +302,6 @@ func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domain
 		domainResult := originSSLDomainResult{
 			Domain:       domain,
 			AccountLabel: acc.Label,
-			ExpiresOn:    cert.ExpiresOn,
 		}
 
 		if serr := h.CFClient.SetZoneSSLFullStrict(ctx, acc, zone.ID); serr != nil {
@@ -412,42 +360,12 @@ func (h *CommandHandler) findAccountByDomainInAccounts(ctx context.Context, doma
 	}
 
 	if len(matches) == 0 {
-		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名 %s 不在所选 Cloudflare 账号中", domain)
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名 %s 不在任何可用 Cloudflare 账号中", domain)
 	}
 	if len(matches) > 1 {
-		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名 %s 在所选 Cloudflare 账号中重复，无法确定唯一来源", domain)
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名 %s 在多个 Cloudflare 账号中重复，无法确定唯一来源", domain)
 	}
 	return matches[0].Account, matches[0].Zone, nil
-}
-
-func (h *CommandHandler) accountsByLabels(labels []string) []config.CF {
-	if len(labels) == 0 {
-		return append([]config.CF(nil), h.Accounts...)
-	}
-
-	out := make([]config.CF, 0, len(labels))
-	seen := make(map[string]bool)
-	for _, label := range labels {
-		acc := h.getAccountByLabel(label)
-		if acc == nil || seen[acc.Label] {
-			continue
-		}
-		seen[acc.Label] = true
-		out = append(out, *acc)
-	}
-	return out
-}
-
-func accountLabelsFromAccounts(accounts []config.CF) []string {
-	out := make([]string, 0, len(accounts))
-	for _, acc := range accounts {
-		label := strings.TrimSpace(acc.Label)
-		if label == "" {
-			continue
-		}
-		out = append(out, label)
-	}
-	return out
 }
 
 func sortedAWSTargetAliases() []string {
@@ -538,57 +456,15 @@ func (h *CommandHandler) originSSLPromptText() string {
 
 	var sb strings.Builder
 	sb.WriteString("生成 Cloudflare Origin CA 源站证书（15年）。\n")
-	sb.WriteString("先多选 Cloudflare 账号，再多选 AWS 目标，最后输入一个或多个主域名。\n\n")
+	sb.WriteString("Cloudflare 账号会按域名自动识别，只需要多选 AWS 目标，再输入一个或多个主域名。\n\n")
 	sb.WriteString("兼容直接命令：/ssl example.com example.net us-aws sg-aws\n")
 	sb.WriteString("说明：每个域名固定签发 domain.com + *.domain.com\n\n")
-	sb.WriteString("可选 Cloudflare 账号：\n")
-	for _, a := range h.Accounts {
-		if strings.TrimSpace(a.Label) == "" {
-			continue
-		}
-		sb.WriteString("- " + a.Label + "\n")
-	}
-	sb.WriteString("\n可选 AWS 目标：\n")
+	sb.WriteString("可选 AWS 目标：\n")
 	for _, alias := range sortedAWSTargetAliases() {
 		target := config.Cfg.AWSTargets[alias]
 		sb.WriteString(fmt.Sprintf("- %s (%s)\n", alias, target.Region))
 	}
 	return sb.String()
-}
-
-// 写临时文件并移动到 /tmp（最终路径），返回最终路径
-func writeTempAndMove(filename string, data []byte, perm os.FileMode) (string, error) {
-	tmpFile, err := os.CreateTemp("", "origin-ca-*.pem")
-	if err != nil {
-		return "", err
-	}
-	tmpPath := tmpFile.Name()
-
-	defer func() {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
-	}()
-
-	_ = os.Chmod(tmpPath, perm)
-
-	if _, err := tmpFile.Write(data); err != nil {
-		return "", err
-	}
-	_ = tmpFile.Sync()
-
-	finalPath := filepath.Join(os.TempDir(), filename)
-	_ = os.Rename(tmpPath, finalPath)
-
-	return finalPath, nil
-}
-
-// 简单文件名清洗（避免 OS/Telegram 不兼容字符）
-func sanitizeFilename(name string) string {
-	name = strings.ReplaceAll(name, " ", "_")
-	name = strings.ReplaceAll(name, "/", "_")
-	name = strings.ReplaceAll(name, "\\", "_")
-	name = strings.ReplaceAll(name, ":", "_")
-	return name
 }
 
 func importToACM(ctx context.Context, target config.AWSTarget, certPEM, keyPEM string) (string, error) {
