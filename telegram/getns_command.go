@@ -168,6 +168,9 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 		TargetAccount: selected.Label,
 		ParseErrors:   parseErrors,
 	}
+	ctx := context.Background()
+	cfPacer := newBatchAPIPacer()
+	registrarPacer := newBatchAPIPacer()
 
 	for _, domain := range domains {
 		if acc, zone, err := h.findZone(domain); err == nil {
@@ -175,7 +178,7 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 				Domain:       zone.Name,
 				AccountLabel: acc.Label,
 			}
-			_ = h.appendGetNSManualOrSynced(domain, zone.NameServers, &result)
+			_ = h.appendGetNSManualOrSynced(ctx, domain, zone.NameServers, &result, registrarPacer)
 			result.Existing = append(result.Existing, item)
 			continue
 		} else if !errors.Is(err, cfclient.ErrZoneNotFound) {
@@ -183,7 +186,12 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 			continue
 		}
 
-		zone, err := h.CFClient.CreateZone(context.Background(), selected, domain)
+		if err := cfPacer.Wait(ctx); err != nil {
+			result.Failed = append(result.Failed, fmt.Sprintf("%s: 创建 Zone 前等待失败: %v", domain, err))
+			continue
+		}
+
+		zone, err := h.CFClient.CreateZone(ctx, selected, domain)
 		if err != nil {
 			result.Failed = append(result.Failed, fmt.Sprintf("%s: %v", domain, err))
 			continue
@@ -193,24 +201,35 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 			Domain:       zone.Name,
 			AccountLabel: selected.Label,
 		}
-		_ = h.appendGetNSManualOrSynced(domain, zone.NameServers, &result)
+		_ = h.appendGetNSManualOrSynced(ctx, domain, zone.NameServers, &result, registrarPacer)
 		result.Created = append(result.Created, item)
 	}
 
 	return result
 }
 
-func (h *CommandHandler) appendGetNSManualOrSynced(domain string, nameServers []string, result *getNSBatchResult) error {
+func (h *CommandHandler) appendGetNSManualOrSynced(ctx context.Context, domain string, nameServers []string, result *getNSBatchResult, pacer *batchAPIPacer) error {
 	if len(nameServers) == 0 {
 		result.ManualNS = append(result.ManualNS, fmt.Sprintf("- %s\n  未获取到 NS", domain))
 		return fmt.Errorf("未获取到 NS")
 	}
 
+	if h.RegistrarManager == nil {
+		result.ManualNS = append(result.ManualNS, fmt.Sprintf("- %s\n  %s", domain, strings.Join(nameServers, "\n  ")))
+		return fmt.Errorf("未配置注册商")
+	}
+
+	if pacer != nil {
+		if err := pacer.Wait(ctx); err != nil {
+			manual := fmt.Sprintf("- %s\n  %s\n  同步失败: %v", domain, strings.Join(nameServers, "\n  "), err)
+			result.ManualNS = append(result.ManualNS, manual)
+			return err
+		}
+	}
+
 	if _, err := h.syncRegistrarNameServers(domain, nameServers); err != nil {
 		manual := fmt.Sprintf("- %s\n  %s", domain, strings.Join(nameServers, "\n  "))
-		if h.RegistrarManager != nil {
-			manual += fmt.Sprintf("\n  同步失败: %v", err)
-		}
+		manual += fmt.Sprintf("\n  同步失败: %v", err)
 		result.ManualNS = append(result.ManualNS, manual)
 		return err
 	}

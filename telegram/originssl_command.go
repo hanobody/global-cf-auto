@@ -1,11 +1,16 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"fmt"
 	"html"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"DomainC/cfclient"
 	"DomainC/config"
@@ -37,6 +42,14 @@ type originSSLBatchResult struct {
 	Failed        []string
 }
 
+type originSSLARNEntry struct {
+	Domain       string
+	AccountLabel string
+	Alias        string
+	Region       string
+	ARN          string
+}
+
 func (r originSSLBatchResult) SummaryText() string {
 	var sb strings.Builder
 	sb.WriteString("✅ /ssl 处理完成")
@@ -52,10 +65,12 @@ func (r originSSLBatchResult) SummaryText() string {
 	sb.WriteString(fmt.Sprintf("\n成功域名: %d", len(r.Success)))
 
 	var importFailLines []string
+	arnCount := 0
 	for _, item := range r.Success {
 		successImports := 0
 		for _, imp := range item.Imports {
 			if imp.Err == nil && strings.TrimSpace(imp.ARN) != "" {
+				arnCount++
 				successImports++
 				continue
 			}
@@ -67,6 +82,7 @@ func (r originSSLBatchResult) SummaryText() string {
 		}
 		sb.WriteString(fmt.Sprintf("\n- %s -> %s | Full(Strict): %s | ACM: %d/%d", item.Domain, item.AccountLabel, strictStatus, successImports, len(item.Imports)))
 	}
+	sb.WriteString(fmt.Sprintf("\n成功 ARN: %d", arnCount))
 
 	if len(r.ParseErrors) > 0 {
 		sb.WriteString("\n\n格式错误:")
@@ -285,6 +301,8 @@ func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domain
 	}
 
 	ctx := context.Background()
+	cfPacer := newBatchAPIPacer()
+	awsPacer := newBatchAPIPacer()
 	for _, domain := range domains {
 		acc, zone, err := h.findAccountByDomainInAccounts(ctx, domain, accounts)
 		if err != nil {
@@ -293,6 +311,10 @@ func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domain
 		}
 
 		hostnames := []string{domain, "*." + domain}
+		if err := cfPacer.Wait(ctx); err != nil {
+			result.Failed = append(result.Failed, fmt.Sprintf("%s: 创建源站证书前等待失败: %v", domain, err))
+			continue
+		}
 		cert, err := h.CFClient.CreateOriginCertificate(ctx, acc, hostnames)
 		if err != nil {
 			result.Failed = append(result.Failed, fmt.Sprintf("%s: 创建源站证书失败: %v", domain, err))
@@ -304,7 +326,9 @@ func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domain
 			AccountLabel: acc.Label,
 		}
 
-		if serr := h.CFClient.SetZoneSSLFullStrict(ctx, acc, zone.ID); serr != nil {
+		if err := cfPacer.Wait(ctx); err != nil {
+			domainResult.StrictErr = fmt.Errorf("设置 Full(Strict) 前等待失败: %w", err)
+		} else if serr := h.CFClient.SetZoneSSLFullStrict(ctx, acc, zone.ID); serr != nil {
 			domainResult.StrictErr = serr
 		}
 
@@ -314,6 +338,15 @@ func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domain
 				domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
 					Alias: awsAlias,
 					Err:   fmt.Errorf("未知 AWS 目标别名"),
+				})
+				continue
+			}
+
+			if err := awsPacer.Wait(ctx); err != nil {
+				domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
+					Alias:  awsAlias,
+					Region: target.Region,
+					Err:    fmt.Errorf("导入 ACM 前等待失败: %w", err),
 				})
 				continue
 			}
@@ -395,58 +428,250 @@ func formatAWSTargets(aliases []string) []string {
 
 func (h *CommandHandler) sendOriginSSLResult(result originSSLBatchResult) {
 	h.sendText(result.SummaryText())
-	h.sendOriginSSLARNBlocks(result)
+	h.sendOriginSSLARNOutputs(result)
 }
 
-func (h *CommandHandler) sendOriginSSLARNBlocks(result originSSLBatchResult) {
-	htmlSender, ok := h.Sender.(HTMLSender)
-	for _, item := range result.Success {
-		msg := buildOriginSSLHTMLBlock(item)
-		if strings.TrimSpace(msg) == "" {
-			continue
-		}
+func (h *CommandHandler) sendOriginSSLARNOutputs(result originSSLBatchResult) {
+	entries := collectOriginSSLARNEntries(result)
+	if len(entries) == 0 {
+		return
+	}
 
-		if ok {
-			if err := htmlSender.SendHTML(context.Background(), msg); err == nil {
+	if len(entries) > 20 {
+		if err := h.sendOriginSSLARNCSV(entries); err != nil {
+			h.sendText(fmt.Sprintf("发送 /ssl ARN CSV 失败: %v", err))
+		}
+	} else {
+		h.sendOriginSSLARNMappingBlock(entries)
+	}
+
+	h.sendOriginSSLARNCopyBlocks(entries)
+}
+
+func collectOriginSSLARNEntries(result originSSLBatchResult) []originSSLARNEntry {
+	entries := make([]originSSLARNEntry, 0)
+	for _, item := range result.Success {
+		for _, imp := range item.Imports {
+			if imp.Err != nil || strings.TrimSpace(imp.ARN) == "" {
 				continue
 			}
+			entries = append(entries, originSSLARNEntry{
+				Domain:       item.Domain,
+				AccountLabel: item.AccountLabel,
+				Alias:        imp.Alias,
+				Region:       imp.Region,
+				ARN:          strings.TrimSpace(imp.ARN),
+			})
 		}
+	}
+	return entries
+}
 
-		h.sendText(buildOriginSSLFallbackBlock(item))
+func (h *CommandHandler) sendOriginSSLARNMappingBlock(entries []originSSLARNEntry) {
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		lines = append(lines, fmt.Sprintf("%s | %s | %s | %s", entry.Domain, entry.Region, entry.Alias, extractARNResourceID(entry.ARN)))
+	}
+	h.sendOriginSSLPreBlocks("ARN 对照", lines)
+}
+
+func (h *CommandHandler) sendOriginSSLARNCopyBlocks(entries []originSSLARNEntry) {
+	lines := make([]string, 0, len(entries))
+	for i, entry := range entries {
+		line := entry.ARN
+		if i < len(entries)-1 {
+			line += ","
+		}
+		lines = append(lines, line)
+	}
+	h.sendOriginSSLPreBlocks("ARN 批量复制", lines)
+}
+
+func (h *CommandHandler) sendOriginSSLPreBlocks(title string, lines []string) {
+	lines = filterBlankLines(lines)
+	if len(lines) == 0 {
+		return
+	}
+
+	htmlSender, ok := h.Sender.(HTMLSender)
+	if !ok {
+		h.sendOriginSSLFallbackBlocks(title, lines)
+		return
+	}
+
+	ctx := context.Background()
+	for _, block := range buildOriginSSLHTMLPreBlocks(title, lines) {
+		if err := htmlSender.SendHTML(ctx, block); err != nil {
+			h.sendOriginSSLFallbackBlocks(title, lines)
+			return
+		}
 	}
 }
 
-func buildOriginSSLHTMLBlock(item originSSLDomainResult) string {
-	var sb strings.Builder
-	hasContent := false
-
-	for _, imp := range item.Imports {
-		if imp.Err != nil || strings.TrimSpace(imp.ARN) == "" {
-			continue
-		}
-		if hasContent {
-			sb.WriteString("\n\n")
-		}
-		sb.WriteString("<b>域名:</b> " + html.EscapeString(item.Domain) + "\n")
-		sb.WriteString("<b>Cloudflare 账号:</b> " + html.EscapeString(item.AccountLabel) + "\n")
-		sb.WriteString("<b>AWS 目标:</b> " + html.EscapeString(imp.Alias) + "\n")
-		sb.WriteString("<b>区域:</b> " + html.EscapeString(imp.Region) + "\n")
-		sb.WriteString("<pre>" + html.EscapeString(imp.ARN) + "</pre>")
-		hasContent = true
+func (h *CommandHandler) sendOriginSSLFallbackBlocks(title string, lines []string) {
+	blocks := buildOriginSSLTextBlocks(title, lines)
+	for _, block := range blocks {
+		h.sendText(block)
 	}
-
-	return sb.String()
 }
 
-func buildOriginSSLFallbackBlock(item originSSLDomainResult) string {
-	var blocks []string
-	for _, imp := range item.Imports {
-		if imp.Err != nil || strings.TrimSpace(imp.ARN) == "" {
+func buildOriginSSLHTMLPreBlocks(title string, lines []string) []string {
+	return buildOriginSSLBlocks(title, lines, func(title string, body []string) string {
+		var sb strings.Builder
+		sb.WriteString("<b>" + html.EscapeString(title) + "</b>\n<pre>")
+		for i, line := range body {
+			if i > 0 {
+				sb.WriteByte('\n')
+			}
+			sb.WriteString(html.EscapeString(line))
+		}
+		sb.WriteString("</pre>")
+		return sb.String()
+	})
+}
+
+func buildOriginSSLTextBlocks(title string, lines []string) []string {
+	return buildOriginSSLBlocks(title, lines, func(title string, body []string) string {
+		var sb strings.Builder
+		sb.WriteString(title)
+		for _, line := range body {
+			sb.WriteString("\n" + line)
+		}
+		return sb.String()
+	})
+}
+
+func buildOriginSSLBlocks(title string, lines []string, render func(title string, body []string) string) []string {
+	if len(lines) == 0 {
+		return nil
+	}
+
+	chunks := make([][]string, 0, 1)
+	current := make([]string, 0, len(lines))
+	for _, line := range lines {
+		candidate := append(append([]string(nil), current...), line)
+		if len(current) > 0 && len(render(title, candidate)) > tgMaxLen {
+			chunks = append(chunks, append([]string(nil), current...))
+			current = []string{line}
 			continue
 		}
-		blocks = append(blocks, fmt.Sprintf("域名: %s\nCloudflare 账号: %s\nAWS 目标: %s\n区域: %s\nARN:\n%s", item.Domain, item.AccountLabel, imp.Alias, imp.Region, imp.ARN))
+		current = candidate
 	}
-	return strings.Join(blocks, "\n\n")
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+
+	blocks := make([]string, 0, len(chunks))
+	for i, chunk := range chunks {
+		chunkTitle := title
+		if len(chunks) > 1 {
+			chunkTitle = fmt.Sprintf("%s (%d/%d)", title, i+1, len(chunks))
+		}
+		blocks = append(blocks, render(chunkTitle, chunk))
+	}
+	return blocks
+}
+
+func filterBlankLines(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func (h *CommandHandler) sendOriginSSLARNCSV(entries []originSSLARNEntry) error {
+	csvBytes, filename, err := buildOriginSSLARNCSV(entries)
+	if err != nil {
+		return err
+	}
+
+	tmpFile, err := os.CreateTemp("", "origin-ssl-arn-*.csv")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+	}()
+
+	if _, err := tmpFile.Write(csvBytes); err != nil {
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+
+	finalPath := filepath.Join(os.TempDir(), filename)
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, finalPath); err == nil {
+		tmpPath = finalPath
+	}
+
+	return h.Sender.SendDocumentPath(context.Background(), tmpPath, fmt.Sprintf("📄 /ssl ARN 对照 (%d 条)", len(entries)))
+}
+
+func buildOriginSSLARNCSV(entries []originSSLARNEntry) ([]byte, string, error) {
+	filename := fmt.Sprintf("origin-ssl-arn-%s.csv", time.Now().Format("20060102-150405"))
+	buf := &bytes.Buffer{}
+	w := csv.NewWriter(buf)
+	w.UseCRLF = false
+
+	if err := w.Write([]string{"域名", "Cloudflare账号", "AWS目标", "区域", "ARN_ID", "ARN尾段", "完整ARN"}); err != nil {
+		return nil, "", err
+	}
+
+	for _, entry := range entries {
+		if err := w.Write([]string{
+			entry.Domain,
+			entry.AccountLabel,
+			entry.Alias,
+			entry.Region,
+			extractARNResourceID(entry.ARN),
+			extractARNTail(entry.ARN),
+			entry.ARN,
+		}); err != nil {
+			return nil, "", err
+		}
+	}
+
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return nil, "", err
+	}
+
+	return buf.Bytes(), filename, nil
+}
+
+func extractARNResourceID(arn string) string {
+	arn = strings.TrimSpace(arn)
+	if arn == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(arn, "/"); idx >= 0 && idx < len(arn)-1 {
+		return arn[idx+1:]
+	}
+	if idx := strings.LastIndex(arn, ":"); idx >= 0 && idx < len(arn)-1 {
+		return arn[idx+1:]
+	}
+	return arn
+}
+
+func extractARNTail(arn string) string {
+	id := extractARNResourceID(arn)
+	if idx := strings.LastIndex(id, "-"); idx >= 0 && idx < len(id)-1 {
+		return id[idx+1:]
+	}
+	return id
 }
 
 func (h *CommandHandler) originSSLPromptText() string {
