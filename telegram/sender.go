@@ -21,6 +21,10 @@ type Sender interface {
 	AnswerCallback(ctx context.Context, callbackID, text string) error
 }
 
+type HTMLSender interface {
+	SendHTML(ctx context.Context, msg string) error
+}
+
 type NoopSender struct{}
 
 func (NoopSender) SendDocumentPath(ctx context.Context, filepath string, caption string) error {
@@ -39,6 +43,7 @@ func (NoopSender) EditButtons(ctx context.Context, chatID int64, messageID int, 
 }
 func (NoopSender) ClearButtons(ctx context.Context, chatID int64, messageID int) error { return nil }
 func (NoopSender) AnswerCallback(ctx context.Context, callbackID, text string) error   { return nil }
+func (NoopSender) SendHTML(ctx context.Context, msg string) error                       { return nil }
 
 // BotSender 实现了带简单重试和节流的 Telegram 发送能力。
 type BotSender struct {
@@ -95,6 +100,20 @@ func (s *BotSender) SendWithButtons(ctx context.Context, msg string, buttons [][
 		rows = append(rows, row)
 	}
 	message.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	return s.sendWithMarkup(ctx, message)
+}
+
+func (s *BotSender) SendHTML(ctx context.Context, msg string) error {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return nil
+	}
+	if len(msg) > tgMaxLen {
+		return fmt.Errorf("HTML 消息过长: %d", len(msg))
+	}
+
+	message := tgbotapi.NewMessage(s.chatID, msg)
+	message.ParseMode = tgbotapi.ModeHTML
 	return s.sendWithMarkup(ctx, message)
 }
 func splitTelegramText(s string, limit int) []string {
