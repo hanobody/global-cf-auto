@@ -13,7 +13,11 @@ type batchAPIPacer struct {
 }
 
 func newBatchAPIPacer() *batchAPIPacer {
-	return &batchAPIPacer{interval: batchAPICallInterval}
+	return newBatchAPIPacerWithInterval(batchAPICallInterval)
+}
+
+func newBatchAPIPacerWithInterval(interval time.Duration) *batchAPIPacer {
+	return &batchAPIPacer{interval: interval}
 }
 
 func (p *batchAPIPacer) Wait(ctx context.Context) error {

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"DomainC/config"
@@ -78,7 +79,10 @@ type Client interface {
 	GetAbuseReportCount(ctx context.Context, account config.CF) (int, error)
 }
 
-type apiClient struct{}
+type apiClient struct {
+	accountIDMu    sync.RWMutex
+	accountIDCache map[string]string
+}
 
 type abuseReportsResponse struct {
 	ResultInfo struct {
@@ -94,7 +98,9 @@ type abuseReportsResponse struct {
 
 // NewClient 返回默认的 Cloudflare API 客户端实现
 func NewClient() Client {
-	return &apiClient{}
+	return &apiClient{
+		accountIDCache: make(map[string]string),
+	}
 }
 
 // ErrZoneNotFound 在账户中未找到域名时返回
@@ -248,6 +254,10 @@ func (c *apiClient) GetAccountID(ctx context.Context, account config.CF) (string
 	ctx, cancel := ensureTimeout(ctx)
 	defer cancel()
 
+	if accountID, ok := c.cachedAccountID(account); ok {
+		return accountID, nil
+	}
+
 	api, err := cloudflare.NewWithAPIToken(account.APIToken)
 	if err != nil {
 		return "", fmt.Errorf("初始化客户端失败 [%s]: %v", account.Label, err)
@@ -260,7 +270,9 @@ func (c *apiClient) GetAccountID(ctx context.Context, account config.CF) (string
 	if len(accounts) == 0 {
 		return "", fmt.Errorf("账户 [%s] 下无可用 Account ID", account.Label)
 	}
-	return accounts[0].ID, nil
+	accountID := accounts[0].ID
+	c.storeAccountID(account, accountID)
+	return accountID, nil
 }
 
 // CreateZone 创建新 Zone（修复版：自动获取并传递 Account ID + 重试）
@@ -287,16 +299,19 @@ func (c *apiClient) CreateZone(ctx context.Context, account config.CF, domain st
 		if createErr == nil {
 			break
 		}
-		if strings.Contains(createErr.Error(), "500") || strings.Contains(createErr.Error(), "Internal Server Error") {
-			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		if shouldRetryCreateZone(createErr) {
+			time.Sleep(createZoneRetryDelay(createErr, attempt))
 			continue
 		}
 		break
 	}
 
 	if createErr != nil {
-		if strings.Contains(createErr.Error(), "500") {
+		if strings.Contains(strings.ToLower(createErr.Error()), "500") {
 			return ZoneDetail{}, fmt.Errorf("创建域名失败（HTTP 500，很可能是域名尚未在注册商成功注册）: %w\n请先在 Namecheap/GoDaddy/阿里云 等注册域名，等待 WHOIS 可查后再试", createErr)
+		}
+		if shouldRetryCreateZone(createErr) {
+			return ZoneDetail{}, fmt.Errorf("创建域名失败（Cloudflare API 限流或临时异常，已自动退避重试）: %w", createErr)
 		}
 		return ZoneDetail{}, fmt.Errorf("创建域名失败: %w", createErr)
 	}
@@ -308,6 +323,66 @@ func (c *apiClient) CreateZone(ctx context.Context, account config.CF, domain st
 		Status:      zone.Status,
 		Paused:      zone.Paused,
 	}, nil
+}
+
+func (c *apiClient) cachedAccountID(account config.CF) (string, bool) {
+	key := accountIDCacheKey(account)
+	if key == "" {
+		return "", false
+	}
+
+	c.accountIDMu.RLock()
+	defer c.accountIDMu.RUnlock()
+	accountID, ok := c.accountIDCache[key]
+	return accountID, ok && strings.TrimSpace(accountID) != ""
+}
+
+func (c *apiClient) storeAccountID(account config.CF, accountID string) {
+	key := accountIDCacheKey(account)
+	if key == "" || strings.TrimSpace(accountID) == "" {
+		return
+	}
+
+	c.accountIDMu.Lock()
+	defer c.accountIDMu.Unlock()
+	c.accountIDCache[key] = accountID
+}
+
+func accountIDCacheKey(account config.CF) string {
+	if label := strings.TrimSpace(account.Label); label != "" {
+		return label
+	}
+	return strings.TrimSpace(account.APIToken)
+}
+
+func shouldRetryCreateZone(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "500") ||
+		strings.Contains(msg, "internal server error") ||
+		strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "429") ||
+		strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "exceeded available rate limit retries")
+}
+
+func createZoneRetryDelay(err error, attempt int) time.Duration {
+	if err == nil {
+		return 0
+	}
+
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "429") ||
+		strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "exceeded available rate limit retries") {
+		return time.Duration(attempt+1) * 5 * time.Second
+	}
+
+	return time.Duration(attempt+1) * 2 * time.Second
 }
 func (c *apiClient) DeleteDNSRecord(ctx context.Context, account config.CF, domain string, recordName string) (int, error) {
 	ctx, cancel := ensureTimeout(ctx)
