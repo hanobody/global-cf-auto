@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"DomainC/cfclient"
+	"DomainC/config"
 	"DomainC/telegram"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -397,37 +398,21 @@ func handleDeleteCommandCallback(action string, parts []string, user *tgbotapi.U
 	sender := telegram.DefaultSender()
 	switch action {
 	case "deletecmd_select":
-		accountLabel := payload.AccountLabel
-		if cfclient.GetAccountByLabel(accountLabel) == nil {
-			log.Printf("未找到账号标签: %s", accountLabel)
-			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", accountLabel))
-			return
-		}
-
-		telegram.SetPendingDeleteInput(user.ID, telegram.DeleteInputRequest{
-			AccountLabel: accountLabel,
-		})
+		telegram.SetPendingDeleteInput(user.ID, telegram.DeleteInputRequest{})
 
 		if cb.Message != nil {
 			_ = sender.EditButtons(context.Background(),
 				cb.Message.Chat.ID,
 				cb.Message.MessageID,
 				[][]telegram.Button{{
-					{Text: "已选择 " + accountLabel, CallbackData: "noop"},
+					{Text: "已进入批量输入", CallbackData: "noop"},
 				}},
 			)
 		}
 
-		telegram.SendTelegramAlert(telegram.BuildDeleteInputPrompt(accountLabel))
+		telegram.SendTelegramAlert(telegram.BuildDeleteInputPrompt(""))
 
 	case "deletecmd_confirm":
-		account := cfclient.GetAccountByLabel(payload.AccountLabel)
-		if account == nil {
-			log.Printf("未找到账号标签: %s", payload.AccountLabel)
-			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", payload.AccountLabel))
-			return
-		}
-
 		if cb.Message != nil {
 			_ = sender.EditButtons(context.Background(),
 				cb.Message.Chat.ID,
@@ -439,7 +424,7 @@ func handleDeleteCommandCallback(action string, parts []string, user *tgbotapi.U
 		}
 
 		go func() {
-			result := telegram.ProcessDeleteBatch(cfclient.NewClient(), *account, payload.Domains)
+			result := telegram.ProcessDeleteBatch(cfclient.NewClient(), config.Cfg.CloudflareAccounts, payload.Domains)
 			result.ParseErrors = append(result.ParseErrors, payload.ParseErrors...)
 			telegram.SendTelegramAlert(result.Summary())
 
