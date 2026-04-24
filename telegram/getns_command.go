@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"time"
 
 	"DomainC/cfclient"
 	"DomainC/config"
 )
+
+const getNSCreateZoneInterval = 3 * time.Second
 
 type getNSDomainResult struct {
 	Domain       string
@@ -169,7 +172,7 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 		ParseErrors:   parseErrors,
 	}
 	ctx := context.Background()
-	cfPacer := newBatchAPIPacer()
+	cfPacer := newBatchAPIPacerWithInterval(getNSCreateZoneInterval)
 	registrarPacer := newBatchAPIPacer()
 
 	for _, domain := range domains {

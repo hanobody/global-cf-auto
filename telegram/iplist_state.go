@@ -24,6 +24,10 @@ type GetNSInputRequest struct {
 	AccountLabel string
 }
 
+type DeleteInputRequest struct {
+	AccountLabel string
+}
+
 type OriginSSLInputRequest struct {
 	AWSAliases []string
 }
@@ -39,6 +43,12 @@ type GetNSCallbackPayload struct {
 	AccountLabel string
 }
 
+type DeleteCallbackPayload struct {
+	AccountLabel string
+	Domains      []string
+	ParseErrors  []string
+}
+
 type OriginSSLSelection struct {
 	AWSAliases map[string]bool
 }
@@ -51,18 +61,22 @@ var interactionState = struct {
 	mu                  sync.Mutex
 	pendingIPList       map[int64]IPListInputRequest
 	pendingGetNS        map[int64]GetNSInputRequest
+	pendingDelete       map[int64]DeleteInputRequest
 	pendingOriginSSL    map[int64]OriginSSLInputRequest
 	originSSLSelections map[int64]OriginSSLSelection
 	ipListCallbacks     map[string]IPListCallbackPayload
 	getNSCallbacks      map[string]GetNSCallbackPayload
+	deleteCallbacks     map[string]DeleteCallbackPayload
 	originSSLCallbacks  map[string]OriginSSLCallbackPayload
 }{
 	pendingIPList:       make(map[int64]IPListInputRequest),
 	pendingGetNS:        make(map[int64]GetNSInputRequest),
+	pendingDelete:       make(map[int64]DeleteInputRequest),
 	pendingOriginSSL:    make(map[int64]OriginSSLInputRequest),
 	originSSLSelections: make(map[int64]OriginSSLSelection),
 	ipListCallbacks:     make(map[string]IPListCallbackPayload),
 	getNSCallbacks:      make(map[string]GetNSCallbackPayload),
+	deleteCallbacks:     make(map[string]DeleteCallbackPayload),
 	originSSLCallbacks:  make(map[string]OriginSSLCallbackPayload),
 }
 
@@ -70,6 +84,7 @@ func SetPendingIPListInput(userID int64, req IPListInputRequest) {
 	interactionState.mu.Lock()
 	defer interactionState.mu.Unlock()
 	delete(interactionState.pendingGetNS, userID)
+	delete(interactionState.pendingDelete, userID)
 	delete(interactionState.pendingOriginSSL, userID)
 	interactionState.pendingIPList[userID] = req
 }
@@ -91,6 +106,7 @@ func SetPendingGetNSInput(userID int64, req GetNSInputRequest) {
 	interactionState.mu.Lock()
 	defer interactionState.mu.Unlock()
 	delete(interactionState.pendingIPList, userID)
+	delete(interactionState.pendingDelete, userID)
 	delete(interactionState.pendingOriginSSL, userID)
 	interactionState.pendingGetNS[userID] = req
 }
@@ -108,11 +124,34 @@ func ClearPendingGetNSInput(userID int64) {
 	delete(interactionState.pendingGetNS, userID)
 }
 
+func SetPendingDeleteInput(userID int64, req DeleteInputRequest) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	delete(interactionState.pendingIPList, userID)
+	delete(interactionState.pendingGetNS, userID)
+	delete(interactionState.pendingOriginSSL, userID)
+	interactionState.pendingDelete[userID] = req
+}
+
+func GetPendingDeleteInput(userID int64) (DeleteInputRequest, bool) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	req, ok := interactionState.pendingDelete[userID]
+	return req, ok
+}
+
+func ClearPendingDeleteInput(userID int64) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	delete(interactionState.pendingDelete, userID)
+}
+
 func SetPendingOriginSSLInput(userID int64, req OriginSSLInputRequest) {
 	interactionState.mu.Lock()
 	defer interactionState.mu.Unlock()
 	delete(interactionState.pendingIPList, userID)
 	delete(interactionState.pendingGetNS, userID)
+	delete(interactionState.pendingDelete, userID)
 	interactionState.pendingOriginSSL[userID] = OriginSSLInputRequest{
 		AWSAliases: append([]string(nil), req.AWSAliases...),
 	}
@@ -217,6 +256,32 @@ func GetGetNSCallbackPayload(token string) (GetNSCallbackPayload, bool) {
 	defer interactionState.mu.Unlock()
 	payload, ok := interactionState.getNSCallbacks[token]
 	return payload, ok
+}
+
+func SetDeleteCallbackPayload(payload DeleteCallbackPayload) string {
+	token := newInteractionToken()
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	interactionState.deleteCallbacks[token] = DeleteCallbackPayload{
+		AccountLabel: payload.AccountLabel,
+		Domains:      append([]string(nil), payload.Domains...),
+		ParseErrors:  append([]string(nil), payload.ParseErrors...),
+	}
+	return token
+}
+
+func GetDeleteCallbackPayload(token string) (DeleteCallbackPayload, bool) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	payload, ok := interactionState.deleteCallbacks[token]
+	if !ok {
+		return DeleteCallbackPayload{}, false
+	}
+	return DeleteCallbackPayload{
+		AccountLabel: payload.AccountLabel,
+		Domains:      append([]string(nil), payload.Domains...),
+		ParseErrors:  append([]string(nil), payload.ParseErrors...),
+	}, true
 }
 
 func SetOriginSSLCallbackPayload(payload OriginSSLCallbackPayload) string {

@@ -41,6 +41,9 @@ func (h *CommandHandler) HandleMessage(msg *tgbotapi.Message) {
 			if h.handlePendingOriginSSLInput(msg.Text, msg.From.ID) {
 				return
 			}
+			if h.handlePendingDeleteInput(msg.Text, msg.From.ID) {
+				return
+			}
 			if h.handlePendingGetNSInput(msg.Text, msg.From.ID) {
 				return
 			}
