@@ -38,6 +38,10 @@ func HandleCallback(cb *tgbotapi.CallbackQuery) {
 		handleGetNSCallback(action, parts, user, cb)
 		return
 	}
+	if strings.HasPrefix(action, "deletecmd_") {
+		handleDeleteCommandCallback(action, parts, user, cb)
+		return
+	}
 	if strings.HasPrefix(action, "ssl_") {
 		handleOriginSSLCallback(action, parts, user, cb)
 		return
@@ -375,6 +379,94 @@ func handleGetNSCallback(action string, parts []string, user *tgbotapi.User, cb 
 	}
 
 	telegram.SendTelegramAlert(fmt.Sprintf("已选择账号 %s。\n请直接发送要添加的域名，支持多行、空格、逗号或分号分隔。\n示例：\nexample.com\nexample.net", accountLabel))
+}
+
+func handleDeleteCommandCallback(action string, parts []string, user *tgbotapi.User, cb *tgbotapi.CallbackQuery) {
+	if len(parts) < 2 {
+		log.Printf("无效的 delete 回调数据: %v", parts)
+		return
+	}
+
+	token := parts[1]
+	payload, ok := telegram.GetDeleteCallbackPayload(token)
+	if !ok {
+		telegram.SendTelegramAlert("操作已过期，请重新执行 /delete。")
+		return
+	}
+
+	sender := telegram.DefaultSender()
+	switch action {
+	case "deletecmd_select":
+		accountLabel := payload.AccountLabel
+		if cfclient.GetAccountByLabel(accountLabel) == nil {
+			log.Printf("未找到账号标签: %s", accountLabel)
+			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", accountLabel))
+			return
+		}
+
+		telegram.SetPendingDeleteInput(user.ID, telegram.DeleteInputRequest{
+			AccountLabel: accountLabel,
+		})
+
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(),
+				cb.Message.Chat.ID,
+				cb.Message.MessageID,
+				[][]telegram.Button{{
+					{Text: "已选择 " + accountLabel, CallbackData: "noop"},
+				}},
+			)
+		}
+
+		telegram.SendTelegramAlert(telegram.BuildDeleteInputPrompt(accountLabel))
+
+	case "deletecmd_confirm":
+		account := cfclient.GetAccountByLabel(payload.AccountLabel)
+		if account == nil {
+			log.Printf("未找到账号标签: %s", payload.AccountLabel)
+			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", payload.AccountLabel))
+			return
+		}
+
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(),
+				cb.Message.Chat.ID,
+				cb.Message.MessageID,
+				[][]telegram.Button{{
+					{Text: "✅ 已确认，批量处理中…", CallbackData: "noop"},
+				}},
+			)
+		}
+
+		go func() {
+			result := telegram.ProcessDeleteBatch(cfclient.NewClient(), *account, payload.Domains)
+			result.ParseErrors = append(result.ParseErrors, payload.ParseErrors...)
+			telegram.SendTelegramAlert(result.Summary())
+
+			if cb.Message != nil {
+				_ = sender.EditButtons(context.Background(),
+					cb.Message.Chat.ID,
+					cb.Message.MessageID,
+					[][]telegram.Button{{
+						{Text: "✅ 已完成", CallbackData: "noop"},
+					}},
+				)
+				_ = sender.ClearButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID)
+			}
+		}()
+
+	case "deletecmd_cancel":
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(),
+				cb.Message.Chat.ID,
+				cb.Message.MessageID,
+				[][]telegram.Button{{
+					{Text: "❌ 已取消", CallbackData: "noop"},
+				}},
+			)
+		}
+		telegram.SendTelegramAlert(fmt.Sprintf("已取消批量删除（操作人: %s）", user.UserName))
+	}
 }
 
 func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User, cb *tgbotapi.CallbackQuery) {
