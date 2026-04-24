@@ -187,7 +187,7 @@ func (h *CommandHandler) ipListInputPrompt(req IPListInputRequest) string {
 	case IPListActionDelete:
 		return fmt.Sprintf("已选择白名单 %s（账号: %s）。\n请直接发送要删除的地址，每行一条，只需填写 IP 或 CIDR。\n示例：\n1.2.3.4\n2407:cdc0:b010::/112", listName, req.AccountLabel)
 	default:
-		return fmt.Sprintf("已选择白名单 %s（账号: %s）。\n请直接发送要添加的地址，每行一条，格式：IP 或 CIDR，备注可选。\n示例：\n1.2.3.4 办公网\n2407:cdc0:b010::/112 香港", listName, req.AccountLabel)
+		return fmt.Sprintf("已选择白名单 %s（账号: %s）。\n请直接发送要添加的地址，每行一条，格式：IP 或 CIDR，备注可选。\n同一批次里未填写备注的行，会自动继承本批第一条非空备注。\n示例：\n1.2.3.4 办公网\n2407:cdc0:b010::/112\n8.8.8.8", listName, req.AccountLabel)
 	}
 }
 
@@ -246,6 +246,7 @@ func (h *CommandHandler) handlePendingIPListInput(msgText string, userID int64) 
 
 func (h *CommandHandler) processIPListAddBatch(acc config.CF, req IPListInputRequest, entries []ipListBatchEntry) ipListBatchResult {
 	result := ipListBatchResult{Request: req}
+	entries = fillIPListBatchComments(entries)
 	for _, entry := range entries {
 		if _, err := h.CFClient.CreateCustomListItem(context.Background(), acc, req.ListID, entry.IP, entry.Comment); err != nil {
 			result.Failed = append(result.Failed, fmt.Sprintf("%s: %v", entry.IP, err))
@@ -270,15 +271,17 @@ func (h *CommandHandler) processIPListDeleteBatch(acc config.CF, req IPListInput
 		if item.ID == "" || item.IP == nil {
 			continue
 		}
-		ip, err := normalizeIPListValue(*item.IP)
-		if err != nil || ip == "" {
+		keys, err := buildIPListMatchKeys(*item.IP)
+		if err != nil || len(keys) == 0 {
 			continue
 		}
-		index[ip] = append(index[ip], item.ID)
+		for _, key := range keys {
+			index[key] = appendUniqueIPListItemID(index[key], item.ID)
+		}
 	}
 
 	for _, entry := range entries {
-		itemIDs := index[entry.IP]
+		itemIDs := lookupIPListItemIDs(index, entry.IP)
 		if len(itemIDs) == 0 {
 			result.Missing = append(result.Missing, entry.IP)
 			continue
@@ -297,7 +300,7 @@ func (h *CommandHandler) processIPListDeleteBatch(acc config.CF, req IPListInput
 		}
 
 		result.Success++
-		delete(index, entry.IP)
+		removeIPListItemIDs(index, entry.IP, itemIDs)
 	}
 
 	return result
@@ -348,6 +351,33 @@ func parseIPListInput(input string) (string, string, error) {
 	return ipStr, comment, nil
 }
 
+func fillIPListBatchComments(entries []ipListBatchEntry) []ipListBatchEntry {
+	if len(entries) == 0 {
+		return entries
+	}
+
+	var inherited string
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.Comment) == "" {
+			continue
+		}
+		inherited = strings.TrimSpace(entry.Comment)
+		break
+	}
+	if inherited == "" {
+		return entries
+	}
+
+	filled := make([]ipListBatchEntry, 0, len(entries))
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.Comment) == "" {
+			entry.Comment = inherited
+		}
+		filled = append(filled, entry)
+	}
+	return filled
+}
+
 func normalizeIPListValue(input string) (string, error) {
 	ipStr := strings.TrimSpace(input)
 	if ipStr == "" {
@@ -367,4 +397,132 @@ func normalizeIPListValue(input string) (string, error) {
 		return "", fmt.Errorf("IP 无法解析")
 	}
 	return ip.String(), nil
+}
+
+func buildIPListMatchKeys(input string) ([]string, error) {
+	ipStr := strings.TrimSpace(input)
+	if ipStr == "" {
+		return nil, fmt.Errorf("IP 不能为空")
+	}
+
+	keySet := make(map[string]struct{}, 2)
+	addKey := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		keySet[value] = struct{}{}
+	}
+
+	if strings.Contains(ipStr, "/") {
+		ip, network, err := net.ParseCIDR(ipStr)
+		if err != nil {
+			return nil, err
+		}
+
+		addKey(network.String())
+		ones, bits := network.Mask.Size()
+		if ones == bits {
+			addKey(normalizeParsedIP(ip))
+			addKey(singleHostCIDR(ip))
+		}
+	} else {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return nil, fmt.Errorf("IP 无法解析")
+		}
+
+		addKey(normalizeParsedIP(ip))
+		addKey(singleHostCIDR(ip))
+	}
+
+	keys := make([]string, 0, len(keySet))
+	for key := range keySet {
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
+func lookupIPListItemIDs(index map[string][]string, value string) []string {
+	keys, err := buildIPListMatchKeys(value)
+	if err != nil {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	itemIDs := make([]string, 0)
+	for _, key := range keys {
+		for _, itemID := range index[key] {
+			if _, ok := seen[itemID]; ok {
+				continue
+			}
+			seen[itemID] = struct{}{}
+			itemIDs = append(itemIDs, itemID)
+		}
+	}
+	return itemIDs
+}
+
+func removeIPListItemIDs(index map[string][]string, value string, itemIDs []string) {
+	keys, err := buildIPListMatchKeys(value)
+	if err != nil {
+		return
+	}
+
+	removeSet := make(map[string]struct{}, len(itemIDs))
+	for _, itemID := range itemIDs {
+		if strings.TrimSpace(itemID) == "" {
+			continue
+		}
+		removeSet[itemID] = struct{}{}
+	}
+
+	for _, key := range keys {
+		bucket := index[key]
+		if len(bucket) == 0 {
+			continue
+		}
+
+		kept := bucket[:0]
+		for _, itemID := range bucket {
+			if _, ok := removeSet[itemID]; ok {
+				continue
+			}
+			kept = append(kept, itemID)
+		}
+
+		if len(kept) == 0 {
+			delete(index, key)
+			continue
+		}
+		index[key] = kept
+	}
+}
+
+func appendUniqueIPListItemID(items []string, itemID string) []string {
+	for _, existing := range items {
+		if existing == itemID {
+			return items
+		}
+	}
+	return append(items, itemID)
+}
+
+func normalizeParsedIP(ip net.IP) string {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4.String()
+	}
+	return ip.String()
+}
+
+func singleHostCIDR(ip net.IP) string {
+	if ip4 := ip.To4(); ip4 != nil {
+		return (&net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}).String()
+	}
+
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return ""
+	}
+	return (&net.IPNet{IP: ip16, Mask: net.CIDRMask(128, 128)}).String()
 }
