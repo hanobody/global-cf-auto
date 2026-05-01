@@ -816,6 +816,38 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 			telegram.SendTelegramAlert("请至少选择一个域名后再确认。")
 			return
 		}
+		selection, ok := telegram.GetOriginSSLDomainSelection(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("/ssl 域名选择已过期，请重新执行 /ssl。")
+			return
+		}
+		if len(config.Cfg.AWSTargets) > 0 {
+			page := telegram.BuildOriginSSLAWSSelectionView(payload.SessionID, selection)
+			editOrSendPage(sender, cb, page)
+		} else {
+			page := telegram.BuildOriginSSLDomainConfirmView(payload.SessionID, items)
+			editOrSendPage(sender, cb, page)
+		}
+
+	case "ssl_domain_aws_toggle":
+		selection, ok := telegram.ToggleOriginSSLDomainAWSAlias(payload.SessionID, payload.Value)
+		if !ok {
+			telegram.SendTelegramAlert("/ssl AWS 选择已过期，请重新执行 /ssl。")
+			return
+		}
+		page := telegram.BuildOriginSSLAWSSelectionView(payload.SessionID, selection)
+		editOrSendPage(sender, cb, page)
+
+	case "ssl_domain_aws_done":
+		items, ok := telegram.SelectedOriginSSLDomainItems(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("/ssl 域名选择已过期，请重新执行 /ssl。")
+			return
+		}
+		if len(items) == 0 {
+			telegram.SendTelegramAlert("请至少选择一个域名后再确认。")
+			return
+		}
 		page := telegram.BuildOriginSSLDomainConfirmView(payload.SessionID, items)
 		editOrSendPage(sender, cb, page)
 
@@ -834,8 +866,14 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", payload.AccountLabel))
 			return
 		}
+		selection, ok := telegram.GetOriginSSLDomainSelection(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("/ssl 域名选择已过期，请重新执行 /ssl。")
+			return
+		}
+		awsAliases := sortedSelectedKeys(selection.AWSAliases)
 		go func() {
-			result := telegram.ProcessOriginSSLDomainItems(context.Background(), cfclient.NewClient(), *account, items)
+			result := telegram.ProcessOriginSSLDomainItems(context.Background(), cfclient.NewClient(), *account, items, awsAliases)
 			telegram.SendTelegramAlert(result.Summary())
 		}()
 		page := telegram.BuildOriginSSLDNSQuestionView(payload.SessionID, payload.AccountLabel, len(items))
@@ -920,6 +958,107 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 		page := telegram.BuildOriginSSLContinueView(plan.SessionID, plan.AccountLabel)
 		editOrSendPage(sender, cb, page)
 
+	case "ssl_dns_name_toggle":
+		selection, ok := telegram.ToggleOriginSSLDNSNameSelectionDomain(payload.SessionID, payload.Value)
+		if !ok {
+			telegram.SendTelegramAlert("/ssl 解析名选择已过期，请重新执行 /ssl。")
+			return
+		}
+		selection.Page = payload.Page
+		page := telegram.BuildOriginSSLDNSNameDomainSelectionView(payload.SessionID, selection)
+		editOrSendPage(sender, cb, page)
+
+	case "ssl_dns_name_page":
+		selection, ok := telegram.SetOriginSSLDNSNameSelectionPage(payload.SessionID, payload.Page)
+		if !ok {
+			telegram.SendTelegramAlert("/ssl 解析名选择已过期，请重新执行 /ssl。")
+			return
+		}
+		page := telegram.BuildOriginSSLDNSNameDomainSelectionView(payload.SessionID, selection)
+		editOrSendPage(sender, cb, page)
+
+	case "ssl_dns_name_all":
+		selection, ok := telegram.SelectAllOriginSSLDNSNameDomains(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("/ssl 解析名选择已过期，请重新执行 /ssl。")
+			return
+		}
+		newPlan := telegram.BuildOriginSSLDNSNamePlan(selection.AccountLabel, selection.OriginSessionID, selection.Domains, selection.Names, selection.DNSRecordType, selection.DNSTarget, selection.Proxied)
+		combinedRecords := append([]telegram.OriginSSLDNSRecordPlan(nil), selection.PendingDNSRecords...)
+		combinedRecords = append(combinedRecords, newPlan.Records...)
+		telegram.ClearOriginSSLDNSNameSelection(payload.SessionID)
+		plan := telegram.OriginSSLDNSPlan{
+			AccountLabel: selection.AccountLabel,
+			SessionID:    selection.OriginSessionID,
+			Records:      combinedRecords,
+		}
+		planID := telegram.SetOriginSSLDNSPlan(plan)
+		page := telegram.BuildOriginSSLDNSPlanConfirmView(planID, plan)
+		editOrSendPage(sender, cb, page)
+
+	case "ssl_dns_name_done":
+		selection, ok := telegram.GetOriginSSLDNSNameSelection(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("/ssl 解析名选择已过期，请重新执行 /ssl。")
+			return
+		}
+		selectedDomains, ok := telegram.SelectedOriginSSLDNSNameDomains(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("/ssl 解析名选择已过期，请重新执行 /ssl。")
+			return
+		}
+		if len(selectedDomains) == 0 {
+			telegram.SendTelegramAlert("请至少选择一个域名后再确认。")
+			return
+		}
+		newPlan := telegram.BuildOriginSSLDNSNamePlan(selection.AccountLabel, selection.OriginSessionID, selectedDomains, selection.Names, selection.DNSRecordType, selection.DNSTarget, selection.Proxied)
+		combinedRecords := append([]telegram.OriginSSLDNSRecordPlan(nil), selection.PendingDNSRecords...)
+		combinedRecords = append(combinedRecords, newPlan.Records...)
+		remaining := remainingStringItems(selection.Domains, selectedDomains)
+		telegram.ClearOriginSSLDNSNameSelection(payload.SessionID)
+		if len(remaining) == 0 {
+			plan := telegram.OriginSSLDNSPlan{
+				AccountLabel: selection.AccountLabel,
+				SessionID:    selection.OriginSessionID,
+				Records:      combinedRecords,
+			}
+			planID := telegram.SetOriginSSLDNSPlan(plan)
+			page := telegram.BuildOriginSSLDNSPlanConfirmView(planID, plan)
+			editOrSendPage(sender, cb, page)
+			return
+		}
+		req := telegram.OriginSSLInputRequest{
+			AccountLabel:      selection.AccountLabel,
+			SessionID:         selection.OriginSessionID,
+			Stage:             telegram.OriginSSLInputDNSRecords,
+			DNSTarget:         selection.DNSTarget,
+			DNSRecordType:     selection.DNSRecordType,
+			Proxied:           selection.Proxied,
+			SelectedDomains:   remaining,
+			PendingDNSRecords: combinedRecords,
+		}
+		telegram.SetPendingOriginSSLInput(user.ID, req)
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: "等待剩余域名解析输入", CallbackData: "noop"},
+			}})
+		}
+		telegram.SendTelegramAlert(telegram.BuildOriginSSLDNSRecordsPrompt(req, nil))
+
+	case "ssl_dns_name_cancel":
+		selection, ok := telegram.GetOriginSSLDNSNameSelection(payload.SessionID)
+		telegram.ClearOriginSSLDNSNameSelection(payload.SessionID)
+		if ok {
+			telegram.ClearOriginSSLDomainSelection(selection.OriginSessionID)
+		}
+		telegram.ClearPendingOriginSSLInput(user.ID)
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: "已结束", CallbackData: "noop"},
+			}})
+		}
+		telegram.SendTelegramAlert(fmt.Sprintf("/ssl 交互已结束（操作人: %s）", user.UserName))
+
 	case "ssl_finish":
 		telegram.ClearOriginSSLDomainSelection(payload.SessionID)
 		telegram.ClearPendingOriginSSLInput(user.ID)
@@ -972,5 +1111,28 @@ func sortedSelectedKeys(items map[string]bool) []string {
 		out = append(out, key)
 	}
 	sort.Strings(out)
+	return out
+}
+
+func remainingStringItems(all []string, selected []string) []string {
+	selectedSet := make(map[string]struct{}, len(selected))
+	for _, item := range selected {
+		item = strings.TrimSpace(strings.ToLower(item))
+		if item == "" {
+			continue
+		}
+		selectedSet[item] = struct{}{}
+	}
+	var out []string
+	for _, item := range all {
+		normalized := strings.TrimSpace(strings.ToLower(item))
+		if normalized == "" {
+			continue
+		}
+		if _, ok := selectedSet[normalized]; ok {
+			continue
+		}
+		out = append(out, normalized)
+	}
 	return out
 }

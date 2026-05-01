@@ -1,6 +1,7 @@
 package cfclient
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -134,6 +135,30 @@ type zoneListResponse struct {
 		Message string `json:"message"`
 	} `json:"errors"`
 	Success bool `json:"success"`
+}
+
+type zoneOverviewGraphQLResponse struct {
+	Data struct {
+		Viewer struct {
+			Zones []struct {
+				ZoneTag string `json:"zoneTag"`
+				HTTP    []struct {
+					Uniq struct {
+						Uniques int `json:"uniques"`
+					} `json:"uniq"`
+					Sum struct {
+						Threats int `json:"threats"`
+					} `json:"sum"`
+				} `json:"httpRequests1dGroups"`
+				Firewall []struct {
+					Count int `json:"count"`
+				} `json:"firewallEventsAdaptiveGroups"`
+			} `json:"zones"`
+		} `json:"viewer"`
+	} `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
 }
 
 // NewClient 返回默认的 Cloudflare API 客户端实现
@@ -942,10 +967,7 @@ func (c *apiClient) ListZoneSummaries(ctx context.Context, account config.CF) ([
 		}
 
 		for _, z := range result.Result {
-			plan := strings.TrimSpace(z.Plan.Name)
-			if plan == "" {
-				plan = "-"
-			}
+			plan := compactZonePlan(z.Plan.Name)
 			out = append(out, ZoneSummary{
 				ID:               z.ID,
 				Name:             z.Name,
@@ -953,8 +975,8 @@ func (c *apiClient) ListZoneSummaries(ctx context.Context, account config.CF) ([
 				Paused:           z.Paused,
 				CreatedOn:        z.CreatedOn,
 				Plan:             plan,
-				SecurityInsights: "-",
-				UniqueVisitors:   "-",
+				SecurityInsights: "0",
+				UniqueVisitors:   "0",
 			})
 		}
 
@@ -962,7 +984,138 @@ func (c *apiClient) ListZoneSummaries(ctx context.Context, account config.CF) ([
 			break
 		}
 	}
+	c.hydrateZoneOverviewMetrics(ctx, account, accountID, out)
 	return out, nil
+}
+
+func compactZonePlan(plan string) string {
+	plan = strings.TrimSpace(plan)
+	if plan == "" {
+		return "-"
+	}
+	lower := strings.ToLower(plan)
+	switch {
+	case strings.Contains(lower, "free"):
+		return "Free"
+	case strings.Contains(lower, "pro"):
+		return "Pro"
+	case strings.Contains(lower, "business"):
+		return "Business"
+	case strings.Contains(lower, "enterprise"):
+		return "Enterprise"
+	}
+	if len(plan) > 16 {
+		return plan[:16]
+	}
+	return plan
+}
+
+func (c *apiClient) hydrateZoneOverviewMetrics(ctx context.Context, account config.CF, accountID string, zones []ZoneSummary) {
+	if len(zones) == 0 {
+		return
+	}
+	metrics, err := c.fetchAccountZoneOverviewMetrics(ctx, account, accountID)
+	if err != nil {
+		log.Printf("[ListZoneSummaries] overview metrics unavailable account=%s: %v", account.Label, err)
+		return
+	}
+	for i := range zones {
+		metric, ok := metrics[zones[i].ID]
+		if !ok {
+			continue
+		}
+		zones[i].SecurityInsights = fmt.Sprintf("%d", metric.SecurityInsights)
+		zones[i].UniqueVisitors = fmt.Sprintf("%d", metric.UniqueVisitors)
+	}
+}
+
+type zoneOverviewMetric struct {
+	SecurityInsights int
+	UniqueVisitors   int
+}
+
+func (c *apiClient) fetchAccountZoneOverviewMetrics(ctx context.Context, account config.CF, accountID string) (map[string]zoneOverviewMetric, error) {
+	end := time.Now().UTC()
+	start := end.Add(-24 * time.Hour)
+	query := `query($accountTag: string, $dateStart: Date, $dateEnd: Date, $dtStart: Time, $dtEnd: Time) {
+viewer {
+zones(filter: {accountTag: $accountTag}) {
+zoneTag
+httpRequests1dGroups(limit: 1, filter: {date_geq: $dateStart, date_leq: $dateEnd}) {
+uniq { uniques }
+sum { threats }
+}
+firewallEventsAdaptiveGroups(limit: 1, filter: {datetime_geq: $dtStart, datetime_leq: $dtEnd}) {
+count
+}
+}
+}
+}`
+	vars := map[string]interface{}{
+		"accountTag": accountID,
+		"dateStart":  start.Format("2006-01-02"),
+		"dateEnd":    end.Format("2006-01-02"),
+		"dtStart":    start.Format(time.RFC3339),
+		"dtEnd":      end.Format(time.RFC3339),
+	}
+
+	var resp zoneOverviewGraphQLResponse
+	if err := c.doCloudflareGraphQL(ctx, account, query, vars, &resp); err != nil {
+		return nil, err
+	}
+	if len(resp.Errors) > 0 {
+		return nil, errors.New(resp.Errors[0].Message)
+	}
+
+	out := make(map[string]zoneOverviewMetric, len(resp.Data.Viewer.Zones))
+	for _, zone := range resp.Data.Viewer.Zones {
+		metric := zoneOverviewMetric{}
+		if len(zone.HTTP) > 0 {
+			metric.UniqueVisitors = zone.HTTP[0].Uniq.Uniques
+			metric.SecurityInsights = zone.HTTP[0].Sum.Threats
+		}
+		if len(zone.Firewall) > 0 && zone.Firewall[0].Count > metric.SecurityInsights {
+			metric.SecurityInsights = zone.Firewall[0].Count
+		}
+		if strings.TrimSpace(zone.ZoneTag) != "" {
+			out[zone.ZoneTag] = metric
+		}
+	}
+	return out, nil
+}
+
+func (c *apiClient) doCloudflareGraphQL(ctx context.Context, account config.CF, query string, variables map[string]interface{}, out interface{}) error {
+	body, err := json.Marshal(map[string]interface{}{
+		"query":     query,
+		"variables": variables,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.cloudflare.com/client/v4/graphql", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+account.APIToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("GraphQL HTTP %d: %s", resp.StatusCode, truncateForLog(string(respBody), 512))
+	}
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *apiClient) ApplyRecommendedSpeedSettings(ctx context.Context, account config.CF, zoneID string) []ZoneSettingResult {

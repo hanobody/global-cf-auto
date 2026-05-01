@@ -2,7 +2,10 @@ package telegram
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+
+	"DomainC/config"
 )
 
 const (
@@ -251,13 +254,13 @@ func BuildOriginSSLDomainSelectionView(sessionID string, selection OriginSSLDoma
 		if item.Paused {
 			status += "/paused"
 		}
-		sb.WriteString(fmt.Sprintf("%d. %s\n   状态: %s | 安全: %s | 访客: %s | 计划: %s\n",
+		sb.WriteString(fmt.Sprintf("%d. %s | %s | SI:%s UV:%s Plan:%s\n",
 			i+1,
-			truncateDisplay(item.Name, 54),
-			truncateDisplay(status, 18),
-			truncateDisplay(normalizeDisplayValue(item.SecurityInsights), 16),
-			truncateDisplay(normalizeDisplayValue(item.UniqueVisitors), 16),
-			truncateDisplay(normalizeDisplayValue(item.Plan), 18),
+			truncateDisplay(item.Name, 32),
+			truncateDisplay(status, 12),
+			truncateDisplay(normalizeDisplayValue(item.SecurityInsights), 8),
+			truncateDisplay(normalizeDisplayValue(item.UniqueVisitors), 10),
+			truncateDisplay(normalizeDisplayValue(item.Plan), 10),
 		))
 	}
 
@@ -316,12 +319,21 @@ func BuildOriginSSLDomainSelectionView(sessionID string, selection OriginSSLDoma
 
 func BuildOriginSSLDomainConfirmView(sessionID string, items []OriginSSLDomainItem) IPListPage {
 	var accountLabel string
+	var awsAliases []string
 	if len(items) > 0 {
 		accountLabel = items[0].AccountLabel
+	}
+	if selection, ok := GetOriginSSLDomainSelection(sessionID); ok {
+		awsAliases = sortedSelectedOriginSSLMapKeys(selection.AWSAliases)
 	}
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("【ssl 执行确认】\n账号: %s\n已选择域名: %d\n", accountLabel, len(items)))
+	if len(awsAliases) == 0 {
+		sb.WriteString("AWS 导入: 未选择\n")
+	} else {
+		sb.WriteString("AWS 导入: " + strings.Join(awsAliases, ", ") + "\n")
+	}
 	for i, item := range items {
 		if i >= 20 {
 			sb.WriteString(fmt.Sprintf("- ... 其余 %d 个域名\n", len(items)-i))
@@ -356,6 +368,45 @@ func BuildOriginSSLDomainConfirmView(sessionID string, items []OriginSSLDomainIt
 			},
 		},
 	}
+}
+
+func BuildOriginSSLAWSSelectionView(sessionID string, selection OriginSSLDomainSelection) IPListPage {
+	items, _ := SelectedOriginSSLDomainItems(sessionID)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("【ssl AWS 目标选择】\n账号: %s\n域名: %d\n", selection.AccountLabel, len(items)))
+	sb.WriteString("请选择源站证书要导入的 AWS 目标，可多选，也可不选。\n")
+
+	aliases := sortedAWSTargetAliases()
+	var buttons [][]Button
+	var flat []Button
+	for _, alias := range aliases {
+		mark := "☐"
+		if selection.AWSAliases != nil && selection.AWSAliases[alias] {
+			mark = "☑"
+		}
+		target := config.Cfg.AWSTargets[alias]
+		token := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{
+			AccountLabel: selection.AccountLabel,
+			SessionID:    sessionID,
+			Value:        alias,
+		})
+		flat = append(flat, Button{
+			Text:         fmt.Sprintf("%s %s(%s)", mark, alias, target.Region),
+			CallbackData: fmt.Sprintf("ssl_domain_aws_toggle|%s", token),
+		})
+	}
+	buttons = append(buttons, chunkButtons(flat, 2)...)
+
+	token := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{
+		AccountLabel: selection.AccountLabel,
+		SessionID:    sessionID,
+	})
+	buttons = append(buttons, []Button{
+		{Text: fmt.Sprintf("确认AWS选择（已选 %d）", countSelected(selection.AWSAliases)), CallbackData: fmt.Sprintf("ssl_domain_aws_done|%s", token)},
+		{Text: "返回域名选择", CallbackData: fmt.Sprintf("ssl_continue_domains|%s", token)},
+		{Text: "取消", CallbackData: fmt.Sprintf("ssl_domain_cancel|%s", token)},
+	})
+	return IPListPage{Message: sb.String(), Buttons: buttons}
 }
 
 func BuildOriginSSLDNSQuestionView(sessionID string, accountLabel string, selected int) IPListPage {
@@ -398,7 +449,15 @@ func BuildOriginSSLDNSProxyView(sessionID string, accountLabel string, targetTyp
 
 func BuildOriginSSLDNSPlanConfirmView(planID string, plan OriginSSLDNSPlan) IPListPage {
 	var sb strings.Builder
+	target := originSSLDNSPlanTarget(plan)
 	sb.WriteString(fmt.Sprintf("【ssl DNS 创建确认】\n账号: %s\n待创建/更新记录: %d\n", plan.AccountLabel, len(plan.Records)))
+	if target != "" {
+		sb.WriteString("解析目标: " + target + "\n")
+	}
+	if len(plan.Records) >= originSSLDNSRecordLimit {
+		sb.WriteString(fmt.Sprintf("记录数已达到本次上限 %d，如还有遗漏请分批继续执行。\n", originSSLDNSRecordLimit))
+	}
+	sb.WriteString("除自动 www CNAME 指向根域外，其余记录都会解析到上面的目标。\n")
 	for i, record := range plan.Records {
 		if i >= 20 {
 			sb.WriteString(fmt.Sprintf("- ... 其余 %d 条记录\n", len(plan.Records)-i))
@@ -412,10 +471,9 @@ func BuildOriginSSLDNSPlanConfirmView(planID string, plan OriginSSLDNSPlan) IPLi
 		if record.AutoWWW {
 			suffix = " | auto www"
 		}
-		sb.WriteString(fmt.Sprintf("- %s %s -> %s | 代理: %s%s\n",
+		sb.WriteString(fmt.Sprintf("- %s %s | 代理: %s%s\n",
 			record.Type,
 			truncateDisplay(record.FQDN, 54),
-			truncateDisplay(record.Content, 54),
 			proxy,
 			suffix,
 		))
@@ -433,6 +491,79 @@ func BuildOriginSSLDNSPlanConfirmView(planID string, plan OriginSSLDNSPlan) IPLi
 			{Text: "取消", CallbackData: fmt.Sprintf("ssl_dns_create_cancel|%s", token)},
 		}},
 	}
+}
+
+func BuildOriginSSLDNSNameDomainSelectionView(sessionID string, selection OriginSSLDNSNameSelection) IPListPage {
+	totalPages := pageCount(len(selection.Domains), originSSLItemsPerPage)
+	page := clampPage(selection.Page, totalPages)
+	start := page * originSSLItemsPerPage
+	end := start + originSSLItemsPerPage
+	if end > len(selection.Domains) {
+		end = len(selection.Domains)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("【解析名适用域名】\n账号: %s\n解析名: %s\n页码: %d/%d\n已选择: %d/%d\n\n",
+		selection.AccountLabel, strings.Join(selection.Names, ", "), page+1, totalPages, countSelected(selection.Selected), len(selection.Domains)))
+	sb.WriteString("请选择这些解析名要创建到哪些域名。")
+
+	var buttons [][]Button
+	for i := start; i < end; i++ {
+		domain := selection.Domains[i]
+		mark := "☐"
+		if selection.Selected[domain] {
+			mark = "☑"
+		}
+		token := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{
+			AccountLabel: selection.AccountLabel,
+			SessionID:    sessionID,
+			Value:        domain,
+			Page:         page,
+		})
+		buttons = append(buttons, []Button{{
+			Text:         fmt.Sprintf("%s %d. %s", mark, i+1, truncateDisplay(domain, 38)),
+			CallbackData: fmt.Sprintf("ssl_dns_name_toggle|%s", token),
+		}})
+	}
+
+	var nav []Button
+	if page > 0 {
+		token := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{
+			AccountLabel: selection.AccountLabel,
+			SessionID:    sessionID,
+			Page:         page - 1,
+		})
+		nav = append(nav, Button{Text: "上一页", CallbackData: fmt.Sprintf("ssl_dns_name_page|%s", token)})
+	}
+	if page+1 < totalPages {
+		token := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{
+			AccountLabel: selection.AccountLabel,
+			SessionID:    sessionID,
+			Page:         page + 1,
+		})
+		nav = append(nav, Button{Text: "下一页", CallbackData: fmt.Sprintf("ssl_dns_name_page|%s", token)})
+	}
+	if len(nav) > 0 {
+		buttons = append(buttons, nav)
+	}
+
+	token := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{
+		AccountLabel: selection.AccountLabel,
+		SessionID:    sessionID,
+	})
+	allToken := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{
+		AccountLabel: selection.AccountLabel,
+		SessionID:    sessionID,
+	})
+	buttons = append(buttons, []Button{
+		{Text: "全选并确认", CallbackData: fmt.Sprintf("ssl_dns_name_all|%s", allToken)},
+	})
+	buttons = append(buttons, []Button{
+		{Text: "确认适用域名", CallbackData: fmt.Sprintf("ssl_dns_name_done|%s", token)},
+		{Text: "结束", CallbackData: fmt.Sprintf("ssl_dns_name_cancel|%s", token)},
+	})
+
+	return IPListPage{Message: sb.String(), Buttons: buttons}
 }
 
 func BuildOriginSSLContinueView(sessionID string, accountLabel string) IPListPage {
@@ -492,6 +623,31 @@ func normalizeDisplayValue(s string) string {
 		return "-"
 	}
 	return s
+}
+
+func sortedSelectedOriginSSLMapKeys(items map[string]bool) []string {
+	out := make([]string, 0, len(items))
+	for key, selected := range items {
+		if !selected || strings.TrimSpace(key) == "" {
+			continue
+		}
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func originSSLDNSPlanTarget(plan OriginSSLDNSPlan) string {
+	for _, record := range plan.Records {
+		if record.AutoWWW {
+			continue
+		}
+		return fmt.Sprintf("%s %s", record.Type, record.Content)
+	}
+	if len(plan.Records) > 0 {
+		return fmt.Sprintf("%s %s", plan.Records[0].Type, plan.Records[0].Content)
+	}
+	return ""
 }
 
 func truncateDisplay(s string, max int) string {
