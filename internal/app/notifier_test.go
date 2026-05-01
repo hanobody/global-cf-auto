@@ -96,6 +96,12 @@ func (f *fakeCF) DeleteDNSRecord(ctx context.Context, account config.CF, domain 
 func (f *fakeCF) ListZones(ctx context.Context, account config.CF) ([]cfclient.ZoneDetail, error) {
 	return nil, nil
 }
+func (f *fakeCF) ListZoneSummaries(ctx context.Context, account config.CF) ([]cfclient.ZoneSummary, error) {
+	return nil, nil
+}
+func (f *fakeCF) ApplyRecommendedSpeedSettings(ctx context.Context, account config.CF, zoneID string) []cfclient.ZoneSettingResult {
+	return nil
+}
 func (f *fakeCF) PurgeZoneCache(ctx context.Context, account config.CF, zoneID string) error {
 	return nil
 }

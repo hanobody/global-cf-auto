@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"sync"
+	"time"
 )
 
 type IPListAction string
@@ -41,8 +42,23 @@ type DeleteInputRequest struct {
 	AccountLabel string
 }
 
+type OriginSSLInputStage string
+
+const (
+	OriginSSLInputDomains    OriginSSLInputStage = "domains"
+	OriginSSLInputDNSTarget  OriginSSLInputStage = "dns_target"
+	OriginSSLInputDNSRecords OriginSSLInputStage = "dns_records"
+)
+
 type OriginSSLInputRequest struct {
-	AWSAliases []string
+	AWSAliases     []string
+	AccountLabel   string
+	SessionID      string
+	Stage          OriginSSLInputStage
+	DNSTarget      string
+	DNSRecordType  string
+	Proxied        bool
+	SelectedDomains []string
 }
 
 type IPListCallbackPayload struct {
@@ -77,7 +93,51 @@ type OriginSSLSelection struct {
 }
 
 type OriginSSLCallbackPayload struct {
-	Value string
+	Value         string
+	AccountLabel  string
+	SessionID     string
+	ItemKey       string
+	Page          int
+	DNSTarget     string
+	DNSRecordType string
+	Proxied       bool
+}
+
+type OriginSSLDomainItem struct {
+	Key              string
+	AccountLabel     string
+	ZoneID           string
+	Name             string
+	Status           string
+	Paused           bool
+	CreatedOn        time.Time
+	Plan             string
+	SecurityInsights string
+	UniqueVisitors   string
+}
+
+type OriginSSLDomainSelection struct {
+	AccountLabel string
+	Items        []OriginSSLDomainItem
+	Selected     map[string]bool
+	Page         int
+}
+
+type OriginSSLDNSRecordPlan struct {
+	AccountLabel string
+	Domain       string
+	Name         string
+	FQDN         string
+	Type         string
+	Content      string
+	Proxied      bool
+	AutoWWW      bool
+}
+
+type OriginSSLDNSPlan struct {
+	AccountLabel string
+	SessionID    string
+	Records      []OriginSSLDNSRecordPlan
 }
 
 type IPListDeleteItem struct {
@@ -132,6 +192,8 @@ var interactionState = struct {
 	getNSCallbacks      map[string]GetNSCallbackPayload
 	deleteCallbacks     map[string]DeleteCallbackPayload
 	originSSLCallbacks  map[string]OriginSSLCallbackPayload
+	originSSLDomains    map[string]OriginSSLDomainSelection
+	originSSLDNSPlans   map[string]OriginSSLDNSPlan
 }{
 	pendingIPList:       make(map[int64]IPListInputRequest),
 	pendingSetDNS:       make(map[int64]SetDNSInputRequest),
@@ -146,6 +208,8 @@ var interactionState = struct {
 	getNSCallbacks:      make(map[string]GetNSCallbackPayload),
 	deleteCallbacks:     make(map[string]DeleteCallbackPayload),
 	originSSLCallbacks:  make(map[string]OriginSSLCallbackPayload),
+	originSSLDomains:    make(map[string]OriginSSLDomainSelection),
+	originSSLDNSPlans:   make(map[string]OriginSSLDNSPlan),
 }
 
 func SetPendingIPListInput(userID int64, req IPListInputRequest) {
@@ -248,7 +312,14 @@ func SetPendingOriginSSLInput(userID int64, req OriginSSLInputRequest) {
 	delete(interactionState.pendingGetNS, userID)
 	delete(interactionState.pendingDelete, userID)
 	interactionState.pendingOriginSSL[userID] = OriginSSLInputRequest{
-		AWSAliases: append([]string(nil), req.AWSAliases...),
+		AWSAliases:      append([]string(nil), req.AWSAliases...),
+		AccountLabel:    req.AccountLabel,
+		SessionID:       req.SessionID,
+		Stage:           req.Stage,
+		DNSTarget:       req.DNSTarget,
+		DNSRecordType:   req.DNSRecordType,
+		Proxied:         req.Proxied,
+		SelectedDomains: append([]string(nil), req.SelectedDomains...),
 	}
 }
 
@@ -260,7 +331,14 @@ func GetPendingOriginSSLInput(userID int64) (OriginSSLInputRequest, bool) {
 		return OriginSSLInputRequest{}, false
 	}
 	return OriginSSLInputRequest{
-		AWSAliases: append([]string(nil), req.AWSAliases...),
+		AWSAliases:      append([]string(nil), req.AWSAliases...),
+		AccountLabel:    req.AccountLabel,
+		SessionID:       req.SessionID,
+		Stage:           req.Stage,
+		DNSTarget:       req.DNSTarget,
+		DNSRecordType:   req.DNSRecordType,
+		Proxied:         req.Proxied,
+		SelectedDomains: append([]string(nil), req.SelectedDomains...),
 	}, true
 }
 
@@ -601,6 +679,120 @@ func GetOriginSSLCallbackPayload(token string) (OriginSSLCallbackPayload, bool) 
 	defer interactionState.mu.Unlock()
 	payload, ok := interactionState.originSSLCallbacks[token]
 	return payload, ok
+}
+
+func SetOriginSSLDomainSelection(selection OriginSSLDomainSelection) string {
+	sessionID := newInteractionToken()
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	interactionState.originSSLDomains[sessionID] = cloneOriginSSLDomainSelection(selection)
+	return sessionID
+}
+
+func GetOriginSSLDomainSelection(sessionID string) (OriginSSLDomainSelection, bool) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	selection, ok := interactionState.originSSLDomains[sessionID]
+	if !ok {
+		return OriginSSLDomainSelection{}, false
+	}
+	return cloneOriginSSLDomainSelection(selection), true
+}
+
+func ToggleOriginSSLDomainSelectionItem(sessionID string, key string) (OriginSSLDomainSelection, bool) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	selection, ok := interactionState.originSSLDomains[sessionID]
+	if !ok {
+		return OriginSSLDomainSelection{}, false
+	}
+	if selection.Selected == nil {
+		selection.Selected = make(map[string]bool)
+	}
+	if selection.Selected[key] {
+		delete(selection.Selected, key)
+	} else {
+		selection.Selected[key] = true
+	}
+	interactionState.originSSLDomains[sessionID] = selection
+	return cloneOriginSSLDomainSelection(selection), true
+}
+
+func SetOriginSSLDomainSelectionPage(sessionID string, page int) (OriginSSLDomainSelection, bool) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	selection, ok := interactionState.originSSLDomains[sessionID]
+	if !ok {
+		return OriginSSLDomainSelection{}, false
+	}
+	selection.Page = page
+	interactionState.originSSLDomains[sessionID] = selection
+	return cloneOriginSSLDomainSelection(selection), true
+}
+
+func SelectedOriginSSLDomainItems(sessionID string) ([]OriginSSLDomainItem, bool) {
+	selection, ok := GetOriginSSLDomainSelection(sessionID)
+	if !ok {
+		return nil, false
+	}
+	items := make([]OriginSSLDomainItem, 0, len(selection.Selected))
+	for _, item := range selection.Items {
+		if selection.Selected[item.Key] {
+			items = append(items, item)
+		}
+	}
+	return items, true
+}
+
+func ClearOriginSSLDomainSelection(sessionID string) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	delete(interactionState.originSSLDomains, sessionID)
+}
+
+func cloneOriginSSLDomainSelection(selection OriginSSLDomainSelection) OriginSSLDomainSelection {
+	out := OriginSSLDomainSelection{
+		AccountLabel: selection.AccountLabel,
+		Items:        append([]OriginSSLDomainItem(nil), selection.Items...),
+		Selected:     make(map[string]bool, len(selection.Selected)),
+		Page:         selection.Page,
+	}
+	for key, selected := range selection.Selected {
+		out.Selected[key] = selected
+	}
+	return out
+}
+
+func SetOriginSSLDNSPlan(plan OriginSSLDNSPlan) string {
+	planID := newInteractionToken()
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	interactionState.originSSLDNSPlans[planID] = OriginSSLDNSPlan{
+		AccountLabel: plan.AccountLabel,
+		SessionID:    plan.SessionID,
+		Records:      append([]OriginSSLDNSRecordPlan(nil), plan.Records...),
+	}
+	return planID
+}
+
+func GetOriginSSLDNSPlan(planID string) (OriginSSLDNSPlan, bool) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	plan, ok := interactionState.originSSLDNSPlans[planID]
+	if !ok {
+		return OriginSSLDNSPlan{}, false
+	}
+	return OriginSSLDNSPlan{
+		AccountLabel: plan.AccountLabel,
+		SessionID:    plan.SessionID,
+		Records:      append([]OriginSSLDNSRecordPlan(nil), plan.Records...),
+	}, true
+}
+
+func ClearOriginSSLDNSPlan(planID string) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	delete(interactionState.originSSLDNSPlans, planID)
 }
 
 func newInteractionToken() string {

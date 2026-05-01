@@ -38,6 +38,20 @@ type ZoneDetail struct {
 	Status      string
 	Paused      bool
 }
+type ZoneSummary struct {
+	ID               string
+	Name             string
+	Status           string
+	Paused           bool
+	CreatedOn        time.Time
+	Plan             string
+	SecurityInsights string
+	UniqueVisitors   string
+}
+type ZoneSettingResult struct {
+	Name string
+	Err  error
+}
 type OriginCert struct {
 	ID             string
 	CertificatePEM string
@@ -68,6 +82,8 @@ type Client interface {
 	UpdateDNSRecord(ctx context.Context, account config.CF, domain string, params DNSRecordUpdateParams) (cloudflare.DNSRecord, error)
 	DeleteDNSRecord(ctx context.Context, account config.CF, domain string, recordName string) (int, error)
 	ListZones(ctx context.Context, acc config.CF) ([]ZoneDetail, error)
+	ListZoneSummaries(ctx context.Context, account config.CF) ([]ZoneSummary, error)
+	ApplyRecommendedSpeedSettings(ctx context.Context, account config.CF, zoneID string) []ZoneSettingResult
 	CreateOriginCertificate(ctx context.Context, account config.CF, hostnames []string) (OriginCert, error)
 	ListOriginCACertificates(ctx context.Context, account config.CF) ([]OriginCACertInfo, error)
 	PurgeZoneCache(ctx context.Context, account config.CF, zoneID string) error
@@ -90,6 +106,29 @@ type abuseReportsResponse struct {
 		TotalCount int `json:"total_count"`
 	} `json:"result_info"`
 	Result json.RawMessage `json:"result"`
+	Errors []struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"errors"`
+	Success bool `json:"success"`
+}
+
+type zoneListResponse struct {
+	Result []struct {
+		ID        string    `json:"id"`
+		Name      string    `json:"name"`
+		Status    string    `json:"status"`
+		Paused    bool      `json:"paused"`
+		CreatedOn time.Time `json:"created_on"`
+		Plan      struct {
+			Name string `json:"name"`
+		} `json:"plan"`
+	} `json:"result"`
+	ResultInfo struct {
+		Page       int `json:"page"`
+		PerPage    int `json:"per_page"`
+		TotalPages int `json:"total_pages"`
+	} `json:"result_info"`
 	Errors []struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
@@ -263,6 +302,11 @@ func parseAbuseResultCount(raw json.RawMessage) (int, error) {
 func (c *apiClient) GetAccountID(ctx context.Context, account config.CF) (string, error) {
 	ctx, cancel := ensureTimeout(ctx)
 	defer cancel()
+
+	if accountID := strings.TrimSpace(account.AccountID); accountID != "" {
+		c.storeAccountID(account, accountID)
+		return accountID, nil
+	}
 
 	if accountID, ok := c.cachedAccountID(account); ok {
 		return accountID, nil
@@ -844,6 +888,164 @@ func (c *apiClient) ListZones(ctx context.Context, account config.CF) ([]ZoneDet
 		})
 	}
 	return out, nil
+}
+
+func (c *apiClient) ListZoneSummaries(ctx context.Context, account config.CF) ([]ZoneSummary, error) {
+	var cancel context.CancelFunc
+	if _, ok := ctx.Deadline(); ok {
+		cancel = func() {}
+	} else {
+		ctx, cancel = context.WithTimeout(ctx, 3*time.Minute)
+	}
+	defer cancel()
+
+	accountID, err := c.GetAccountID(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]ZoneSummary, 0)
+	for page := 1; ; page++ {
+		q := url.Values{}
+		q.Set("account.id", accountID)
+		q.Set("page", fmt.Sprintf("%d", page))
+		q.Set("per_page", "50")
+		endpoint := "https://api.cloudflare.com/client/v4/zones?" + q.Encode()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("构建 Zone 列表请求失败 [%s]: %v", account.Label, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+account.APIToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("列出 Zone 失败 [%s]: %v", account.Label, err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("读取 Zone 列表响应失败 [%s]: %v", account.Label, readErr)
+		}
+
+		var result zoneListResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, fmt.Errorf("解析 Zone 列表响应失败 [%s]: %v", account.Label, err)
+		}
+		if resp.StatusCode >= http.StatusBadRequest || !result.Success {
+			detail := ""
+			if len(result.Errors) > 0 {
+				detail = result.Errors[0].Message
+			}
+			return nil, fmt.Errorf("列出 Zone 失败 [%s]: HTTP %d %s", account.Label, resp.StatusCode, strings.TrimSpace(detail))
+		}
+
+		for _, z := range result.Result {
+			plan := strings.TrimSpace(z.Plan.Name)
+			if plan == "" {
+				plan = "-"
+			}
+			out = append(out, ZoneSummary{
+				ID:               z.ID,
+				Name:             z.Name,
+				Status:           z.Status,
+				Paused:           z.Paused,
+				CreatedOn:        z.CreatedOn,
+				Plan:             plan,
+				SecurityInsights: "-",
+				UniqueVisitors:   "-",
+			})
+		}
+
+		if result.ResultInfo.TotalPages <= 0 || page >= result.ResultInfo.TotalPages {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (c *apiClient) ApplyRecommendedSpeedSettings(ctx context.Context, account config.CF, zoneID string) []ZoneSettingResult {
+	settings := []struct {
+		name  string
+		value interface{}
+	}{
+		{name: "brotli", value: "on"},
+		{name: "early_hints", value: "on"},
+		{name: "http2", value: "on"},
+		{name: "http3", value: "on"},
+		{name: "0rtt", value: "on"},
+		{name: "minify", value: map[string]string{"css": "on", "html": "on", "js": "on"}},
+	}
+
+	results := make([]ZoneSettingResult, 0, len(settings))
+	for i, setting := range settings {
+		if i > 0 {
+			timer := time.NewTimer(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				results = append(results, ZoneSettingResult{
+					Name: setting.name,
+					Err:  ctx.Err(),
+				})
+				continue
+			case <-timer.C:
+			}
+		}
+		results = append(results, ZoneSettingResult{
+			Name: setting.name,
+			Err:  c.updateZoneSettingValueWithRetry(ctx, account, zoneID, setting.name, setting.value),
+		})
+	}
+	return results
+}
+
+func (c *apiClient) updateZoneSettingValueWithRetry(ctx context.Context, account config.CF, zoneID string, name string, value interface{}) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		err := c.updateZoneSettingValue(ctx, account, zoneID, name, value)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !shouldRetryCreateZone(err) || attempt == 2 {
+			break
+		}
+
+		timer := time.NewTimer(time.Duration(attempt+1) * 3 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
+}
+
+func (c *apiClient) updateZoneSettingValue(ctx context.Context, account config.CF, zoneID string, name string, value interface{}) error {
+	ctx, cancel := ensureTimeout(ctx)
+	defer cancel()
+
+	api, err := cloudflare.NewWithAPIToken(account.APIToken)
+	if err != nil {
+		return fmt.Errorf("初始化 Cloudflare 客户端失败 [%s]: %v", account.Label, err)
+	}
+
+	rc := &cloudflare.ResourceContainer{
+		Level:      cloudflare.ZoneRouteLevel,
+		Identifier: zoneID,
+	}
+
+	_, err = api.UpdateZoneSetting(ctx, rc, cloudflare.UpdateZoneSettingParams{
+		Name:  name,
+		Value: value,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %v", name, err)
+	}
+	return nil
 }
 
 func (c *apiClient) CreateOriginCertificate(ctx context.Context, account config.CF, hostnames []string) (OriginCert, error) {
