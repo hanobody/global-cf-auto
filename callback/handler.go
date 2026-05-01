@@ -43,6 +43,10 @@ func HandleCallback(cb *tgbotapi.CallbackQuery) {
 		handleDeleteCommandCallback(action, parts, user, cb)
 		return
 	}
+	if strings.HasPrefix(action, "setdns_") {
+		handleSetDNSCallback(action, parts, user, cb)
+		return
+	}
 	if strings.HasPrefix(action, "ssl_") {
 		handleOriginSSLCallback(action, parts, user, cb)
 		return
@@ -186,9 +190,16 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User, cb
 			}
 
 			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("【IP 白名单】\n账号: %s\n请选择要操作的名单：\n", accountLabel))
+			sb.WriteString(fmt.Sprintf("【IP 白名单】\n账号: %s\n请选择要操作的名单，或直接进入全部 IP 删除选择：\n", accountLabel))
 
 			var buttons [][]telegram.Button
+			accountToken := telegram.SetIPListCallbackPayload(telegram.IPListCallbackPayload{
+				AccountLabel: accountLabel,
+			})
+			buttons = append(buttons, []telegram.Button{{
+				Text:         "删除IP（全部名单）",
+				CallbackData: fmt.Sprintf("iplist_delete_account|%s", accountToken),
+			}})
 			for i, list := range lists {
 				sb.WriteString(fmt.Sprintf("%d. %s (%d)\n", i+1, list.Name, list.NumItems))
 				listToken := telegram.SetIPListCallbackPayload(telegram.IPListCallbackPayload{
@@ -231,19 +242,24 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User, cb
 			)
 		}()
 
+	case "iplist_delete_account":
+		account := cfclient.GetAccountByLabel(accountLabel)
+		if account == nil {
+			log.Printf("未找到账号标签: %s", accountLabel)
+			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", accountLabel))
+			return
+		}
+		go beginIPListDeleteSelection(client, sender, *account, accountLabel, "")
+
 	case "iplist_delete":
 		if payload.ItemID == "" {
-			listName := payload.ListName
-			if strings.TrimSpace(listName) == "" {
-				listName = payload.ListID
+			account := cfclient.GetAccountByLabel(accountLabel)
+			if account == nil {
+				log.Printf("未找到账号标签: %s", accountLabel)
+				telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", accountLabel))
+				return
 			}
-			telegram.SetPendingIPListInput(user.ID, telegram.IPListInputRequest{
-				AccountLabel: accountLabel,
-				ListID:       payload.ListID,
-				ListName:     listName,
-				Action:       telegram.IPListActionDelete,
-			})
-			telegram.SendTelegramAlert(fmt.Sprintf("已选择白名单 %s（账号: %s）。\n请直接发送要删除的地址，每行一条，只需填写 IP 或 CIDR。\n示例：\n1.2.3.4\n2407:cdc0:b010::/112", listName, accountLabel))
+			go beginIPListDeleteSelection(client, sender, *account, accountLabel, payload.ListID)
 			return
 		}
 
@@ -325,6 +341,76 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User, cb
 		go func() {
 			telegram.SendTelegramAlert(fmt.Sprintf("已取消删除（操作人: %s）", user.UserName))
 		}()
+	case "iplist_select_toggle":
+		selection, ok := telegram.ToggleIPListDeleteSelectionItem(payload.SessionID, payload.ItemKey)
+		if !ok {
+			telegram.SendTelegramAlert("删除选择已过期，请重新执行 /iplist。")
+			return
+		}
+		selection.Page = payload.Page
+		renderIPListDeleteSelection(sender, cb, payload.SessionID, selection)
+
+	case "iplist_select_page":
+		selection, ok := telegram.SetIPListDeleteSelectionPage(payload.SessionID, payload.Page)
+		if !ok {
+			telegram.SendTelegramAlert("删除选择已过期，请重新执行 /iplist。")
+			return
+		}
+		renderIPListDeleteSelection(sender, cb, payload.SessionID, selection)
+
+	case "iplist_select_done":
+		items, ok := telegram.SelectedIPListDeleteItems(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("删除选择已过期，请重新执行 /iplist。")
+			return
+		}
+		if len(items) == 0 {
+			telegram.SendTelegramAlert("请至少选择一条 IP 记录后再确认。")
+			return
+		}
+		page := telegram.BuildIPListDeleteConfirmView(payload.SessionID, items)
+		editOrSendPage(sender, cb, page)
+
+	case "iplist_select_confirm":
+		items, ok := telegram.SelectedIPListDeleteItems(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("删除选择已过期，请重新执行 /iplist。")
+			return
+		}
+		if len(items) == 0 {
+			telegram.SendTelegramAlert("没有已选择的 IP 记录，删除已取消。")
+			return
+		}
+		account := cfclient.GetAccountByLabel(accountLabel)
+		if account == nil {
+			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", accountLabel))
+			return
+		}
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: "✅ 已确认，后台删除中…", CallbackData: "noop"},
+			}})
+		}
+		go func() {
+			result := telegram.ProcessIPListDeleteItems(context.Background(), client, *account, items)
+			telegram.ClearIPListDeleteSelection(payload.SessionID)
+			telegram.SendTelegramAlert(result.Summary())
+			if cb.Message != nil {
+				_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+					{Text: "✅ 删除任务已提交", CallbackData: "noop"},
+				}})
+			}
+		}()
+
+	case "iplist_select_cancel":
+		telegram.ClearIPListDeleteSelection(payload.SessionID)
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: "已取消", CallbackData: "noop"},
+			}})
+		}
+		telegram.SendTelegramAlert(fmt.Sprintf("已取消 IP 删除选择（操作人: %s）", user.UserName))
+
 	case "iplist_add":
 		listName := payload.ListName
 		if strings.TrimSpace(listName) == "" {
@@ -337,6 +423,86 @@ func handleIPListCallback(action string, parts []string, user *tgbotapi.User, cb
 			Action:       telegram.IPListActionAdd,
 		})
 		telegram.SendTelegramAlert(fmt.Sprintf("已选择白名单 %s（账号: %s）。\n请直接发送要添加的地址，每行一条，格式：IP 或 CIDR，备注可选。\n示例：\n1.2.3.4 办公网\n2407:cdc0:b010::/112 香港", listName, accountLabel))
+	}
+}
+
+func beginIPListDeleteSelection(client cfclient.Client, sender telegram.Sender, account config.CF, accountLabel string, onlyListID string) {
+	lists, err := client.ListCustomLists(context.Background(), account)
+	if err != nil {
+		telegram.SendTelegramAlert(fmt.Sprintf("查询账号 %s 白名单失败: %v", accountLabel, err))
+		return
+	}
+
+	var items []telegram.IPListDeleteItem
+	for _, list := range lists {
+		if strings.TrimSpace(onlyListID) != "" && list.ID != onlyListID {
+			continue
+		}
+
+		listItems, err := client.ListCustomListItems(context.Background(), account, list.ID)
+		if err != nil {
+			telegram.SendTelegramAlert(fmt.Sprintf("读取白名单 %s 失败: %v", list.Name, err))
+			return
+		}
+		for _, item := range listItems {
+			if item.ID == "" || item.IP == nil || strings.TrimSpace(*item.IP) == "" {
+				continue
+			}
+			key := list.ID + ":" + item.ID
+			items = append(items, telegram.IPListDeleteItem{
+				Key:          key,
+				AccountLabel: accountLabel,
+				ListID:       list.ID,
+				ListName:     list.Name,
+				ItemID:       item.ID,
+				IP:           *item.IP,
+				Comment:      item.Comment,
+			})
+		}
+	}
+
+	if len(items) == 0 {
+		scope := "全部名单"
+		if strings.TrimSpace(onlyListID) != "" {
+			scope = onlyListID
+		}
+		telegram.SendTelegramAlert(fmt.Sprintf("账号 %s 的 %s 暂无可删除 IP 记录。", accountLabel, scope))
+		return
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].ListName == items[j].ListName {
+			return items[i].IP < items[j].IP
+		}
+		return items[i].ListName < items[j].ListName
+	})
+
+	sessionID := telegram.SetIPListDeleteSelection(telegram.IPListDeleteSelection{
+		AccountLabel: accountLabel,
+		Items:        items,
+		Selected:     make(map[string]bool),
+		Page:         0,
+	})
+	selection, _ := telegram.GetIPListDeleteSelection(sessionID)
+	page := telegram.BuildIPListDeleteSelectionView(sessionID, selection)
+	if err := sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
+		log.Printf("发送 IP 删除选择失败: %v", err)
+	}
+}
+
+func renderIPListDeleteSelection(sender telegram.Sender, cb *tgbotapi.CallbackQuery, sessionID string, selection telegram.IPListDeleteSelection) {
+	page := telegram.BuildIPListDeleteSelectionView(sessionID, selection)
+	editOrSendPage(sender, cb, page)
+}
+
+func editOrSendPage(sender telegram.Sender, cb *tgbotapi.CallbackQuery, page telegram.IPListPage) {
+	if cb != nil && cb.Message != nil {
+		if err := sender.EditMessageWithButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, page.Message, page.Buttons); err == nil {
+			return
+		}
+	}
+	if err := sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
+		log.Printf("发送交互消息失败: %v", err)
 	}
 }
 
@@ -452,6 +618,119 @@ func handleDeleteCommandCallback(action string, parts []string, user *tgbotapi.U
 		}
 		telegram.SendTelegramAlert(fmt.Sprintf("已取消批量删除（操作人: %s）", user.UserName))
 	}
+}
+
+func handleSetDNSCallback(action string, parts []string, user *tgbotapi.User, cb *tgbotapi.CallbackQuery) {
+	if len(parts) < 2 {
+		log.Printf("无效的 setdns 回调数据: %v", parts)
+		return
+	}
+
+	token := parts[1]
+	payload, ok := telegram.GetSetDNSCallbackPayload(token)
+	if !ok {
+		telegram.SendTelegramAlert("操作已过期，请重新执行 /setdns。")
+		return
+	}
+
+	sender := telegram.DefaultSender()
+	switch action {
+	case "setdns_account":
+		if cfclient.GetAccountByLabel(payload.AccountLabel) == nil {
+			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", payload.AccountLabel))
+			return
+		}
+		telegram.SetPendingSetDNSInput(user.ID, telegram.SetDNSInputRequest{
+			AccountLabel: payload.AccountLabel,
+			Stage:        telegram.SetDNSInputKeywords,
+		})
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: "已选择 " + payload.AccountLabel, CallbackData: "noop"},
+			}})
+		}
+		telegram.SendTelegramAlert(telegram.BuildSetDNSKeywordPrompt(payload.AccountLabel))
+
+	case "setdns_start", "setdns_continue":
+		selection, ok := telegram.GetSetDNSSelection(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("setdns 选择已过期，请重新执行 /setdns。")
+			return
+		}
+		if len(selection.Candidates) == 0 {
+			telegram.ClearSetDNSSelection(payload.SessionID)
+			telegram.SendTelegramAlert("本次 setdns 没有剩余候选记录，交互已结束。")
+			return
+		}
+		renderSetDNSSelection(sender, cb, payload.SessionID, selection)
+
+	case "setdns_toggle":
+		selection, ok := telegram.ToggleSetDNSSelectionItem(payload.SessionID, payload.ItemKey)
+		if !ok {
+			telegram.SendTelegramAlert("setdns 选择已过期，请重新执行 /setdns。")
+			return
+		}
+		selection.Page = payload.Page
+		renderSetDNSSelection(sender, cb, payload.SessionID, selection)
+
+	case "setdns_page":
+		selection, ok := telegram.SetSetDNSSelectionPage(payload.SessionID, payload.Page)
+		if !ok {
+			telegram.SendTelegramAlert("setdns 选择已过期，请重新执行 /setdns。")
+			return
+		}
+		renderSetDNSSelection(sender, cb, payload.SessionID, selection)
+
+	case "setdns_done":
+		targets, ok := telegram.SelectedSetDNSRecordTargets(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("setdns 选择已过期，请重新执行 /setdns。")
+			return
+		}
+		if len(targets) == 0 {
+			telegram.SendTelegramAlert("请至少选择一条解析记录后再确认。")
+			return
+		}
+		page := telegram.BuildSetDNSConfirmView(payload.SessionID, targets)
+		editOrSendPage(sender, cb, page)
+
+	case "setdns_apply":
+		targets, ok := telegram.SelectedSetDNSRecordTargets(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("setdns 选择已过期，请重新执行 /setdns。")
+			return
+		}
+		if len(targets) == 0 {
+			telegram.SendTelegramAlert("没有已选择的解析记录，请返回选择。")
+			return
+		}
+		telegram.SetPendingSetDNSInput(user.ID, telegram.SetDNSInputRequest{
+			AccountLabel: payload.AccountLabel,
+			SessionID:    payload.SessionID,
+			Stage:        telegram.SetDNSInputNewTarget,
+		})
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: fmt.Sprintf("已确认 %d 条，等待新目标", len(targets)), CallbackData: "noop"},
+			}})
+		}
+		telegram.SendTelegramAlert(telegram.BuildSetDNSNewTargetPrompt(payload.AccountLabel, len(targets)))
+
+	case "setdns_finish", "setdns_cancel":
+		telegram.ClearSetDNSSelection(payload.SessionID)
+		telegram.ClearPendingSetDNSInput(user.ID)
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: "已结束", CallbackData: "noop"},
+			}})
+		}
+		telegram.SendTelegramAlert(fmt.Sprintf("setdns 交互已结束（操作人: %s）", user.UserName))
+	}
+}
+
+func renderSetDNSSelection(sender telegram.Sender, cb *tgbotapi.CallbackQuery, sessionID string, selection telegram.SetDNSSelection) {
+	page := telegram.BuildSetDNSSelectionView(sessionID, selection)
+	editOrSendPage(sender, cb, page)
 }
 
 func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User, cb *tgbotapi.CallbackQuery) {

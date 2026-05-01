@@ -65,6 +65,7 @@ type Client interface {
 	GetZoneDetails(ctx context.Context, account config.CF, domain string) (ZoneDetail, error)
 	CreateZone(ctx context.Context, account config.CF, domain string) (ZoneDetail, error)
 	UpsertDNSRecord(ctx context.Context, account config.CF, domain string, params DNSRecordParams) (cloudflare.DNSRecord, error)
+	UpdateDNSRecord(ctx context.Context, account config.CF, domain string, params DNSRecordUpdateParams) (cloudflare.DNSRecord, error)
 	DeleteDNSRecord(ctx context.Context, account config.CF, domain string, recordName string) (int, error)
 	ListZones(ctx context.Context, acc config.CF) ([]ZoneDetail, error)
 	CreateOriginCertificate(ctx context.Context, account config.CF, hostnames []string) (OriginCert, error)
@@ -112,6 +113,15 @@ type DNSRecordParams struct {
 	Name    string
 	Content string
 	Proxied bool
+	TTL     int
+}
+
+type DNSRecordUpdateParams struct {
+	ID      string
+	Type    string
+	Name    string
+	Content string
+	Proxied *bool
 	TTL     int
 }
 
@@ -696,6 +706,55 @@ func (c *apiClient) UpsertDNSRecord(ctx context.Context, account config.CF, doma
 		return cloudflare.DNSRecord{}, fmt.Errorf("创建解析记录失败: %v", err)
 	}
 
+	return record, nil
+}
+
+func (c *apiClient) UpdateDNSRecord(ctx context.Context, account config.CF, domain string, params DNSRecordUpdateParams) (cloudflare.DNSRecord, error) {
+	ctx, cancel := ensureTimeout(ctx)
+	defer cancel()
+
+	if strings.TrimSpace(params.ID) == "" {
+		return cloudflare.DNSRecord{}, errors.New("record ID is empty")
+	}
+	if strings.TrimSpace(params.Type) == "" {
+		return cloudflare.DNSRecord{}, errors.New("record type is empty")
+	}
+	if strings.TrimSpace(params.Name) == "" {
+		return cloudflare.DNSRecord{}, errors.New("record name is empty")
+	}
+	if strings.TrimSpace(params.Content) == "" {
+		return cloudflare.DNSRecord{}, errors.New("record content is empty")
+	}
+
+	api, err := cloudflare.NewWithAPIToken(account.APIToken)
+	if err != nil {
+		return cloudflare.DNSRecord{}, fmt.Errorf("初始化客户端失败 [%s]: %v", account.Label, err)
+	}
+
+	zones, err := api.ListZonesContext(ctx, cloudflare.WithZoneFilters(domain, "", ""))
+	if err != nil {
+		return cloudflare.DNSRecord{}, fmt.Errorf("获取 Zone 失败: %v", err)
+	}
+	if len(zones.Result) == 0 {
+		return cloudflare.DNSRecord{}, fmt.Errorf("%w: %s", ErrZoneNotFound, domain)
+	}
+
+	ttl := params.TTL
+	if ttl <= 0 {
+		ttl = 1
+	}
+
+	record, err := api.UpdateDNSRecord(ctx, cloudflare.ZoneIdentifier(zones.Result[0].ID), cloudflare.UpdateDNSRecordParams{
+		ID:      params.ID,
+		Type:    strings.ToUpper(params.Type),
+		Name:    params.Name,
+		Content: params.Content,
+		TTL:     ttl,
+		Proxied: params.Proxied,
+	})
+	if err != nil {
+		return cloudflare.DNSRecord{}, fmt.Errorf("更新解析记录失败: %v", err)
+	}
 	return record, nil
 }
 

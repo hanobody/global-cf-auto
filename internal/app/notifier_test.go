@@ -49,6 +49,9 @@ func (f *fakeSender) SendDocumentPath(ctx context.Context, filepath string, capt
 func (f *fakeSender) EditButtons(ctx context.Context, chatID int64, messageID int, buttons [][]telegram.Button) error {
 	return nil
 }
+func (f *fakeSender) EditMessageWithButtons(ctx context.Context, chatID int64, messageID int, msg string, buttons [][]telegram.Button) error {
+	return nil
+}
 func (f *fakeSender) ClearButtons(ctx context.Context, chatID int64, messageID int) error {
 	return nil
 }
@@ -82,6 +85,9 @@ func (f *fakeCF) CreateZone(ctx context.Context, account config.CF, domain strin
 	return cfclient.ZoneDetail{}, nil
 }
 func (f *fakeCF) UpsertDNSRecord(ctx context.Context, account config.CF, domain string, params cfclient.DNSRecordParams) (cloudflare.DNSRecord, error) {
+	return cloudflare.DNSRecord{}, nil
+}
+func (f *fakeCF) UpdateDNSRecord(ctx context.Context, account config.CF, domain string, params cfclient.DNSRecordUpdateParams) (cloudflare.DNSRecord, error) {
 	return cloudflare.DNSRecord{}, nil
 }
 func (f *fakeCF) DeleteDNSRecord(ctx context.Context, account config.CF, domain string, recordName string) (int, error) {
