@@ -320,11 +320,13 @@ func BuildOriginSSLDomainSelectionView(sessionID string, selection OriginSSLDoma
 func BuildOriginSSLDomainConfirmView(sessionID string, items []OriginSSLDomainItem) IPListPage {
 	var accountLabel string
 	var awsAliases []string
+	var blockCountries []string
 	if len(items) > 0 {
 		accountLabel = items[0].AccountLabel
 	}
 	if selection, ok := GetOriginSSLDomainSelection(sessionID); ok {
 		awsAliases = sortedSelectedOriginSSLMapKeys(selection.AWSAliases)
+		blockCountries = append([]string(nil), selection.BlockCountries...)
 	}
 
 	var sb strings.Builder
@@ -333,6 +335,11 @@ func BuildOriginSSLDomainConfirmView(sessionID string, items []OriginSSLDomainIt
 		sb.WriteString("AWS 导入: 未选择\n")
 	} else {
 		sb.WriteString("AWS 导入: " + strings.Join(awsAliases, ", ") + "\n")
+	}
+	if len(blockCountries) == 0 {
+		sb.WriteString("国家/地区拦截: 跳过\n")
+	} else {
+		sb.WriteString("国家/地区拦截: " + strings.Join(blockCountries, ",") + "\n")
 	}
 	for i, item := range items {
 		if i >= 20 {

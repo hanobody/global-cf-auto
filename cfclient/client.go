@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -100,6 +101,8 @@ type Client interface {
 type apiClient struct {
 	accountIDMu    sync.RWMutex
 	accountIDCache map[string]string
+	baseURL        string
+	httpClient     *http.Client
 }
 
 type abuseReportsResponse struct {
@@ -165,6 +168,8 @@ type zoneOverviewGraphQLResponse struct {
 func NewClient() Client {
 	return &apiClient{
 		accountIDCache: make(map[string]string),
+		baseURL:        "https://api.cloudflare.com/client/v4",
+		httpClient:     http.DefaultClient,
 	}
 }
 
@@ -1119,37 +1124,28 @@ func (c *apiClient) doCloudflareGraphQL(ctx context.Context, account config.CF, 
 }
 
 func (c *apiClient) ApplyRecommendedSpeedSettings(ctx context.Context, account config.CF, zoneID string) []ZoneSettingResult {
-	settings := []struct {
-		name  string
-		value interface{}
-	}{
-		{name: "brotli", value: "on"},
-		{name: "early_hints", value: "on"},
-		{name: "http2", value: "on"},
-		{name: "http3", value: "on"},
-		{name: "0rtt", value: "on"},
-		{name: "minify", value: map[string]string{"css": "on", "html": "on", "js": "on"}},
+	settings := map[string]any{
+		"brotli":      "on",
+		"early_hints": "on",
+		"http2":       "on",
+		"http3":       "on",
+		"0rtt":        "on",
+		"minify":      map[string]string{"css": "on", "html": "on", "js": "on"},
 	}
 
-	results := make([]ZoneSettingResult, 0, len(settings))
-	for i, setting := range settings {
-		if i > 0 {
-			timer := time.NewTimer(500 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				results = append(results, ZoneSettingResult{
-					Name: setting.name,
-					Err:  ctx.Err(),
-				})
-				continue
-			case <-timer.C:
-			}
+	status := c.EnableSpeedRecommendations(ctx, account, zoneID, settings)
+	keys := make([]string, 0, len(status))
+	for key := range status {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	results := make([]ZoneSettingResult, 0, len(keys))
+	for _, key := range keys {
+		var err error
+		if strings.HasPrefix(status[key], statusFailedPrefix) {
+			err = errors.New(strings.TrimPrefix(status[key], statusFailedPrefix))
 		}
-		results = append(results, ZoneSettingResult{
-			Name: setting.name,
-			Err:  c.updateZoneSettingValueWithRetry(ctx, account, zoneID, setting.name, setting.value),
-		})
+		results = append(results, ZoneSettingResult{Name: key, Err: err})
 	}
 	return results
 }

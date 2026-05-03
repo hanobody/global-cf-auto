@@ -27,6 +27,7 @@ type getNSBatchResult struct {
 	Failed          []string
 	ManualNS        []string
 	RegistrarSynced int
+	Provisioned     []cfclient.ProvisionResult
 }
 
 func (r getNSBatchResult) HasInputErrors() bool {
@@ -51,6 +52,17 @@ func (r getNSBatchResult) Summary() string {
 		sb.WriteString("\n\n需手动设置 NS:")
 		for _, item := range r.ManualNS {
 			sb.WriteString("\n" + item)
+		}
+	}
+
+	if len(r.Provisioned) > 0 {
+		sb.WriteString("\n\nCloudflare 初始化:")
+		for _, item := range r.Provisioned {
+			block := item.CountryBlockStatus
+			if len(item.CountryBlockCountries) > 0 {
+				block += " " + strings.Join(item.CountryBlockCountries, ",")
+			}
+			sb.WriteString(fmt.Sprintf("\n- %s | WAF:%s | Speed:%s | RUM:%s", item.Domain, block, compactSpeedStatus(item.SpeedStatus), item.RUMStatus))
 		}
 	}
 
@@ -194,10 +206,13 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 			continue
 		}
 
-		zone, err := h.CFClient.CreateZone(ctx, selected, domain)
+		zone, provisionResult, err := h.createOrProvisionGetNSZone(ctx, selected, domain)
 		if err != nil {
 			result.Failed = append(result.Failed, fmt.Sprintf("%s: %v", domain, err))
 			continue
+		}
+		if provisionResult != nil {
+			result.Provisioned = append(result.Provisioned, *provisionResult)
 		}
 
 		item := getNSDomainResult{
@@ -209,6 +224,51 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 	}
 
 	return result
+}
+
+func (h *CommandHandler) createOrProvisionGetNSZone(ctx context.Context, selected config.CF, domain string) (cfclient.ZoneDetail, *cfclient.ProvisionResult, error) {
+	if provisioner, ok := h.CFClient.(cfclient.Provisioner); ok {
+		result, err := provisioner.ProvisionCloudflareZone(ctx, selected, domain, cfclient.ProvisionOptions{
+			AccountID:           selected.AccountID,
+			BlockCountries:      config.DefaultBlockCountries(),
+			EnableSpeed:         config.EnableSpeedRecommendations(),
+			EnableRUM:           config.EnableRUMAutoInstall(),
+			ExtraZoneSettings:   config.ExtraZoneSettings(),
+			CreateZoneIfMissing: true,
+		})
+		if err != nil {
+			return cfclient.ZoneDetail{}, nil, err
+		}
+		return cfclient.ZoneDetail{
+			ID:          result.ZoneID,
+			Name:        result.Domain,
+			NameServers: append([]string(nil), result.NameServers...),
+		}, result, nil
+	}
+
+	zone, err := h.CFClient.CreateZone(ctx, selected, domain)
+	return zone, nil, err
+}
+
+func compactSpeedStatus(status map[string]string) string {
+	if len(status) == 0 {
+		return "skipped"
+	}
+	okCount := 0
+	failed := 0
+	for _, value := range status {
+		if value == "enabled" {
+			okCount++
+			continue
+		}
+		if strings.HasPrefix(value, "failed:") {
+			failed++
+		}
+	}
+	if failed == 0 {
+		return fmt.Sprintf("ok %d/%d", okCount, len(status))
+	}
+	return fmt.Sprintf("ok %d/%d failed %d", okCount, len(status), failed)
 }
 
 func (h *CommandHandler) appendGetNSManualOrSynced(ctx context.Context, domain string, nameServers []string, result *getNSBatchResult, pacer *batchAPIPacer) error {

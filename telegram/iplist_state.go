@@ -46,6 +46,7 @@ type OriginSSLInputStage string
 
 const (
 	OriginSSLInputDomains    OriginSSLInputStage = "domains"
+	OriginSSLInputBlockCountries OriginSSLInputStage = "block_countries"
 	OriginSSLInputDNSTarget  OriginSSLInputStage = "dns_target"
 	OriginSSLInputDNSRecords OriginSSLInputStage = "dns_records"
 )
@@ -59,6 +60,7 @@ type OriginSSLInputRequest struct {
 	DNSRecordType    string
 	Proxied          bool
 	SelectedDomains  []string
+	BlockCountries   []string
 	PendingDNSRecords []OriginSSLDNSRecordPlan
 }
 
@@ -122,6 +124,7 @@ type OriginSSLDomainSelection struct {
 	Items        []OriginSSLDomainItem
 	Selected     map[string]bool
 	AWSAliases   map[string]bool
+	BlockCountries []string
 	Page         int
 }
 
@@ -337,6 +340,7 @@ func SetPendingOriginSSLInput(userID int64, req OriginSSLInputRequest) {
 		DNSRecordType:    req.DNSRecordType,
 		Proxied:          req.Proxied,
 		SelectedDomains:  append([]string(nil), req.SelectedDomains...),
+		BlockCountries:   append([]string(nil), req.BlockCountries...),
 		PendingDNSRecords: append([]OriginSSLDNSRecordPlan(nil), req.PendingDNSRecords...),
 	}
 }
@@ -357,6 +361,7 @@ func GetPendingOriginSSLInput(userID int64) (OriginSSLInputRequest, bool) {
 		DNSRecordType:    req.DNSRecordType,
 		Proxied:          req.Proxied,
 		SelectedDomains:  append([]string(nil), req.SelectedDomains...),
+		BlockCountries:   append([]string(nil), req.BlockCountries...),
 		PendingDNSRecords: append([]OriginSSLDNSRecordPlan(nil), req.PendingDNSRecords...),
 	}, true
 }
@@ -756,6 +761,18 @@ func ToggleOriginSSLDomainAWSAlias(sessionID string, alias string) (OriginSSLDom
 	return cloneOriginSSLDomainSelection(selection), true
 }
 
+func SetOriginSSLDomainBlockCountries(sessionID string, countries []string) (OriginSSLDomainSelection, bool) {
+	interactionState.mu.Lock()
+	defer interactionState.mu.Unlock()
+	selection, ok := interactionState.originSSLDomains[sessionID]
+	if !ok {
+		return OriginSSLDomainSelection{}, false
+	}
+	selection.BlockCountries = append([]string(nil), countries...)
+	interactionState.originSSLDomains[sessionID] = selection
+	return cloneOriginSSLDomainSelection(selection), true
+}
+
 func SetOriginSSLDomainSelectionPage(sessionID string, page int) (OriginSSLDomainSelection, bool) {
 	interactionState.mu.Lock()
 	defer interactionState.mu.Unlock()
@@ -794,6 +811,7 @@ func cloneOriginSSLDomainSelection(selection OriginSSLDomainSelection) OriginSSL
 		Items:        append([]OriginSSLDomainItem(nil), selection.Items...),
 		Selected:     make(map[string]bool, len(selection.Selected)),
 		AWSAliases:   make(map[string]bool, len(selection.AWSAliases)),
+		BlockCountries: append([]string(nil), selection.BlockCountries...),
 		Page:         selection.Page,
 	}
 	for key, selected := range selection.Selected {

@@ -17,6 +17,12 @@ import (
 // HandleCallback 处理来自 Notifier 的内联按钮回调
 // callbackData 格式：action|accountLabel|domain|[paused yes/no]
 func HandleCallback(cb *tgbotapi.CallbackQuery) {
+	if cb == nil {
+		return
+	}
+	if cb.Message != nil && cb.Message.Chat != nil && !config.IsTelegramChatAllowed(cb.Message.Chat.ID) {
+		return
+	}
 	callbackData := cb.Data
 	user := cb.From
 	parts := strings.Split(callbackData, "|")
@@ -825,8 +831,18 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 			page := telegram.BuildOriginSSLAWSSelectionView(payload.SessionID, selection)
 			editOrSendPage(sender, cb, page)
 		} else {
-			page := telegram.BuildOriginSSLDomainConfirmView(payload.SessionID, items)
-			editOrSendPage(sender, cb, page)
+			telegram.SetPendingOriginSSLInput(user.ID, telegram.OriginSSLInputRequest{
+				AccountLabel:    payload.AccountLabel,
+				SessionID:       payload.SessionID,
+				Stage:           telegram.OriginSSLInputBlockCountries,
+				SelectedDomains: telegram.OriginSSLDomainNames(items),
+			})
+			if cb.Message != nil {
+				_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+					{Text: "等待国家/地区拦截输入", CallbackData: "noop"},
+				}})
+			}
+			telegram.SendTelegramAlert(telegram.BuildOriginSSLBlockCountriesPrompt(telegram.OriginSSLInputRequest{SessionID: payload.SessionID}, ""))
 		}
 
 	case "ssl_domain_aws_toggle":
@@ -848,8 +864,20 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 			telegram.SendTelegramAlert("请至少选择一个域名后再确认。")
 			return
 		}
-		page := telegram.BuildOriginSSLDomainConfirmView(payload.SessionID, items)
-		editOrSendPage(sender, cb, page)
+		selection, _ := telegram.GetOriginSSLDomainSelection(payload.SessionID)
+		telegram.SetPendingOriginSSLInput(user.ID, telegram.OriginSSLInputRequest{
+			AccountLabel:    payload.AccountLabel,
+			SessionID:       payload.SessionID,
+			Stage:           telegram.OriginSSLInputBlockCountries,
+			SelectedDomains: telegram.OriginSSLDomainNames(items),
+			AWSAliases:      sortedSelectedKeys(selection.AWSAliases),
+		})
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: "等待国家/地区拦截输入", CallbackData: "noop"},
+			}})
+		}
+		telegram.SendTelegramAlert(telegram.BuildOriginSSLBlockCountriesPrompt(telegram.OriginSSLInputRequest{SessionID: payload.SessionID}, ""))
 
 	case "ssl_domain_ssl_confirm":
 		items, ok := telegram.SelectedOriginSSLDomainItems(payload.SessionID)
@@ -872,9 +900,11 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 			return
 		}
 		awsAliases := sortedSelectedKeys(selection.AWSAliases)
+		blockCountries := append([]string(nil), selection.BlockCountries...)
 		go func() {
-			result := telegram.ProcessOriginSSLDomainItems(context.Background(), cfclient.NewClient(), *account, items, awsAliases)
+			result := telegram.ProcessOriginSSLDomainItems(context.Background(), cfclient.NewClient(), *account, items, awsAliases, blockCountries)
 			telegram.SendTelegramAlert(result.Summary())
+			telegram.SendOriginSSLInteractiveARNOutputs(sender, result)
 		}()
 		page := telegram.BuildOriginSSLDNSQuestionView(payload.SessionID, payload.AccountLabel, len(items))
 		editOrSendPage(sender, cb, page)
