@@ -125,10 +125,16 @@ func TestNormalizeCountryCodesRejectsInvalid(t *testing.T) {
 
 func TestEnsureCountryBlockRuleCreatesRulesetWhenEntrypointMissing(t *testing.T) {
 	var created bool
+	getCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet:
-			writeCFResponse(t, w, http.StatusNotFound, false, nil, "missing")
+			getCount++
+			if getCount == 1 {
+				writeCFResponse(t, w, http.StatusNotFound, false, nil, "missing")
+				return
+			}
+			writeCFResponse(t, w, http.StatusOK, true, rulesetEntryPoint{ID: "rs1", Rules: []rulesetRule{{Description: countryBlockRuleDesc, Expression: `ip.src.country in {"CN" "RU"}`, Action: "block", Enabled: true}}})
 		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone1/rulesets":
 			created = true
 			var body struct {
@@ -153,6 +159,28 @@ func TestEnsureCountryBlockRuleCreatesRulesetWhenEntrypointMissing(t *testing.T)
 	}
 	if status != statusCreated || !created {
 		t.Fatalf("expected created, got status=%s created=%v", status, created)
+	}
+}
+
+func TestEnsureCountryBlockRuleFailsWhenCreatedRuleCannotBeVerified(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			writeCFResponse(t, w, http.StatusOK, true, rulesetEntryPoint{ID: "rs1"})
+		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone1/rulesets/rs1/rules":
+			writeCFResponse(t, w, http.StatusOK, true, map[string]any{"id": "rule1"})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	status, err := newTestAPIClient(server).EnsureCountryBlockRule(context.Background(), config.CF{APIToken: "secret"}, "zone1", []string{"cn"})
+	if err == nil {
+		t.Fatal("EnsureCountryBlockRule error = nil, want verification failure")
+	}
+	if status != "" {
+		t.Fatalf("status = %q, want empty on verification failure", status)
 	}
 }
 

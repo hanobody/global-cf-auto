@@ -27,9 +27,11 @@ const (
 	statusAlreadyEnabled      = "already_enabled"
 	statusEnabled             = "enabled"
 	statusSkipped             = "skipped"
-	statusFailedPrefix        = "failed: "
-	maxCloudflareHTTPRetries  = 2
-	defaultHTTPRetryBaseDelay = 500 * time.Millisecond
+	statusFailedPrefix         = "failed: "
+	maxCloudflareHTTPRetries   = 2
+	countryBlockVerifyAttempts = 5
+	countryBlockVerifyDelay    = 250 * time.Millisecond
+	defaultHTTPRetryBaseDelay  = 500 * time.Millisecond
 )
 
 // Provisioner is implemented by the default Cloudflare client. It is kept
@@ -406,6 +408,9 @@ func (c *apiClient) EnsureCountryBlockRule(ctx context.Context, account config.C
 			if err := c.Do(ctx, account, http.MethodPost, fmt.Sprintf("/zones/%s/rulesets", zoneID), req, nil); err != nil {
 				return "", err
 			}
+			if err := c.verifyCountryBlockRule(ctx, account, zoneID, expression); err != nil {
+				return "", err
+			}
 			return statusCreated, nil
 		}
 		return "", err
@@ -418,7 +423,7 @@ func (c *apiClient) EnsureCountryBlockRule(ctx context.Context, account config.C
 		if existing.Description != countryBlockRuleDesc {
 			continue
 		}
-		if strings.TrimSpace(existing.Expression) == expression && strings.EqualFold(existing.Action, "block") && existing.Enabled {
+		if countryBlockRuleMatches(existing, expression) {
 			return statusAlreadyExists, nil
 		}
 		if strings.TrimSpace(existing.ID) == "" {
@@ -429,13 +434,78 @@ func (c *apiClient) EnsureCountryBlockRule(ctx context.Context, account config.C
 		if err := c.Do(ctx, account, http.MethodPatch, updatePath, rule, nil); err != nil {
 			return "", err
 		}
+		if err := c.verifyCountryBlockRule(ctx, account, zoneID, expression); err != nil {
+			return "", err
+		}
 		return statusUpdated, nil
 	}
 
 	if err := c.Do(ctx, account, http.MethodPost, fmt.Sprintf("/zones/%s/rulesets/%s/rules", zoneID, entry.ID), rule, nil); err != nil {
 		return "", err
 	}
+	if err := c.verifyCountryBlockRule(ctx, account, zoneID, expression); err != nil {
+		return "", err
+	}
 	return statusCreated, nil
+}
+
+func (c *apiClient) verifyCountryBlockRule(ctx context.Context, account config.CF, zoneID string, expression string) error {
+	path := fmt.Sprintf("/zones/%s/rulesets/phases/%s/entrypoint", zoneID, firewallCustomPhase)
+	var lastErr error
+	for attempt := 0; attempt < countryBlockVerifyAttempts; attempt++ {
+		if err := waitCountryBlockVerifyRetry(ctx, attempt); err != nil {
+			return err
+		}
+		var entry rulesetEntryPoint
+		if err := c.Do(ctx, account, http.MethodGet, path, nil, &entry); err != nil {
+			lastErr = err
+			continue
+		}
+		if strings.TrimSpace(entry.ID) == "" {
+			lastErr = errors.New("Cloudflare firewall entrypoint ruleset id is empty after write")
+			continue
+		}
+		for _, existing := range entry.Rules {
+			if countryBlockRuleMatches(existing, expression) {
+				return nil
+			}
+		}
+		lastErr = fmt.Errorf("Cloudflare firewall rule %q is not visible after write", countryBlockRuleDesc)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("verify Cloudflare country block rule failed: %w", lastErr)
+	}
+	return errors.New("verify Cloudflare country block rule failed")
+}
+
+func waitCountryBlockVerifyRetry(ctx context.Context, attempt int) error {
+	if attempt <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(time.Duration(attempt) * countryBlockVerifyDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func countryBlockRuleMatches(existing rulesetRule, expression string) bool {
+	return existing.Description == countryBlockRuleDesc &&
+		normalizeRulesetExpression(existing.Expression) == normalizeRulesetExpression(expression) &&
+		strings.EqualFold(existing.Action, "block") &&
+		existing.Enabled
+}
+
+func normalizeRulesetExpression(value string) string {
+	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	for strings.HasPrefix(value, "(") && strings.HasSuffix(value, ")") && len(value) > 1 {
+		value = strings.TrimSpace(value[1 : len(value)-1])
+		value = strings.Join(strings.Fields(value), " ")
+	}
+	return value
 }
 
 func (c *apiClient) EnableSpeedRecommendations(ctx context.Context, account config.CF, zoneID string, extraSettings map[string]any) map[string]string {
