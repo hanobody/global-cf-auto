@@ -37,6 +37,8 @@ type originSSLDomainResult struct {
 	StrictErr    error
 	CountryBlockStatus    string
 	CountryBlockCountries []string
+	CacheRuleStatus       string
+	RUMStatus             string
 	Imports      []originSSLImportResult
 }
 
@@ -69,6 +71,9 @@ type OriginSSLInteractiveDomainResult struct {
 	StrictErr    error
 	CountryBlockStatus    string
 	CountryBlockCountries []string
+	CacheRuleStatus       string
+	RUMStatus             string
+	PostInitErrors        []string
 	Imports      []OriginSSLAWSImportResult
 	SpeedApplied []string
 	SpeedFailed  []string
@@ -116,8 +121,8 @@ func (r OriginSSLInteractiveResult) Summary() string {
 					arnLines = append(arnLines, fmt.Sprintf("%s | %s(%s) | %s", item.Domain, imp.Alias, imp.Region, extractARNResourceID(imp.ARN)))
 				}
 			}
-			sb.WriteString(fmt.Sprintf("\n- %s | Full(Strict): %s | WAF:%s | Speed:%d/%d | ACM:%d/%d",
-				item.Domain, strict, formatOriginSSLCountryBlock(item.CountryBlockStatus, item.CountryBlockCountries), len(item.SpeedApplied), len(item.SpeedApplied)+len(item.SpeedFailed), importOK, len(item.Imports)))
+			sb.WriteString(fmt.Sprintf("\n- %s | Full(Strict): %s | WAF:%s | Speed:%d/%d | Cache:%s | ACM:%d/%d",
+				item.Domain, strict, formatOriginSSLCountryBlock(item.CountryBlockStatus, item.CountryBlockCountries), len(item.SpeedApplied), len(item.SpeedApplied)+len(item.SpeedFailed), normalizeDisplayValue(item.CacheRuleStatus), importOK, len(item.Imports)))
 		}
 		if len(arnLines) > 0 {
 			sb.WriteString("\n\nARN 对照:")
@@ -189,7 +194,7 @@ func (r originSSLBatchResult) SummaryText() string {
 		if item.StrictErr != nil {
 			strictStatus = "失败: " + item.StrictErr.Error()
 		}
-		sb.WriteString(fmt.Sprintf("\n- %s -> %s | Full(Strict): %s | WAF: %s | ACM: %d/%d", item.Domain, item.AccountLabel, strictStatus, formatOriginSSLCountryBlock(item.CountryBlockStatus, item.CountryBlockCountries), successImports, len(item.Imports)))
+		sb.WriteString(fmt.Sprintf("\n- %s -> %s | Full(Strict): %s | WAF: %s | Cache: %s | ACM: %d/%d", item.Domain, item.AccountLabel, strictStatus, formatOriginSSLCountryBlock(item.CountryBlockStatus, item.CountryBlockCountries), normalizeDisplayValue(item.CacheRuleStatus), successImports, len(item.Imports)))
 	}
 	sb.WriteString(fmt.Sprintf("\n成功 ARN: %d", arnCount))
 
@@ -1232,17 +1237,6 @@ func processOriginSSLDomainItem(ctx context.Context, client cfclient.Client, acc
 		domainResult.StrictErr = setOriginSSLStrictWithRetry(ctx, client, account, zone.ID)
 	}
 
-	if err := cfPacer.Wait(ctx); err != nil {
-		domainResult.CountryBlockStatus = "failed: " + err.Error()
-	} else {
-		status, countries, err := ensureOriginSSLCountryBlock(ctx, client, account, zone.ID, blockCountries)
-		domainResult.CountryBlockStatus = status
-		domainResult.CountryBlockCountries = countries
-		if err != nil {
-			domainResult.CountryBlockStatus = "failed: " + err.Error()
-		}
-	}
-
 	for _, awsAlias := range awsAliases {
 		target, ok := config.Cfg.AWSTargets[awsAlias]
 		if !ok {
@@ -1270,16 +1264,10 @@ func processOriginSSLDomainItem(ctx context.Context, client cfclient.Client, acc
 	}
 
 	if err := cfPacer.Wait(ctx); err != nil {
-		domainResult.SpeedFailed = append(domainResult.SpeedFailed, "speed settings: "+err.Error())
+		domainResult.PostInitErrors = append(domainResult.PostInitErrors, "post init wait: "+err.Error())
 		return domainResult, nil
 	}
-	for _, setting := range client.ApplyRecommendedSpeedSettings(ctx, account, zone.ID) {
-		if setting.Err != nil {
-			domainResult.SpeedFailed = append(domainResult.SpeedFailed, fmt.Sprintf("%s: %v", setting.Name, setting.Err))
-			continue
-		}
-		domainResult.SpeedApplied = append(domainResult.SpeedApplied, setting.Name)
-	}
+	applyOriginSSLPostInit(ctx, client, account, item.Name, zone.ID, blockCountries, &domainResult)
 
 	return domainResult, nil
 }
@@ -1377,6 +1365,88 @@ func ensureOriginSSLCountryBlock(ctx context.Context, client cfclient.Client, ac
 	}
 	status, err := ensurer.EnsureCountryBlockRule(ctx, account, zoneID, normalized)
 	return status, normalized, err
+}
+
+func applyOriginSSLPostInit(ctx context.Context, client cfclient.Client, account config.CF, domain string, zoneID string, blockCountries []string, result *OriginSSLInteractiveDomainResult) {
+	initializer, ok := client.(cloudflarePostInitializer)
+	if !ok {
+		status, countries, err := ensureOriginSSLCountryBlock(ctx, client, account, zoneID, blockCountries)
+		result.CountryBlockStatus = status
+		result.CountryBlockCountries = countries
+		if err != nil {
+			result.CountryBlockStatus = "failed: " + err.Error()
+			result.PostInitErrors = append(result.PostInitErrors, err.Error())
+		}
+		for _, setting := range client.ApplyRecommendedSpeedSettings(ctx, account, zoneID) {
+			if setting.Err != nil {
+				result.SpeedFailed = append(result.SpeedFailed, fmt.Sprintf("%s: %v", setting.Name, setting.Err))
+				continue
+			}
+			result.SpeedApplied = append(result.SpeedApplied, setting.Name)
+		}
+		return
+	}
+
+	postResult, err := initializer.RunPostSSLInit(ctx, account, domain, zoneID, cfclient.PostInitOptions{
+		AccountID:           account.AccountID,
+		BlockCountries:      blockCountries,
+		EnableSecurityRules: len(blockCountries) > 0,
+		EnableSpeedSettings: config.EnableSpeedRecommendations(),
+		EnableCacheRule:     config.EnableCacheRule(),
+		EnableRUM:           config.EnableRUMAutoInstall(),
+		ZoneActiveTimeout:   6 * time.Hour,
+		SSLActiveTimeout:    6 * time.Hour,
+		PollInterval:        2 * time.Minute,
+	})
+	if postResult != nil {
+		result.CountryBlockStatus = postResult.SecurityRuleStatus
+		result.CacheRuleStatus = postResult.CacheRuleStatus
+		result.RUMStatus = postResult.RUMStatus
+		for setting, status := range postResult.SpeedStatus {
+			if strings.HasPrefix(status, "failed:") || strings.HasPrefix(status, "skipped:") {
+				result.SpeedFailed = append(result.SpeedFailed, fmt.Sprintf("%s: %s", setting, status))
+				continue
+			}
+			result.SpeedApplied = append(result.SpeedApplied, setting)
+		}
+		result.PostInitErrors = append(result.PostInitErrors, postResult.Errors...)
+	}
+	if err != nil {
+		result.PostInitErrors = append(result.PostInitErrors, err.Error())
+	}
+}
+
+func applyOriginSSLPostInitBatch(ctx context.Context, client cfclient.Client, account config.CF, domain string, zoneID string, blockCountries []string, result *originSSLDomainResult) {
+	initializer, ok := client.(cloudflarePostInitializer)
+	if !ok {
+		status, countries, err := ensureOriginSSLCountryBlock(ctx, client, account, zoneID, blockCountries)
+		result.CountryBlockStatus = status
+		result.CountryBlockCountries = countries
+		if err != nil {
+			result.CountryBlockStatus = "failed: " + err.Error()
+		}
+		_ = client.ApplyRecommendedSpeedSettings(ctx, account, zoneID)
+		return
+	}
+	postResult, err := initializer.RunPostSSLInit(ctx, account, domain, zoneID, cfclient.PostInitOptions{
+		AccountID:           account.AccountID,
+		BlockCountries:      blockCountries,
+		EnableSecurityRules: len(blockCountries) > 0,
+		EnableSpeedSettings: config.EnableSpeedRecommendations(),
+		EnableCacheRule:     config.EnableCacheRule(),
+		EnableRUM:           config.EnableRUMAutoInstall(),
+		ZoneActiveTimeout:   6 * time.Hour,
+		SSLActiveTimeout:    6 * time.Hour,
+		PollInterval:        2 * time.Minute,
+	})
+	if postResult != nil {
+		result.CountryBlockStatus = postResult.SecurityRuleStatus
+		result.CacheRuleStatus = postResult.CacheRuleStatus
+		result.RUMStatus = postResult.RUMStatus
+	}
+	if err != nil && result.CountryBlockStatus == "" {
+		result.CountryBlockStatus = "failed: " + err.Error()
+	}
 }
 
 func formatOriginSSLCountryBlock(status string, countries []string) string {
@@ -1495,16 +1565,7 @@ func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domain
 		if err := cfPacer.Wait(ctx); err != nil {
 			domainResult.CountryBlockStatus = "failed: " + err.Error()
 		} else {
-			status, countries, err := ensureOriginSSLCountryBlock(ctx, h.CFClient, acc, zone.ID, req.BlockCountries)
-			domainResult.CountryBlockStatus = status
-			domainResult.CountryBlockCountries = countries
-			if err != nil {
-				domainResult.CountryBlockStatus = "failed: " + err.Error()
-			}
-		}
-
-		if err := cfPacer.Wait(ctx); err == nil {
-			_ = h.CFClient.ApplyRecommendedSpeedSettings(ctx, acc, zone.ID)
+			applyOriginSSLPostInitBatch(ctx, h.CFClient, acc, domain, zone.ID, req.BlockCountries, &domainResult)
 		}
 
 		for _, awsAlias := range req.AWSAliases {

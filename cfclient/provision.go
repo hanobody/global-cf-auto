@@ -51,11 +51,13 @@ type ProvisionOptions struct {
 type ProvisionResult struct {
 	Domain                string
 	ZoneID                string
+	ZoneStatus            string
 	ZoneCreated           bool
 	NameServers           []string
 	CountryBlockStatus    string
 	CountryBlockCountries []string
 	SpeedStatus           map[string]string
+	CacheRuleStatus       string
 	RUMStatus             string
 	Warnings              []string
 }
@@ -264,48 +266,18 @@ func (c *apiClient) ProvisionCloudflareZone(ctx context.Context, account config.
 	result := &ProvisionResult{
 		Domain:              zone.Name,
 		ZoneID:              zone.ID,
+		ZoneStatus:          zone.Status,
 		ZoneCreated:         created,
 		NameServers:         append([]string(nil), zone.NameServers...),
 		CountryBlockStatus:  statusSkipped,
 		SpeedStatus:         map[string]string{},
+		CacheRuleStatus:     statusSkipped,
 		RUMStatus:           statusSkipped,
 		CountryBlockCountries: nil,
 	}
 	if result.Domain == "" {
 		result.Domain = domain
 	}
-
-	countries, countryErr := NormalizeCountryCodes(opts.BlockCountries)
-	if countryErr != nil {
-		result.CountryBlockStatus = statusFailedPrefix + countryErr.Error()
-		result.Warnings = append(result.Warnings, countryErr.Error())
-	} else if len(countries) > 0 {
-		result.CountryBlockCountries = countries
-		status, err := c.EnsureCountryBlockRule(ctx, account, zone.ID, countries)
-		if err != nil {
-			result.CountryBlockStatus = statusFailedPrefix + err.Error()
-			result.Warnings = append(result.Warnings, err.Error())
-		} else {
-			result.CountryBlockStatus = status
-		}
-	}
-
-	if opts.EnableSpeed {
-		result.SpeedStatus = c.EnableSpeedRecommendations(ctx, account, zone.ID, opts.ExtraZoneSettings)
-	} else {
-		result.SpeedStatus["speed_brain"] = statusSkipped
-	}
-
-	if opts.EnableRUM {
-		status, err := c.EnsureRUMAutoInstall(ctx, account, accountID, zone.ID, domain)
-		if err != nil {
-			result.RUMStatus = statusFailedPrefix + err.Error()
-			result.Warnings = append(result.Warnings, err.Error())
-		} else {
-			result.RUMStatus = status
-		}
-	}
-
 	return result, nil
 }
 
@@ -389,11 +361,12 @@ func buildCountryBlockExpression(countries []string) string {
 }
 
 type rulesetRule struct {
-	ID          string `json:"id,omitempty"`
-	Description string `json:"description"`
-	Expression  string `json:"expression"`
-	Action      string `json:"action"`
-	Enabled     bool   `json:"enabled"`
+	ID               string `json:"id,omitempty"`
+	Description      string `json:"description"`
+	Expression       string `json:"expression"`
+	Action           string `json:"action"`
+	Enabled          bool   `json:"enabled"`
+	ActionParameters any    `json:"action_parameters,omitempty"`
 }
 
 type rulesetEntryPoint struct {
@@ -466,22 +439,12 @@ func (c *apiClient) EnsureCountryBlockRule(ctx context.Context, account config.C
 }
 
 func (c *apiClient) EnableSpeedRecommendations(ctx context.Context, account config.CF, zoneID string, extraSettings map[string]any) map[string]string {
-	status := make(map[string]string, len(extraSettings)+1)
-	apply := func(settingID string, value any) {
-		if strings.TrimSpace(settingID) == "" {
-			return
-		}
-		path := fmt.Sprintf("/zones/%s/settings/%s", zoneID, settingID)
-		if err := c.Do(ctx, account, http.MethodPatch, path, map[string]any{"value": value}, nil); err != nil {
-			status[settingID] = statusFailedPrefix + err.Error()
-			return
-		}
-		status[settingID] = statusEnabled
-	}
-
-	apply("speed_brain", "on")
+	status := c.EnableCloudflareStandardSpeedRecommendations(ctx, account, zoneID)
 	for _, key := range sortedMapKeys(extraSettings) {
-		apply(key, extraSettings[key])
+		extra := c.applyZoneSettings(ctx, account, zoneID, map[string]any{key: extraSettings[key]})
+		for settingID, settingStatus := range extra {
+			status[settingID] = settingStatus
+		}
 	}
 	return status
 }

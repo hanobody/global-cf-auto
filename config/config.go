@@ -38,6 +38,7 @@ type CFProvision struct {
 	DefaultBlockCountries      string `yaml:"defaultBlockCountries"`
 	EnableSpeedRecommendations *bool  `yaml:"enableSpeedRecommendations"`
 	EnableRUMAutoInstall       *bool  `yaml:"enableRumAutoInstall"`
+	EnableCacheRule            *bool  `yaml:"enableCacheRule"`
 	ExtraZoneSettings          string `yaml:"extraZoneSettings"`
 }
 type Registrar struct {
@@ -114,6 +115,11 @@ func applyEnvOverrides() {
 			Cfg.CloudflareProvision.EnableRUMAutoInstall = &parsed
 		}
 	}
+	if value := strings.TrimSpace(os.Getenv("CF_ENABLE_CACHE_RULE")); value != "" {
+		if parsed, ok := parseBool(value); ok {
+			Cfg.CloudflareProvision.EnableCacheRule = &parsed
+		}
+	}
 	if value := strings.TrimSpace(os.Getenv("CF_EXTRA_ZONE_SETTINGS")); value != "" {
 		Cfg.CloudflareProvision.ExtraZoneSettings = value
 	}
@@ -138,6 +144,13 @@ func EnableRUMAutoInstall() bool {
 		return true
 	}
 	return *Cfg.CloudflareProvision.EnableRUMAutoInstall
+}
+
+func EnableCacheRule() bool {
+	if Cfg.CloudflareProvision.EnableCacheRule == nil {
+		return true
+	}
+	return *Cfg.CloudflareProvision.EnableCacheRule
 }
 
 func ExtraZoneSettings() map[string]any {

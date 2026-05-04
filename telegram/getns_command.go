@@ -213,6 +213,13 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 		}
 		if provisionResult != nil {
 			result.Provisioned = append(result.Provisioned, *provisionResult)
+			h.startCloudflarePostInitTask(selected, provisionResult.Domain, provisionResult.ZoneID, cfProvisionCommandOptions{
+				Domain:         provisionResult.Domain,
+				BlockCountries: config.DefaultBlockCountries(),
+				EnableSpeed:    config.EnableSpeedRecommendations(),
+				EnableCache:    config.EnableCacheRule(),
+				EnableRUM:      config.EnableRUMAutoInstall(),
+			})
 		}
 
 		item := getNSDomainResult{

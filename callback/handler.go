@@ -57,6 +57,10 @@ func HandleCallback(cb *tgbotapi.CallbackQuery) {
 		handleOriginSSLCallback(action, parts, user, cb)
 		return
 	}
+	if strings.HasPrefix(action, "cfrules_") {
+		handleCFRulesCallback(action, parts, user, cb)
+		return
+	}
 	if len(parts) < 3 {
 		log.Printf("无效的回调数据: %s", callbackData)
 		return
@@ -1130,6 +1134,144 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 
 		telegram.SendTelegramAlert(telegram.BuildOriginSSLInputPrompt(req))
 	}
+}
+
+func handleCFRulesCallback(action string, parts []string, user *tgbotapi.User, cb *tgbotapi.CallbackQuery) {
+	if len(parts) < 2 {
+		log.Printf("invalid cfrules callback data: %v", parts)
+		return
+	}
+
+	token := parts[1]
+	payload, ok := telegram.GetCFRulesCallbackPayload(token)
+	if !ok {
+		telegram.SendTelegramAlert("Cloudflare 规则检查操作已过期，请重新执行 /cf_rules。")
+		return
+	}
+
+	sender := telegram.DefaultSender()
+	client := cfclient.NewClient()
+	switch action {
+	case "cfrules_account":
+		account := cfclient.GetAccountByLabel(payload.AccountLabel)
+		if account == nil {
+			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", payload.AccountLabel))
+			return
+		}
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: "已选择 " + payload.AccountLabel, CallbackData: "noop"},
+			}})
+		}
+		telegram.SendTelegramAlert(fmt.Sprintf("正在读取账号 %s 下所有域名，请稍候。", payload.AccountLabel))
+		go func() {
+			if err := telegram.BeginCFRulesDomainSelection(context.Background(), client, sender, *account); err != nil {
+				telegram.SendTelegramAlert(fmt.Sprintf("读取 Cloudflare 域名列表失败: %v", err))
+			}
+		}()
+
+	case "cfrules_toggle":
+		selection, ok := telegram.ToggleCFRulesSelectionItem(payload.SessionID, payload.ItemKey)
+		if !ok {
+			telegram.SendTelegramAlert("Cloudflare 规则检查选择已过期，请重新执行 /cf_rules。")
+			return
+		}
+		selection.Page = payload.Page
+		renderCFRulesDomainSelection(sender, cb, payload.SessionID, selection)
+
+	case "cfrules_page":
+		selection, ok := telegram.SetCFRulesSelectionPage(payload.SessionID, payload.Page)
+		if !ok {
+			telegram.SendTelegramAlert("Cloudflare 规则检查选择已过期，请重新执行 /cf_rules。")
+			return
+		}
+		renderCFRulesDomainSelection(sender, cb, payload.SessionID, selection)
+
+	case "cfrules_all":
+		selection, ok := telegram.SelectAllCFRulesDomains(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("Cloudflare 规则检查选择已过期，请重新执行 /cf_rules。")
+			return
+		}
+		renderCFRulesDomainSelection(sender, cb, payload.SessionID, selection)
+
+	case "cfrules_done":
+		items, ok := telegram.SelectedCFRulesDomainItems(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("Cloudflare 规则检查选择已过期，请重新执行 /cf_rules。")
+			return
+		}
+		if len(items) == 0 {
+			telegram.SendTelegramAlert("请至少选择一个域名后再确认。")
+			return
+		}
+		page := telegram.BuildCFRulesActionView(payload.SessionID, items)
+		editOrSendPage(sender, cb, page)
+
+	case "cfrules_back":
+		selection, ok := telegram.GetCFRulesSelection(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("Cloudflare 规则检查选择已过期，请重新执行 /cf_rules。")
+			return
+		}
+		renderCFRulesDomainSelection(sender, cb, payload.SessionID, selection)
+
+	case "cfrules_run":
+		items, ok := telegram.SelectedCFRulesDomainItems(payload.SessionID)
+		if !ok {
+			telegram.SendTelegramAlert("Cloudflare 规则检查选择已过期，请重新执行 /cf_rules。")
+			return
+		}
+		if len(items) == 0 {
+			telegram.SendTelegramAlert("没有已选择的域名，任务已取消。")
+			return
+		}
+		account := cfclient.GetAccountByLabel(payload.AccountLabel)
+		if account == nil {
+			telegram.SendTelegramAlert(fmt.Sprintf("操作失败：未找到账号 %s", payload.AccountLabel))
+			return
+		}
+		runAction := strings.ToLower(strings.TrimSpace(payload.Action))
+		if runAction == "" {
+			runAction = "enable"
+		}
+		feature := strings.ToLower(strings.TrimSpace(payload.Feature))
+		if feature == "" {
+			feature = "all"
+		}
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: "规则检查任务已提交", CallbackData: "noop"},
+			}})
+		}
+		go func() {
+			result := telegram.ProcessCFRulesItems(context.Background(), client, *account, items, runAction, feature, config.DefaultBlockCountries())
+			telegram.ClearCFRulesSelection(payload.SessionID)
+			telegram.SendTelegramAlert(result.Summary())
+		}()
+
+	case "cfrules_cancel":
+		telegram.ClearCFRulesSelection(payload.SessionID)
+		if cb.Message != nil {
+			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+				{Text: "已取消", CallbackData: "noop"},
+			}})
+		}
+		operator := ""
+		if user != nil {
+			operator = user.UserName
+		}
+		if operator == "" {
+			telegram.SendTelegramAlert("已取消 Cloudflare 规则检查选择。")
+		} else {
+			telegram.SendTelegramAlert(fmt.Sprintf("已取消 Cloudflare 规则检查选择（操作人: %s）。", operator))
+		}
+	}
+}
+
+func renderCFRulesDomainSelection(sender telegram.Sender, cb *tgbotapi.CallbackQuery, sessionID string, selection telegram.CFRulesSelection) {
+	page := telegram.BuildCFRulesDomainSelectionView(sessionID, selection)
+	editOrSendPage(sender, cb, page)
 }
 
 func sortedSelectedKeys(items map[string]bool) []string {
