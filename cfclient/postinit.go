@@ -427,22 +427,42 @@ func (c *apiClient) EnsureDefaultStaticFileCacheRule(ctx context.Context, accoun
 		return "", errors.New("Cloudflare cache entrypoint ruleset id is empty")
 	}
 
+	var target rulesetRule
+	var duplicates []rulesetRule
 	for _, existing := range entry.Rules {
 		if existing.Description != staticCacheRuleDesc {
 			continue
 		}
-		if cacheRuleMatches(existing, rule) {
-			return statusAlreadyExists, nil
+		if strings.TrimSpace(target.Description) == "" {
+			target = existing
+			continue
 		}
-		if strings.TrimSpace(existing.ID) == "" {
+		duplicates = append(duplicates, existing)
+	}
+	if strings.TrimSpace(target.Description) != "" {
+		if strings.TrimSpace(target.ID) == "" {
 			return "", errors.New("Cloudflare cache rule id is empty")
 		}
-		rule.ID = existing.ID
-		updatePath := fmt.Sprintf("/zones/%s/rulesets/%s/rules/%s", zoneID, entry.ID, existing.ID)
-		if err := c.Do(ctx, account, http.MethodPatch, updatePath, rule, nil); err != nil {
-			return classifyCacheRuleError(err)
+		status := statusAlreadyExists
+		if !cacheRuleMatches(target, rule) {
+			rule.ID = target.ID
+			updatePath := fmt.Sprintf("/zones/%s/rulesets/%s/rules/%s", zoneID, entry.ID, target.ID)
+			if err := c.Do(ctx, account, http.MethodPatch, updatePath, rule, nil); err != nil {
+				return classifyCacheRuleError(err)
+			}
+			status = statusUpdated
 		}
-		return statusUpdated, nil
+		for _, duplicate := range duplicates {
+			if strings.TrimSpace(duplicate.ID) == "" {
+				return "", errors.New("Cloudflare duplicate cache rule id is empty")
+			}
+			deletePath := fmt.Sprintf("/zones/%s/rulesets/%s/rules/%s", zoneID, entry.ID, duplicate.ID)
+			if err := c.Do(ctx, account, http.MethodDelete, deletePath, nil, nil); err != nil {
+				return classifyCacheRuleError(err)
+			}
+			status = statusUpdated
+		}
+		return status, nil
 	}
 
 	if err := c.Do(ctx, account, http.MethodPost, fmt.Sprintf("/zones/%s/rulesets/%s/rules", zoneID, entry.ID), rule, nil); err != nil {
@@ -505,6 +525,7 @@ func (c *apiClient) deleteRulesetRuleByDescription(ctx context.Context, account 
 		}
 		return "", err
 	}
+	deleted := false
 	for _, rule := range entry.Rules {
 		if rule.Description != description {
 			continue
@@ -516,6 +537,9 @@ func (c *apiClient) deleteRulesetRuleByDescription(ctx context.Context, account 
 		if err := c.Do(ctx, account, http.MethodDelete, deletePath, nil, nil); err != nil {
 			return "", err
 		}
+		deleted = true
+	}
+	if deleted {
 		return statusDeleted, nil
 	}
 	return statusNotFound, nil

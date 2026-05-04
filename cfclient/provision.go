@@ -419,25 +419,47 @@ func (c *apiClient) EnsureCountryBlockRule(ctx context.Context, account config.C
 		return "", errors.New("Cloudflare firewall entrypoint ruleset id is empty")
 	}
 
+	var target rulesetRule
+	var duplicates []rulesetRule
 	for _, existing := range entry.Rules {
 		if existing.Description != countryBlockRuleDesc {
 			continue
 		}
-		if countryBlockRuleMatches(existing, expression) {
-			return statusAlreadyExists, nil
+		if strings.TrimSpace(target.Description) == "" {
+			target = existing
+			continue
 		}
-		if strings.TrimSpace(existing.ID) == "" {
+		duplicates = append(duplicates, existing)
+	}
+	if strings.TrimSpace(target.Description) != "" {
+		if strings.TrimSpace(target.ID) == "" {
 			return "", errors.New("Cloudflare firewall rule id is empty")
 		}
-		rule.ID = existing.ID
-		updatePath := fmt.Sprintf("/zones/%s/rulesets/%s/rules/%s", zoneID, entry.ID, existing.ID)
-		if err := c.Do(ctx, account, http.MethodPatch, updatePath, rule, nil); err != nil {
-			return "", err
+		status := statusAlreadyExists
+		if !countryBlockRuleMatches(target, expression) {
+			rule.ID = target.ID
+			updatePath := fmt.Sprintf("/zones/%s/rulesets/%s/rules/%s", zoneID, entry.ID, target.ID)
+			if err := c.Do(ctx, account, http.MethodPatch, updatePath, rule, nil); err != nil {
+				return "", err
+			}
+			status = statusUpdated
 		}
-		if err := c.verifyCountryBlockRule(ctx, account, zoneID, expression); err != nil {
-			return "", err
+		for _, duplicate := range duplicates {
+			if strings.TrimSpace(duplicate.ID) == "" {
+				return "", errors.New("Cloudflare duplicate firewall rule id is empty")
+			}
+			deletePath := fmt.Sprintf("/zones/%s/rulesets/%s/rules/%s", zoneID, entry.ID, duplicate.ID)
+			if err := c.Do(ctx, account, http.MethodDelete, deletePath, nil, nil); err != nil {
+				return "", err
+			}
+			status = statusUpdated
 		}
-		return statusUpdated, nil
+		if status == statusUpdated {
+			if err := c.verifyCountryBlockRule(ctx, account, zoneID, expression); err != nil {
+				return "", err
+			}
+		}
+		return status, nil
 	}
 
 	if err := c.Do(ctx, account, http.MethodPost, fmt.Sprintf("/zones/%s/rulesets/%s/rules", zoneID, entry.ID), rule, nil); err != nil {

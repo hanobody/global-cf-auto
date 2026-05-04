@@ -1050,6 +1050,24 @@ func (c *apiClient) fetchZoneOverviewMetrics(ctx context.Context, account config
 		return nil, nil
 	}
 
+	out := make(map[string]zoneOverviewMetric, len(zoneTags))
+	for start := 0; start < len(zoneTags); start += 10 {
+		end := start + 10
+		if end > len(zoneTags) {
+			end = len(zoneTags)
+		}
+		chunkMetrics, err := c.fetchZoneOverviewMetricsChunk(ctx, account, zoneTags[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for zoneTag, metric := range chunkMetrics {
+			out[zoneTag] = metric
+		}
+	}
+	return out, nil
+}
+
+func (c *apiClient) fetchZoneOverviewMetricsChunk(ctx context.Context, account config.CF, zoneTags []string) (map[string]zoneOverviewMetric, error) {
 	end := time.Now().UTC()
 	start := end.Add(-24 * time.Hour)
 	query := `query($zoneTags: [string], $dateStart: Date, $dateEnd: Date, $dtStart: Time, $dtEnd: Time) {

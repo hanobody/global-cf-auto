@@ -135,12 +135,12 @@ func (h *CommandHandler) handleCFRulesCommand(args []string) {
 		return
 	}
 
-	zones, err := h.CFClient.ListZoneSummaries(context.Background(), *account)
+	zones, err := h.CFClient.ListZones(context.Background(), *account)
 	if err != nil {
 		h.sendText(fmt.Sprintf("读取域名失败: %v", err))
 		return
 	}
-	items := buildCFRulesDomainItems(account.Label, zones)
+	items := buildCFRulesDomainItemsFromZones(account.Label, zones)
 	if !strings.EqualFold(args[1], "all") {
 		items = filterCFRulesDomainItems(items, domain)
 	}
@@ -307,11 +307,11 @@ func cloneCFRulesSelection(selection CFRulesSelection) CFRulesSelection {
 }
 
 func BeginCFRulesDomainSelection(ctx context.Context, client cfclient.Client, sender Sender, account config.CF) error {
-	zones, err := client.ListZoneSummaries(ctx, account)
+	zones, err := client.ListZones(ctx, account)
 	if err != nil {
 		return err
 	}
-	items := buildCFRulesDomainItems(account.Label, zones)
+	items := buildCFRulesDomainItemsFromZones(account.Label, zones)
 	if len(items) == 0 {
 		return sender.Send(ctx, fmt.Sprintf("账号 %s 暂无域名。", account.Label))
 	}
@@ -343,6 +343,29 @@ func buildCFRulesDomainItems(accountLabel string, zones []cfclient.ZoneSummary) 
 			Name:         name,
 			Status:       zone.Status,
 			Plan:         zone.Plan,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
+	return items
+}
+
+func buildCFRulesDomainItemsFromZones(accountLabel string, zones []cfclient.ZoneDetail) []CFRulesDomainItem {
+	items := make([]CFRulesDomainItem, 0, len(zones))
+	for _, zone := range zones {
+		name := strings.TrimSpace(strings.ToLower(zone.Name))
+		if name == "" {
+			continue
+		}
+		key := strings.TrimSpace(zone.ID)
+		if key == "" {
+			key = name
+		}
+		items = append(items, CFRulesDomainItem{
+			Key:          key,
+			AccountLabel: accountLabel,
+			ZoneID:       zone.ID,
+			Name:         name,
+			Status:       zone.Status,
 		})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
