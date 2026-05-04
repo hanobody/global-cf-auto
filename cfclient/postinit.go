@@ -421,7 +421,7 @@ func (c *apiClient) EnsureDefaultStaticFileCacheRule(ctx context.Context, accoun
 			}
 			return statusCreated, nil
 		}
-		return "", err
+		return classifyCacheRuleError(err)
 	}
 	if strings.TrimSpace(entry.ID) == "" {
 		return "", errors.New("Cloudflare cache entrypoint ruleset id is empty")

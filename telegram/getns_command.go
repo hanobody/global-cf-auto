@@ -263,19 +263,28 @@ func compactSpeedStatus(status map[string]string) string {
 	}
 	okCount := 0
 	failed := 0
+	skipped := 0
 	for _, value := range status {
-		if value == "enabled" {
+		value = strings.TrimSpace(value)
+		if value == "enabled" || value == "already_enabled" || value == "already_exists" {
 			okCount++
 			continue
 		}
 		if strings.HasPrefix(value, "failed:") {
 			failed++
+			continue
+		}
+		if strings.HasPrefix(value, "skipped") {
+			skipped++
 		}
 	}
-	if failed == 0 {
+	if failed == 0 && skipped == 0 {
 		return fmt.Sprintf("ok %d/%d", okCount, len(status))
 	}
-	return fmt.Sprintf("ok %d/%d failed %d", okCount, len(status), failed)
+	if failed == 0 {
+		return fmt.Sprintf("ok %d/%d skipped %d", okCount, len(status), skipped)
+	}
+	return fmt.Sprintf("ok %d/%d skipped %d failed %d", okCount, len(status), skipped, failed)
 }
 
 func (h *CommandHandler) appendGetNSManualOrSynced(ctx context.Context, domain string, nameServers []string, result *getNSBatchResult, pacer *batchAPIPacer) error {

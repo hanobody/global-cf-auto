@@ -1239,13 +1239,34 @@ func handleCFRulesCallback(action string, parts []string, user *tgbotapi.User, c
 		if feature == "" {
 			feature = "all"
 		}
+		blockCountries := config.DefaultBlockCountries()
+		if telegram.CFRulesNeedsBlockCountries(runAction, feature) && len(blockCountries) == 0 {
+			if user == nil {
+				telegram.SendTelegramAlert("无法识别操作用户，不能继续输入国家/地区代码。")
+				return
+			}
+			req := telegram.CFRulesInputRequest{
+				AccountLabel: payload.AccountLabel,
+				SessionID:    payload.SessionID,
+				Action:       runAction,
+				Feature:      feature,
+			}
+			telegram.SetPendingCFRulesInput(user.ID, req)
+			if cb.Message != nil {
+				_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
+					{Text: "等待国家/地区代码输入", CallbackData: "noop"},
+				}})
+			}
+			telegram.SendTelegramAlert(telegram.BuildCFRulesBlockCountriesPrompt(req, ""))
+			return
+		}
 		if cb.Message != nil {
 			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
 				{Text: "规则检查任务已提交", CallbackData: "noop"},
 			}})
 		}
 		go func() {
-			result := telegram.ProcessCFRulesItems(context.Background(), client, *account, items, runAction, feature, config.DefaultBlockCountries())
+			result := telegram.ProcessCFRulesItems(context.Background(), client, *account, items, runAction, feature, blockCountries)
 			telegram.ClearCFRulesSelection(payload.SessionID)
 			telegram.SendTelegramAlert(result.Summary())
 		}()

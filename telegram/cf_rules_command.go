@@ -38,6 +38,13 @@ type CFRulesCallbackPayload struct {
 	Feature      string
 }
 
+type CFRulesInputRequest struct {
+	AccountLabel string
+	SessionID    string
+	Action       string
+	Feature      string
+}
+
 type CFRulesBatchResult struct {
 	AccountLabel string
 	Action       string
@@ -54,9 +61,11 @@ var cfRulesState = struct {
 	mu        sync.Mutex
 	callbacks map[string]CFRulesCallbackPayload
 	sessions  map[string]CFRulesSelection
+	pending   map[int64]CFRulesInputRequest
 }{
 	callbacks: make(map[string]CFRulesCallbackPayload),
 	sessions:  make(map[string]CFRulesSelection),
+	pending:   make(map[int64]CFRulesInputRequest),
 }
 
 func (h *CommandHandler) handleCFRulesCommand(args []string) {
@@ -89,6 +98,7 @@ func (h *CommandHandler) handleCFRulesCommand(args []string) {
 	}
 	action := "enable"
 	feature := "all"
+	blockCountries := config.DefaultBlockCountries()
 	for _, arg := range args[2:] {
 		key, value, ok := strings.Cut(arg, "=")
 		if !ok {
@@ -107,7 +117,22 @@ func (h *CommandHandler) handleCFRulesCommand(args []string) {
 				h.sendText("feature 参数必须是 all/security/speed/cache")
 				return
 			}
+		case "block", "blocks", "country", "countries":
+			if isNoneValue(value) {
+				blockCountries = nil
+				continue
+			}
+			countries, err := cfclient.NormalizeCountryCodes([]string{value})
+			if err != nil {
+				h.sendText(fmt.Sprintf("block 参数错误：%v", err))
+				return
+			}
+			blockCountries = countries
 		}
+	}
+	if CFRulesNeedsBlockCountries(action, feature) && len(blockCountries) == 0 {
+		h.sendText("启用安全规则需要国家/地区代码。请使用 block=CN,RU，或配置 CF_DEFAULT_BLOCK_COUNTRIES。")
+		return
 	}
 
 	zones, err := h.CFClient.ListZoneSummaries(context.Background(), *account)
@@ -124,7 +149,7 @@ func (h *CommandHandler) handleCFRulesCommand(args []string) {
 		return
 	}
 	go func() {
-		result := ProcessCFRulesItems(context.Background(), h.CFClient, *account, items, action, feature, config.DefaultBlockCountries())
+		result := ProcessCFRulesItems(context.Background(), h.CFClient, *account, items, action, feature, blockCountries)
 		h.sendText(result.Summary())
 	}()
 	h.sendText(fmt.Sprintf("Cloudflare 规则检查任务已提交：账号 %s，域名 %d，动作 %s，功能 %s", account.Label, len(items), action, feature))
@@ -247,6 +272,25 @@ func ClearCFRulesSelection(sessionID string) {
 	cfRulesState.mu.Lock()
 	defer cfRulesState.mu.Unlock()
 	delete(cfRulesState.sessions, sessionID)
+}
+
+func SetPendingCFRulesInput(userID int64, req CFRulesInputRequest) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	cfRulesState.pending[userID] = req
+}
+
+func ClearPendingCFRulesInput(userID int64) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	delete(cfRulesState.pending, userID)
+}
+
+func getPendingCFRulesInput(userID int64) (CFRulesInputRequest, bool) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	req, ok := cfRulesState.pending[userID]
+	return req, ok
 }
 
 func cloneCFRulesSelection(selection CFRulesSelection) CFRulesSelection {
@@ -412,6 +456,79 @@ func BuildCFRulesActionView(sessionID string, items []CFRulesDomainItem) IPListP
 	}
 }
 
+func BuildCFRulesBlockCountriesPrompt(req CFRulesInputRequest, errText string) string {
+	var sb strings.Builder
+	if strings.TrimSpace(errText) != "" {
+		sb.WriteString("国家/地区代码格式错误: " + errText + "\n\n")
+	}
+	sb.WriteString("启用 Cloudflare 安全规则需要指定要拦截的国家/地区代码。\n")
+	defaultCountries := config.DefaultBlockCountries()
+	if len(defaultCountries) > 0 {
+		sb.WriteString("发送 default 使用配置默认: " + strings.Join(defaultCountries, ",") + "\n")
+	}
+	sb.WriteString("请输入 ISO 3166-1 alpha-2 代码，逗号分隔，例如 CN,RU,KP。\n")
+	sb.WriteString("发送 cancel 取消本次规则检查。")
+	return sb.String()
+}
+
+func (h *CommandHandler) handlePendingCFRulesInput(msgText string, userID int64) bool {
+	req, ok := getPendingCFRulesInput(userID)
+	if !ok {
+		return false
+	}
+	input := strings.TrimSpace(msgText)
+	if input == "" {
+		h.sendText(BuildCFRulesBlockCountriesPrompt(req, "输入为空"))
+		return true
+	}
+	if strings.EqualFold(input, "cancel") || strings.EqualFold(input, "exit") || strings.EqualFold(input, "stop") {
+		ClearPendingCFRulesInput(userID)
+		h.sendText("已取消 Cloudflare 规则检查。")
+		return true
+	}
+
+	var countries []string
+	var err error
+	if strings.EqualFold(input, "default") {
+		countries, err = cfclient.NormalizeCountryCodes(config.DefaultBlockCountries())
+	} else if isNoneValue(input) {
+		countries = nil
+	} else {
+		countries, err = cfclient.NormalizeCountryCodes([]string{input})
+	}
+	if err != nil {
+		h.sendText(BuildCFRulesBlockCountriesPrompt(req, err.Error()))
+		return true
+	}
+	if CFRulesNeedsBlockCountries(req.Action, req.Feature) && len(countries) == 0 {
+		h.sendText(BuildCFRulesBlockCountriesPrompt(req, "启用安全规则不能为空；如需跳过安全规则，请返回选择速度或缓存功能"))
+		return true
+	}
+
+	items, ok := SelectedCFRulesDomainItems(req.SessionID)
+	if !ok || len(items) == 0 {
+		ClearPendingCFRulesInput(userID)
+		h.sendText("Cloudflare 规则检查选择已过期，请重新执行 /cf_rules。")
+		return true
+	}
+	account := h.getAccountByLabel(req.AccountLabel)
+	if account == nil {
+		ClearPendingCFRulesInput(userID)
+		h.sendText("未找到 Cloudflare 账号：" + req.AccountLabel)
+		return true
+	}
+
+	ClearPendingCFRulesInput(userID)
+	go func() {
+		result := ProcessCFRulesItems(context.Background(), h.CFClient, *account, items, req.Action, req.Feature, countries)
+		ClearCFRulesSelection(req.SessionID)
+		h.sendText(result.Summary())
+	}()
+	h.sendText(fmt.Sprintf("Cloudflare 规则检查任务已提交：账号 %s，域名 %d，动作 %s，功能 %s，拦截 %s",
+		account.Label, len(items), req.Action, req.Feature, strings.Join(countries, ",")))
+	return true
+}
+
 func ProcessCFRulesItems(ctx context.Context, client cfclient.Client, account config.CF, items []CFRulesDomainItem, action string, feature string, blockCountries []string) CFRulesBatchResult {
 	result := CFRulesBatchResult{AccountLabel: account.Label, Action: action, Feature: feature}
 	manager, ok := client.(cloudflareFeatureManager)
@@ -490,4 +607,10 @@ func normalizeCFRulesFeature(raw string) string {
 	default:
 		return ""
 	}
+}
+
+func CFRulesNeedsBlockCountries(action string, feature string) bool {
+	action = normalizeCFRulesAction(action)
+	feature = normalizeCFRulesFeature(feature)
+	return action == "enable" && (feature == "all" || feature == "security")
 }

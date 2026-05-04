@@ -50,6 +50,9 @@ func (h *CommandHandler) HandleMessage(msg *tgbotapi.Message) {
 			if h.handlePendingGetNSInput(msg.Text, msg.From.ID) {
 				return
 			}
+			if h.handlePendingCFRulesInput(msg.Text, msg.From.ID) {
+				return
+			}
 			if h.handlePendingIPListInput(msg.Text, msg.From.ID) {
 				return
 			}
