@@ -989,7 +989,7 @@ func (c *apiClient) ListZoneSummaries(ctx context.Context, account config.CF) ([
 			break
 		}
 	}
-	c.hydrateZoneOverviewMetrics(ctx, account, accountID, out)
+	c.hydrateZoneOverviewMetrics(ctx, account, out)
 	return out, nil
 }
 
@@ -1015,11 +1015,11 @@ func compactZonePlan(plan string) string {
 	return plan
 }
 
-func (c *apiClient) hydrateZoneOverviewMetrics(ctx context.Context, account config.CF, accountID string, zones []ZoneSummary) {
+func (c *apiClient) hydrateZoneOverviewMetrics(ctx context.Context, account config.CF, zones []ZoneSummary) {
 	if len(zones) == 0 {
 		return
 	}
-	metrics, err := c.fetchAccountZoneOverviewMetrics(ctx, account, accountID)
+	metrics, err := c.fetchZoneOverviewMetrics(ctx, account, zones)
 	if err != nil {
 		log.Printf("[ListZoneSummaries] overview metrics unavailable account=%s: %v", account.Label, err)
 		return
@@ -1039,12 +1039,22 @@ type zoneOverviewMetric struct {
 	UniqueVisitors   int
 }
 
-func (c *apiClient) fetchAccountZoneOverviewMetrics(ctx context.Context, account config.CF, accountID string) (map[string]zoneOverviewMetric, error) {
+func (c *apiClient) fetchZoneOverviewMetrics(ctx context.Context, account config.CF, zones []ZoneSummary) (map[string]zoneOverviewMetric, error) {
+	zoneTags := make([]string, 0, len(zones))
+	for _, zone := range zones {
+		if strings.TrimSpace(zone.ID) != "" {
+			zoneTags = append(zoneTags, strings.TrimSpace(zone.ID))
+		}
+	}
+	if len(zoneTags) == 0 {
+		return nil, nil
+	}
+
 	end := time.Now().UTC()
 	start := end.Add(-24 * time.Hour)
-	query := `query($accountTag: string, $dateStart: Date, $dateEnd: Date, $dtStart: Time, $dtEnd: Time) {
+	query := `query($zoneTags: [string], $dateStart: Date, $dateEnd: Date, $dtStart: Time, $dtEnd: Time) {
 viewer {
-zones(filter: {accountTag: $accountTag}) {
+zones(filter: {zoneTag_in: $zoneTags}) {
 zoneTag
 httpRequests1dGroups(limit: 1, filter: {date_geq: $dateStart, date_leq: $dateEnd}) {
 uniq { uniques }
@@ -1057,11 +1067,11 @@ count
 }
 }`
 	vars := map[string]interface{}{
-		"accountTag": accountID,
-		"dateStart":  start.Format("2006-01-02"),
-		"dateEnd":    end.Format("2006-01-02"),
-		"dtStart":    start.Format(time.RFC3339),
-		"dtEnd":      end.Format(time.RFC3339),
+		"zoneTags":  zoneTags,
+		"dateStart": start.Format("2006-01-02"),
+		"dateEnd":   end.Format("2006-01-02"),
+		"dtStart":   start.Format(time.RFC3339),
+		"dtEnd":     end.Format(time.RFC3339),
 	}
 
 	var resp zoneOverviewGraphQLResponse
