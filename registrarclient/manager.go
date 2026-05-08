@@ -80,7 +80,7 @@ func (m *Manager) SetNameServersForDomain(ctx context.Context, domain string, na
 	}
 
 	if lastErr == nil {
-		lastErr = fmt.Errorf("未在任何注册商账号下找到该域名")
+		lastErr = fmt.Errorf("%w: 未在任何注册商账号下找到该域名", ErrDomainNotFound)
 	}
 	return config.Registrar{}, lastErr
 }

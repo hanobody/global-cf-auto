@@ -34,8 +34,21 @@ type SetDNSInputRequest struct {
 	Stage        SetDNSInputStage
 }
 
+type GetNSInputStage string
+
+const (
+	GetNSInputDomains        GetNSInputStage = "domains"
+	GetNSInputBlockCountries GetNSInputStage = "block_countries"
+)
+
 type GetNSInputRequest struct {
-	AccountLabel string
+	AccountLabel   string
+	Stage          GetNSInputStage
+	EnableSecurity bool
+	EnableSpeed    bool
+	EnableCache    bool
+	EnableRUM      bool
+	BlockCountries []string
 }
 
 type DeleteInputRequest struct {
@@ -75,7 +88,11 @@ type IPListCallbackPayload struct {
 }
 
 type GetNSCallbackPayload struct {
-	AccountLabel string
+	AccountLabel   string
+	EnableSecurity bool
+	EnableSpeed    bool
+	EnableCache    bool
+	EnableRUM      bool
 }
 
 type SetDNSCallbackPayload struct {
@@ -285,6 +302,10 @@ func SetPendingGetNSInput(userID int64, req GetNSInputRequest) {
 	delete(interactionState.pendingSetDNS, userID)
 	delete(interactionState.pendingDelete, userID)
 	delete(interactionState.pendingOriginSSL, userID)
+	if req.Stage == "" {
+		req.Stage = GetNSInputDomains
+	}
+	req.BlockCountries = append([]string(nil), req.BlockCountries...)
 	interactionState.pendingGetNS[userID] = req
 }
 
@@ -292,6 +313,7 @@ func GetPendingGetNSInput(userID int64) (GetNSInputRequest, bool) {
 	interactionState.mu.Lock()
 	defer interactionState.mu.Unlock()
 	req, ok := interactionState.pendingGetNS[userID]
+	req.BlockCountries = append([]string(nil), req.BlockCountries...)
 	return req, ok
 }
 

@@ -497,8 +497,8 @@ func classifyCacheRuleError(err error) (string, error) {
 	switch {
 	case strings.Contains(msg, "exceeded") || strings.Contains(msg, "limit"):
 		return "skipped: rule_limit_reached", nil
-	case strings.Contains(msg, "permission") || strings.Contains(msg, "not authorized"):
-		return "", fmt.Errorf("missing_permission: %w", err)
+	case strings.Contains(msg, "permission") || strings.Contains(msg, "not authorized") || strings.Contains(msg, "authentication"):
+		return "", fmt.Errorf("missing_permission: API Token 缺少 Cache Rules/Rulesets 读取或编辑权限: %w", err)
 	case strings.Contains(msg, "expression"):
 		return "", fmt.Errorf("invalid_expression: %w", err)
 	default:

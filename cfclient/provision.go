@@ -611,7 +611,7 @@ func (c *apiClient) EnsureRUMAutoInstall(ctx context.Context, account config.CF,
 	domain = normalizeProvisionDomain(domain)
 	var raw json.RawMessage
 	if err := c.Do(ctx, account, http.MethodGet, fmt.Sprintf("/accounts/%s/rum/site_info/list", accountID), nil, &raw); err != nil {
-		return "", err
+		return "", classifyRUMError(err)
 	}
 
 	for _, site := range decodeRUMSites(raw) {
@@ -631,7 +631,7 @@ func (c *apiClient) EnsureRUMAutoInstall(ctx context.Context, account config.CF,
 			"zone_tag":     zoneID,
 		}
 		if err := c.Do(ctx, account, http.MethodPut, fmt.Sprintf("/accounts/%s/rum/site_info/%s", accountID, siteID), req, nil); err != nil {
-			return "", err
+			return "", classifyRUMError(err)
 		}
 		return statusUpdated, nil
 	}
@@ -642,9 +642,17 @@ func (c *apiClient) EnsureRUMAutoInstall(ctx context.Context, account config.CF,
 		"zone_tag":     zoneID,
 	}
 	if err := c.Do(ctx, account, http.MethodPost, fmt.Sprintf("/accounts/%s/rum/site_info", accountID), req, nil); err != nil {
-		return "", err
+		return "", classifyRUMError(err)
 	}
 	return statusCreated, nil
+}
+
+func classifyRUMError(err error) error {
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "permission") || strings.Contains(msg, "not authorized") || strings.Contains(msg, "authentication") {
+		return fmt.Errorf("missing_permission: API Token 缺少 Web Analytics/RUM 读取或编辑权限: %w", err)
+	}
+	return err
 }
 
 func decodeRUMSites(raw json.RawMessage) []rumSite {

@@ -529,7 +529,7 @@ func handleGetNSCallback(action string, parts []string, user *tgbotapi.User, cb 
 		return
 	}
 
-	if action != "getns_select" {
+	if action != "getns_select" && action != "getns_init" {
 		log.Printf("未知的 getns 回调动作: %s", action)
 		return
 	}
@@ -541,9 +541,25 @@ func handleGetNSCallback(action string, parts []string, user *tgbotapi.User, cb 
 		return
 	}
 
-	telegram.SetPendingGetNSInput(user.ID, telegram.GetNSInputRequest{
-		AccountLabel: accountLabel,
-	})
+	if action == "getns_select" {
+		editOrSendPage(telegram.DefaultSender(), cb, telegram.BuildGetNSInitOptionsView(accountLabel))
+		return
+	}
+
+	req := telegram.GetNSInputRequest{
+		AccountLabel:   accountLabel,
+		EnableSecurity: payload.EnableSecurity,
+		EnableSpeed:    payload.EnableSpeed,
+		EnableCache:    payload.EnableCache,
+		EnableRUM:      payload.EnableRUM,
+		BlockCountries: config.DefaultBlockCountries(),
+	}
+	if req.EnableSecurity && len(req.BlockCountries) == 0 {
+		req.Stage = telegram.GetNSInputBlockCountries
+	} else {
+		req.Stage = telegram.GetNSInputDomains
+	}
+	telegram.SetPendingGetNSInput(user.ID, req)
 
 	if cb.Message != nil {
 		_ = telegram.DefaultSender().EditButtons(context.Background(),
@@ -554,8 +570,11 @@ func handleGetNSCallback(action string, parts []string, user *tgbotapi.User, cb 
 			}},
 		)
 	}
-
-	telegram.SendTelegramAlert(fmt.Sprintf("已选择账号 %s。\n请直接发送要添加的域名，支持多行、空格、逗号或分号分隔。\n示例：\nexample.com\nexample.net", accountLabel))
+	if req.Stage == telegram.GetNSInputBlockCountries {
+		telegram.SendTelegramAlert(telegram.BuildGetNSBlockCountriesPrompt(req, ""))
+		return
+	}
+	telegram.SendTelegramAlert(telegram.BuildGetNSInputPrompt(accountLabel, req))
 }
 
 func handleDeleteCommandCallback(action string, parts []string, user *tgbotapi.User, cb *tgbotapi.CallbackQuery) {

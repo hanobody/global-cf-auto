@@ -10,6 +10,7 @@ import (
 
 	"DomainC/cfclient"
 	"DomainC/config"
+	"DomainC/registrarclient"
 )
 
 const getNSCreateZoneInterval = 3 * time.Second
@@ -28,6 +29,23 @@ type getNSBatchResult struct {
 	ManualNS        []string
 	RegistrarSynced int
 	Provisioned     []cfclient.ProvisionResult
+	PostInitQueued  []string
+}
+
+type getNSPostInitOptions struct {
+	EnableSecurity bool
+	EnableSpeed    bool
+	EnableCache    bool
+	EnableRUM      bool
+	BlockCountries []string
+}
+
+func (o getNSPostInitOptions) Any() bool {
+	return o.EnableSecurity || o.EnableSpeed || o.EnableCache || o.EnableRUM
+}
+
+func defaultGetNSPostInitOptions() getNSPostInitOptions {
+	return getNSPostInitOptions{BlockCountries: config.DefaultBlockCountries()}
 }
 
 func (r getNSBatchResult) HasInputErrors() bool {
@@ -66,6 +84,13 @@ func (r getNSBatchResult) Summary() string {
 		}
 	}
 
+	if len(r.PostInitQueued) > 0 {
+		sb.WriteString("\n\nCloudflare 后台初始化已提交:")
+		for _, domain := range r.PostInitQueued {
+			sb.WriteString("\n- " + domain)
+		}
+	}
+
 	if len(r.ParseErrors) > 0 {
 		sb.WriteString("\n\n格式错误:")
 		for _, item := range r.ParseErrors {
@@ -98,7 +123,13 @@ func (h *CommandHandler) handleGetNSCommand(args []string) {
 		return
 	}
 
-	domains, selected, selectorErr := h.parseGetNSDomainsAndAccount(args)
+	cleanArgs, postInitOpts, optionErr := parseGetNSPostInitArgs(args)
+	if optionErr != nil {
+		h.sendText(optionErr.Error())
+		return
+	}
+
+	domains, selected, selectorErr := h.parseGetNSDomainsAndAccount(cleanArgs)
 	if selectorErr != nil {
 		h.sendText(selectorErr.Error())
 		return
@@ -111,13 +142,24 @@ func (h *CommandHandler) handleGetNSCommand(args []string) {
 
 	if len(domains) == 0 {
 		if h.operator != nil {
-			SetPendingGetNSInput(h.operator.ID, GetNSInputRequest{AccountLabel: selected.Label})
+			req := newGetNSInputRequest(selected.Label, postInitOpts)
+			if req.EnableSecurity && len(req.BlockCountries) == 0 {
+				req.Stage = GetNSInputBlockCountries
+				SetPendingGetNSInput(h.operator.ID, req)
+				h.sendText(BuildGetNSBlockCountriesPrompt(req, ""))
+				return
+			}
+			SetPendingGetNSInput(h.operator.ID, req)
 		}
-		h.sendText(h.getNSInputPrompt(selected.Label))
+		h.sendText(h.getNSInputPrompt(selected.Label, postInitOpts))
+		return
+	}
+	if postInitOpts.EnableSecurity && len(postInitOpts.BlockCountries) == 0 {
+		h.sendText("已开启安全规则初始化，但没有可用的国家/地区代码。请使用 block=CN,RU，或配置 CF_DEFAULT_BLOCK_COUNTRIES。")
 		return
 	}
 
-	result := h.processGetNSBatch(*selected, domains)
+	result := h.processGetNSBatch(*selected, domains, postInitOpts)
 	if h.operator != nil && !result.HasInputErrors() {
 		ClearPendingGetNSInput(h.operator.ID)
 	}
@@ -154,9 +196,26 @@ func (h *CommandHandler) handlePendingGetNSInput(msgText string, userID int64) b
 		return false
 	}
 
+	if req.Stage == GetNSInputBlockCountries {
+		countries, err := parseGetNSBlockCountriesInput(msgText)
+		if err != nil {
+			h.sendText(BuildGetNSBlockCountriesPrompt(req, err.Error()))
+			return true
+		}
+		if len(countries) == 0 {
+			h.sendText(BuildGetNSBlockCountriesPrompt(req, "启用安全规则时国家/地区代码不能为空"))
+			return true
+		}
+		req.BlockCountries = countries
+		req.Stage = GetNSInputDomains
+		SetPendingGetNSInput(userID, req)
+		h.sendText(h.getNSInputPrompt(req.AccountLabel, getNSPostInitOptionsFromRequest(req)))
+		return true
+	}
+
 	domains, parseErrors := parseGetNSDomainsInput(msgText)
 	if len(domains) == 0 {
-		h.sendText(h.getNSRetryPrompt(req.AccountLabel, parseErrors))
+		h.sendText(h.getNSRetryPrompt(req.AccountLabel, getNSPostInitOptionsFromRequest(req), parseErrors))
 		return true
 	}
 
@@ -167,7 +226,7 @@ func (h *CommandHandler) handlePendingGetNSInput(msgText string, userID int64) b
 		return true
 	}
 
-	result := h.processGetNSBatch(*acc, domains)
+	result := h.processGetNSBatch(*acc, domains, getNSPostInitOptionsFromRequest(req))
 	result.ParseErrors = append(result.ParseErrors, parseErrors...)
 	if !result.HasInputErrors() {
 		ClearPendingGetNSInput(userID)
@@ -177,7 +236,7 @@ func (h *CommandHandler) handlePendingGetNSInput(msgText string, userID int64) b
 	return true
 }
 
-func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []string) getNSBatchResult {
+func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []string, postInitOpts getNSPostInitOptions) getNSBatchResult {
 	domains, parseErrors := parseGetNSDomainsInput(strings.Join(rawDomains, "\n"))
 	result := getNSBatchResult{
 		TargetAccount: selected.Label,
@@ -212,14 +271,20 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 			continue
 		}
 		if provisionResult != nil {
-			result.Provisioned = append(result.Provisioned, *provisionResult)
-			h.startCloudflarePostInitTask(selected, provisionResult.Domain, provisionResult.ZoneID, cfProvisionCommandOptions{
-				Domain:         provisionResult.Domain,
-				BlockCountries: config.DefaultBlockCountries(),
-				EnableSpeed:    config.EnableSpeedRecommendations(),
-				EnableCache:    config.EnableCacheRule(),
-				EnableRUM:      config.EnableRUMAutoInstall(),
-			})
+			if postInitOpts.Any() {
+				var blockCountries []string
+				if postInitOpts.EnableSecurity {
+					blockCountries = append([]string(nil), postInitOpts.BlockCountries...)
+				}
+				result.PostInitQueued = append(result.PostInitQueued, provisionResult.Domain)
+				h.startCloudflarePostInitTask(selected, provisionResult.Domain, provisionResult.ZoneID, cfProvisionCommandOptions{
+					Domain:         provisionResult.Domain,
+					BlockCountries: blockCountries,
+					EnableSpeed:    postInitOpts.EnableSpeed,
+					EnableCache:    postInitOpts.EnableCache,
+					EnableRUM:      postInitOpts.EnableRUM,
+				})
+			}
 		}
 
 		item := getNSDomainResult{
@@ -237,9 +302,9 @@ func (h *CommandHandler) createOrProvisionGetNSZone(ctx context.Context, selecte
 	if provisioner, ok := h.CFClient.(cfclient.Provisioner); ok {
 		result, err := provisioner.ProvisionCloudflareZone(ctx, selected, domain, cfclient.ProvisionOptions{
 			AccountID:           selected.AccountID,
-			BlockCountries:      config.DefaultBlockCountries(),
-			EnableSpeed:         config.EnableSpeedRecommendations(),
-			EnableRUM:           config.EnableRUMAutoInstall(),
+			BlockCountries:      nil,
+			EnableSpeed:         false,
+			EnableRUM:           false,
 			ExtraZoneSettings:   config.ExtraZoneSettings(),
 			CreateZoneIfMissing: true,
 		})
@@ -308,13 +373,183 @@ func (h *CommandHandler) appendGetNSManualOrSynced(ctx context.Context, domain s
 
 	if _, err := h.syncRegistrarNameServers(domain, nameServers); err != nil {
 		manual := fmt.Sprintf("- %s\n  %s", domain, strings.Join(nameServers, "\n  "))
-		manual += fmt.Sprintf("\n  同步失败: %v", err)
+		if errors.Is(err, registrarclient.ErrDomainNotFound) {
+			manual += "\n  注册商未找到该域名，无法自动同步，请手动设置 NS。"
+		} else {
+			manual += fmt.Sprintf("\n  注册商平台/API 异常，自动同步失败: %v", err)
+		}
 		result.ManualNS = append(result.ManualNS, manual)
 		return err
 	}
 
 	result.RegistrarSynced++
 	return nil
+}
+
+func parseGetNSPostInitArgs(args []string) ([]string, getNSPostInitOptions, error) {
+	opts := defaultGetNSPostInitOptions()
+	clean := make([]string, 0, len(args))
+	for _, arg := range args {
+		key, value, ok := strings.Cut(strings.TrimSpace(arg), "=")
+		if !ok {
+			clean = append(clean, arg)
+			continue
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		switch key {
+		case "security", "waf":
+			enabled, err := parseOnOff(value)
+			if err != nil {
+				return clean, opts, fmt.Errorf("security 参数错误：%v", err)
+			}
+			opts.EnableSecurity = enabled
+		case "speed":
+			enabled, err := parseOnOff(value)
+			if err != nil {
+				return clean, opts, fmt.Errorf("speed 参数错误：%v", err)
+			}
+			opts.EnableSpeed = enabled
+		case "cache":
+			enabled, err := parseOnOff(value)
+			if err != nil {
+				return clean, opts, fmt.Errorf("cache 参数错误：%v", err)
+			}
+			opts.EnableCache = enabled
+		case "rum":
+			enabled, err := parseOnOff(value)
+			if err != nil {
+				return clean, opts, fmt.Errorf("rum 参数错误：%v", err)
+			}
+			opts.EnableRUM = enabled
+		case "init":
+			enabled, err := parseOnOff(value)
+			if err != nil {
+				return clean, opts, fmt.Errorf("init 参数错误：%v", err)
+			}
+			opts.EnableSecurity = enabled
+			opts.EnableSpeed = enabled
+			opts.EnableCache = enabled
+		case "block", "blocks", "country", "countries":
+			if isNoneValue(value) {
+				opts.BlockCountries = nil
+				opts.EnableSecurity = false
+				continue
+			}
+			countries, err := cfclient.NormalizeCountryCodes([]string{value})
+			if err != nil {
+				return clean, opts, fmt.Errorf("block 参数错误：%v", err)
+			}
+			opts.BlockCountries = countries
+			if len(countries) > 0 {
+				opts.EnableSecurity = true
+			}
+		default:
+			clean = append(clean, arg)
+		}
+	}
+	return clean, opts, nil
+}
+
+func newGetNSInputRequest(accountLabel string, opts getNSPostInitOptions) GetNSInputRequest {
+	return GetNSInputRequest{
+		AccountLabel:   accountLabel,
+		Stage:          GetNSInputDomains,
+		EnableSecurity: opts.EnableSecurity,
+		EnableSpeed:    opts.EnableSpeed,
+		EnableCache:    opts.EnableCache,
+		EnableRUM:      opts.EnableRUM,
+		BlockCountries: append([]string(nil), opts.BlockCountries...),
+	}
+}
+
+func getNSPostInitOptionsFromRequest(req GetNSInputRequest) getNSPostInitOptions {
+	return getNSPostInitOptions{
+		EnableSecurity: req.EnableSecurity,
+		EnableSpeed:    req.EnableSpeed,
+		EnableCache:    req.EnableCache,
+		EnableRUM:      req.EnableRUM,
+		BlockCountries: append([]string(nil), req.BlockCountries...),
+	}
+}
+
+func parseGetNSBlockCountriesInput(input string) ([]string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" || strings.EqualFold(input, "default") {
+		return cfclient.NormalizeCountryCodes(config.DefaultBlockCountries())
+	}
+	if isNoneValue(input) {
+		return nil, nil
+	}
+	return cfclient.NormalizeCountryCodes([]string{input})
+}
+
+func formatGetNSPostInitOptions(opts getNSPostInitOptions) string {
+	if !opts.Any() {
+		return "关闭（仅创建 Zone 并同步 NS）"
+	}
+	parts := make([]string, 0, 4)
+	if opts.EnableSecurity {
+		suffix := ""
+		if len(opts.BlockCountries) > 0 {
+			suffix = "(" + strings.Join(opts.BlockCountries, ",") + ")"
+		}
+		parts = append(parts, "安全规则"+suffix)
+	}
+	if opts.EnableSpeed {
+		parts = append(parts, "速度推荐")
+	}
+	if opts.EnableCache {
+		parts = append(parts, "缓存规则")
+	}
+	if opts.EnableRUM {
+		parts = append(parts, "RUM")
+	}
+	return strings.Join(parts, "、")
+}
+
+func BuildGetNSBlockCountriesPrompt(req GetNSInputRequest, errText string) string {
+	var sb strings.Builder
+	if strings.TrimSpace(errText) != "" {
+		sb.WriteString("国家/地区代码格式错误: " + errText + "\n\n")
+	}
+	sb.WriteString("/getns 已开启安全规则初始化，需要指定要拦截的国家/地区代码。\n")
+	defaultCountries := config.DefaultBlockCountries()
+	if len(defaultCountries) > 0 {
+		sb.WriteString("发送 default 使用配置默认: " + strings.Join(defaultCountries, ",") + "\n")
+	}
+	sb.WriteString("请输入 ISO 3166-1 alpha-2 代码，逗号分隔，例如 CN,RU,KP。")
+	return sb.String()
+}
+
+func BuildGetNSInputPrompt(accountLabel string, req GetNSInputRequest) string {
+	return fmt.Sprintf("已选择账号 %s。\n初始化：%s\n请直接发送要添加的域名，支持多行、空格、逗号或分号分隔。\n示例：\nexample.com\nexample.net", accountLabel, formatGetNSPostInitOptions(getNSPostInitOptionsFromRequest(req)))
+}
+
+func BuildGetNSInitOptionsView(accountLabel string) IPListPage {
+	token := func(security bool, speed bool, cache bool) string {
+		return SetGetNSCallbackPayload(GetNSCallbackPayload{
+			AccountLabel:   accountLabel,
+			EnableSecurity: security,
+			EnableSpeed:    speed,
+			EnableCache:    cache,
+		})
+	}
+	msg := fmt.Sprintf("已选择账号 %s。\n请选择 /getns 创建 Zone 后是否执行初始化；默认建议只创建 Zone 并同步 NS。", accountLabel)
+	return IPListPage{
+		Message: msg,
+		Buttons: [][]Button{
+			{{Text: "仅创建 Zone/同步 NS", CallbackData: fmt.Sprintf("getns_init|%s", token(false, false, false))}},
+			{
+				{Text: "开启安全规则", CallbackData: fmt.Sprintf("getns_init|%s", token(true, false, false))},
+				{Text: "开启速度推荐", CallbackData: fmt.Sprintf("getns_init|%s", token(false, true, false))},
+			},
+			{
+				{Text: "开启缓存规则", CallbackData: fmt.Sprintf("getns_init|%s", token(false, false, true))},
+				{Text: "安全+速度+缓存", CallbackData: fmt.Sprintf("getns_init|%s", token(true, true, true))},
+			},
+		},
+	}
 }
 
 func (h *CommandHandler) parseGetNSDomainsAndAccount(args []string) ([]string, *config.CF, error) {
@@ -343,15 +578,15 @@ func (h *CommandHandler) getNSPromptText() string {
 		}
 		sb.WriteString("- " + a.Label + "\n")
 	}
-	sb.WriteString("\n选择后直接发送一个或多个域名即可。")
+	sb.WriteString("\n选择账号后可选择是否执行安全规则、速度推荐、缓存规则初始化。")
 	return sb.String()
 }
 
-func (h *CommandHandler) getNSInputPrompt(accountLabel string) string {
-	return fmt.Sprintf("已选择账号 %s。\n请直接发送要添加的域名，支持多行、空格、逗号或分号分隔。\n示例：\nexample.com\nexample.net", accountLabel)
+func (h *CommandHandler) getNSInputPrompt(accountLabel string, opts getNSPostInitOptions) string {
+	return fmt.Sprintf("已选择账号 %s。\n初始化：%s\n请直接发送要添加的域名，支持多行、空格、逗号或分号分隔。\n示例：\nexample.com\nexample.net", accountLabel, formatGetNSPostInitOptions(opts))
 }
 
-func (h *CommandHandler) getNSRetryPrompt(accountLabel string, errs []string) string {
+func (h *CommandHandler) getNSRetryPrompt(accountLabel string, opts getNSPostInitOptions, errs []string) string {
 	var sb strings.Builder
 	if len(errs) > 0 {
 		sb.WriteString("以下域名未识别：\n")
@@ -360,7 +595,7 @@ func (h *CommandHandler) getNSRetryPrompt(accountLabel string, errs []string) st
 		}
 		sb.WriteString("\n")
 	}
-	sb.WriteString(h.getNSInputPrompt(accountLabel))
+	sb.WriteString(h.getNSInputPrompt(accountLabel, opts))
 	return strings.TrimSpace(sb.String())
 }
 
