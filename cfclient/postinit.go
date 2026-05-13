@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"reflect"
 	"sort"
@@ -32,6 +33,7 @@ type PostInitOptions struct {
 	EnableSecurityRules bool
 	EnableSpeedSettings bool
 	EnableCacheRule     bool
+	CloneCacheRule      bool
 	EnableRUM           bool
 	ZoneActiveTimeout   time.Duration
 	SSLActiveTimeout    time.Duration
@@ -75,6 +77,8 @@ type zoneStatusResult struct {
 	Name        string   `json:"name"`
 	Status      string   `json:"status"`
 	NameServers []string `json:"name_servers"`
+	Paused      bool     `json:"paused"`
+	CreatedOn   time.Time `json:"created_on"`
 }
 
 type universalSSLSettings struct {
@@ -160,7 +164,14 @@ func (c *apiClient) RunPostSSLInit(ctx context.Context, account config.CF, domai
 	}
 
 	if opts.EnableCacheRule {
-		if status, err := c.EnsureDefaultStaticFileCacheRule(ctx, account, zoneID); err != nil {
+		var status string
+		var err error
+		if opts.CloneCacheRule {
+			status, err = c.EnsureCacheRulesFromRandomExistingZone(ctx, account, zoneID, domain)
+		} else {
+			status, err = c.EnsureDefaultStaticFileCacheRule(ctx, account, zoneID)
+		}
+		if err != nil {
 			result.CacheRuleStatus = statusFailedPrefix + err.Error()
 			result.Errors = append(result.Errors, err.Error())
 		} else {
@@ -421,6 +432,13 @@ func (c *apiClient) EnsureDefaultStaticFileCacheRule(ctx context.Context, accoun
 			}
 			return statusCreated, nil
 		}
+		if isCloudflarePermissionError(err) {
+			if status, createErr := c.createCacheRuleset(ctx, account, zoneID, []rulesetRule{rule}); createErr == nil {
+				return status, nil
+			} else {
+				return classifyCacheRuleError(fmt.Errorf("%w; direct cache ruleset create failed: %v", err, createErr))
+			}
+		}
 		return classifyCacheRuleError(err)
 	}
 	if strings.TrimSpace(entry.ID) == "" {
@@ -469,6 +487,232 @@ func (c *apiClient) EnsureDefaultStaticFileCacheRule(ctx context.Context, accoun
 		return classifyCacheRuleError(err)
 	}
 	return statusCreated, nil
+}
+
+type cacheRuleCloneSource struct {
+	ZoneID string
+	Domain string
+	Rules  []rulesetRule
+}
+
+func (c *apiClient) EnsureCacheRulesFromRandomExistingZone(ctx context.Context, account config.CF, zoneID string, domain string) (string, error) {
+	source, err := c.randomExistingCacheRuleSource(ctx, account, zoneID, domain)
+	if err != nil {
+		status, fallbackErr := c.EnsureDefaultStaticFileCacheRule(ctx, account, zoneID)
+		if fallbackErr != nil {
+			return "", fmt.Errorf("未找到可克隆的缓存规则源 Zone: %v; 默认缓存模板创建失败: %w", err, fallbackErr)
+		}
+		return status, nil
+	}
+
+	status, err := c.ensureCacheRules(ctx, account, zoneID, source.Rules)
+	if err != nil {
+		return classifyCacheRuleError(err)
+	}
+	return fmt.Sprintf("%s_from %s", status, source.Domain), nil
+}
+
+func (c *apiClient) randomExistingCacheRuleSource(ctx context.Context, account config.CF, targetZoneID string, targetDomain string) (cacheRuleCloneSource, error) {
+	zones, err := c.ListZones(ctx, account)
+	if err != nil {
+		return cacheRuleCloneSource{}, err
+	}
+	if len(zones) == 0 {
+		return cacheRuleCloneSource{}, errors.New("当前账号下没有可用 Zone")
+	}
+
+	candidates := append([]ZoneDetail(nil), zones...)
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng.Shuffle(len(candidates), func(i, j int) {
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	})
+
+	var lastErr error
+	now := time.Now()
+	for _, zone := range candidates {
+		if strings.EqualFold(strings.TrimSpace(zone.ID), strings.TrimSpace(targetZoneID)) ||
+			strings.EqualFold(strings.TrimSpace(zone.Name), strings.TrimSpace(targetDomain)) {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(zone.Status), "active") || zone.Paused {
+			continue
+		}
+
+		detail := zoneStatusResult{}
+		if err := c.Do(ctx, account, http.MethodGet, fmt.Sprintf("/zones/%s", zone.ID), nil, &detail); err != nil {
+			lastErr = err
+			continue
+		}
+		if strings.TrimSpace(detail.ID) == "" {
+			detail.ID = zone.ID
+		}
+		if strings.TrimSpace(detail.Name) == "" {
+			detail.Name = zone.Name
+		}
+		if strings.TrimSpace(detail.Status) == "" {
+			detail.Status = zone.Status
+		}
+		if !isEligibleCacheCloneSource(detail, now) {
+			continue
+		}
+
+		var entry rulesetEntryPoint
+		path := fmt.Sprintf("/zones/%s/rulesets/phases/%s/entrypoint", detail.ID, cacheSettingsPhase)
+		if err := c.Do(ctx, account, http.MethodGet, path, nil, &entry); err != nil {
+			var apiErr *CloudflareAPIError
+			if errors.As(err, &apiErr) && apiErr.IsStatus(http.StatusNotFound) {
+				continue
+			}
+			lastErr = err
+			continue
+		}
+
+		rules := cloneableCacheRules(entry.Rules)
+		if len(rules) == 0 {
+			continue
+		}
+		return cacheRuleCloneSource{
+			ZoneID: detail.ID,
+			Domain: detail.Name,
+			Rules:  rules,
+		}, nil
+	}
+
+	if lastErr != nil {
+		return cacheRuleCloneSource{}, lastErr
+	}
+	return cacheRuleCloneSource{}, errors.New("没有找到 active、非当天创建且已有缓存规则的源 Zone")
+}
+
+func isEligibleCacheCloneSource(zone zoneStatusResult, now time.Time) bool {
+	if !strings.EqualFold(strings.TrimSpace(zone.Status), "active") || zone.Paused {
+		return false
+	}
+	if zone.CreatedOn.IsZero() {
+		return false
+	}
+	created := zone.CreatedOn.In(now.Location())
+	return created.Year() != now.Year() || created.YearDay() != now.YearDay()
+}
+
+func cloneableCacheRules(rules []rulesetRule) []rulesetRule {
+	out := make([]rulesetRule, 0, len(rules))
+	seen := make(map[string]struct{}, len(rules))
+	for _, rule := range rules {
+		description := strings.TrimSpace(rule.Description)
+		if description == "" ||
+			strings.TrimSpace(rule.Expression) == "" ||
+			strings.TrimSpace(rule.Action) == "" {
+			continue
+		}
+		if _, ok := seen[description]; ok {
+			continue
+		}
+		seen[description] = struct{}{}
+		rule.ID = ""
+		out = append(out, rule)
+	}
+	return out
+}
+
+func (c *apiClient) ensureCacheRules(ctx context.Context, account config.CF, zoneID string, rules []rulesetRule) (string, error) {
+	rules = cloneableCacheRules(rules)
+	if len(rules) == 0 {
+		return "", errors.New("cache rules is empty")
+	}
+
+	var entry rulesetEntryPoint
+	path := fmt.Sprintf("/zones/%s/rulesets/phases/%s/entrypoint", zoneID, cacheSettingsPhase)
+	err := c.Do(ctx, account, http.MethodGet, path, nil, &entry)
+	if err != nil {
+		var apiErr *CloudflareAPIError
+		if errors.As(err, &apiErr) && apiErr.IsStatus(http.StatusNotFound) {
+			return c.createCacheRuleset(ctx, account, zoneID, rules)
+		}
+		if isCloudflarePermissionError(err) {
+			if status, createErr := c.createCacheRuleset(ctx, account, zoneID, rules); createErr == nil {
+				return status, nil
+			} else {
+				return "", fmt.Errorf("%w; direct cache ruleset create failed: %v", err, createErr)
+			}
+		}
+		return "", err
+	}
+	if strings.TrimSpace(entry.ID) == "" {
+		return "", errors.New("Cloudflare cache entrypoint ruleset id is empty")
+	}
+
+	status := statusAlreadyExists
+	for _, want := range rules {
+		target, duplicates := findRulesetRuleByDescription(entry.Rules, want.Description)
+		if strings.TrimSpace(target.Description) == "" {
+			if err := c.Do(ctx, account, http.MethodPost, fmt.Sprintf("/zones/%s/rulesets/%s/rules", zoneID, entry.ID), want, nil); err != nil {
+				return "", err
+			}
+			status = statusCreated
+			continue
+		}
+		if strings.TrimSpace(target.ID) == "" {
+			return "", errors.New("Cloudflare cache rule id is empty")
+		}
+		if !cacheRuleMatches(target, want) {
+			want.ID = target.ID
+			updatePath := fmt.Sprintf("/zones/%s/rulesets/%s/rules/%s", zoneID, entry.ID, target.ID)
+			if err := c.Do(ctx, account, http.MethodPatch, updatePath, want, nil); err != nil {
+				return "", err
+			}
+			status = statusUpdated
+		}
+		for _, duplicate := range duplicates {
+			if strings.TrimSpace(duplicate.ID) == "" {
+				return "", errors.New("Cloudflare duplicate cache rule id is empty")
+			}
+			deletePath := fmt.Sprintf("/zones/%s/rulesets/%s/rules/%s", zoneID, entry.ID, duplicate.ID)
+			if err := c.Do(ctx, account, http.MethodDelete, deletePath, nil, nil); err != nil {
+				return "", err
+			}
+			status = statusUpdated
+		}
+	}
+	return status, nil
+}
+
+func (c *apiClient) createCacheRuleset(ctx context.Context, account config.CF, zoneID string, rules []rulesetRule) (string, error) {
+	rules = cloneableCacheRules(rules)
+	if len(rules) == 0 {
+		return "", errors.New("cache rules is empty")
+	}
+	req := map[string]any{
+		"name":  cacheRulesetName,
+		"kind":  "zone",
+		"phase": cacheSettingsPhase,
+		"rules": rules,
+	}
+	if err := c.Do(ctx, account, http.MethodPost, fmt.Sprintf("/zones/%s/rulesets", zoneID), req, nil); err != nil {
+		return "", err
+	}
+	return statusCreated, nil
+}
+
+func findRulesetRuleByDescription(rules []rulesetRule, description string) (rulesetRule, []rulesetRule) {
+	var target rulesetRule
+	var duplicates []rulesetRule
+	for _, existing := range rules {
+		if existing.Description != description {
+			continue
+		}
+		if strings.TrimSpace(target.Description) == "" {
+			target = existing
+			continue
+		}
+		duplicates = append(duplicates, existing)
+	}
+	return target, duplicates
+}
+
+func isCloudflarePermissionError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "permission") || strings.Contains(msg, "not authorized") || strings.Contains(msg, "authentication")
 }
 
 func cacheRuleMatches(existing rulesetRule, want rulesetRule) bool {
