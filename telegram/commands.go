@@ -94,6 +94,8 @@ func (h *CommandHandler) HandleMessage(msg *tgbotapi.Message) {
 		go h.handleCFProvisionCommand("cf_init", args)
 	case "cf_rules":
 		go h.handleCFRulesCommand(args)
+	case "cf_ipblock", "ipblock":
+		go h.handleCFIPBlockCommand(args)
 	}
 
 }
