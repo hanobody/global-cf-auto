@@ -18,12 +18,14 @@ const (
 )
 
 type cloudflareAccountIPBlockManager interface {
-	EnsureAccountIPAccessBlockRule(ctx context.Context, account config.CF, value string) (string, error)
-	DeleteAccountIPAccessBlockRule(ctx context.Context, account config.CF, value string) (string, error)
+	ListZones(ctx context.Context, account config.CF) ([]cfclient.ZoneDetail, error)
+	EnsureIPBlockRule(ctx context.Context, account config.CF, zoneID string, values []string) (string, error)
+	DeleteIPBlockRule(ctx context.Context, account config.CF, zoneID string, values []string) (string, error)
 }
 
 type cfIPBlockAccountResult struct {
 	AccountLabel  string
+	Processed     int
 	Created       int
 	Updated       int
 	AlreadyExists int
@@ -42,7 +44,7 @@ type cfIPBlockBatchResult struct {
 
 func (h *CommandHandler) handleCFIPBlockCommand(args []string) {
 	if len(h.Accounts) == 0 {
-		h.sendText("未配置可用的 Cloudflare 账号，无法设置账号级 IP 黑名单。")
+		h.sendText("未配置可用的 Cloudflare 账号，无法设置 WAF IP 黑名单。")
 		return
 	}
 	action, values, err := parseCFIPBlockArgs(args)
@@ -52,7 +54,7 @@ func (h *CommandHandler) handleCFIPBlockCommand(args []string) {
 	}
 	manager, ok := h.CFClient.(cloudflareAccountIPBlockManager)
 	if !ok {
-		h.sendText("当前 Cloudflare 客户端不支持账号级 IP 黑名单管理。")
+		h.sendText("当前 Cloudflare 客户端不支持 WAF IP 黑名单管理。")
 		return
 	}
 	accounts := append([]config.CF(nil), h.Accounts...)
@@ -60,7 +62,7 @@ func (h *CommandHandler) handleCFIPBlockCommand(args []string) {
 		result := processCFIPBlockAllAccounts(context.Background(), manager, accounts, action, values)
 		h.sendText(result.Summary())
 	}()
-	h.sendText(fmt.Sprintf("Cloudflare 账号级 IP 黑名单任务已提交：动作 %s，账号 %d，IP/IP段 %d。\n账号之间并发执行，每个账号内部限速 %s/条。",
+	h.sendText(fmt.Sprintf("Cloudflare WAF IP 黑名单任务已提交：动作 %s，账号 %d，IP/IP段 %d。\n账号之间并发执行，每个账号内部限速 %s/域名。",
 		action, len(accounts), len(values), cfIPBlockPerAccountInterval))
 }
 
@@ -121,7 +123,7 @@ func parseCFIPBlockValues(args []string) ([]string, error) {
 }
 
 func cfIPBlockUsage() string {
-	return "用法：\n/cf_ipblock add 1.2.3.4,5.6.7.8\n/cf_ipblock delete 1.2.3.4\n/cf_ipblock all add 1.2.3.4\n\n说明：该命令默认对所有已配置 Cloudflare 账号创建账号级 block IP Access Rule，作用于账号下所有域名。"
+	return "用法：\n/cf_ipblock add 1.2.3.4,5.6.7.8\n/cf_ipblock delete 1.2.3.4\n/cf_ipblock all add 1.2.3.4\n\n说明：该命令默认对所有已配置 Cloudflare 账号下的所有域名创建 WAF 自定义规则 telegram-auto-block-ips。add 会合并新增 IP/IP段；delete 只移除本次传入的 IP/IP段，删空后删除规则。"
 }
 
 func processCFIPBlockAllAccounts(ctx context.Context, manager cloudflareAccountIPBlockManager, accounts []config.CF, action string, values []string) cfIPBlockBatchResult {
@@ -159,23 +161,35 @@ func processCFIPBlockAllAccounts(ctx context.Context, manager cloudflareAccountI
 
 func processCFIPBlockAccount(ctx context.Context, manager cloudflareAccountIPBlockManager, account config.CF, action string, values []string) cfIPBlockAccountResult {
 	result := cfIPBlockAccountResult{AccountLabel: account.Label}
+	zones, err := manager.ListZones(ctx, account)
+	if err != nil {
+		result.Failed = append(result.Failed, "读取域名失败: "+err.Error())
+		return result
+	}
 	pacer := newBatchAPIPacerWithInterval(cfIPBlockPerAccountInterval)
-	for _, value := range values {
+	for _, zone := range zones {
+		zoneID := strings.TrimSpace(zone.ID)
+		name := strings.TrimSpace(zone.Name)
+		if zoneID == "" {
+			result.Failed = append(result.Failed, name+": 缺少 zone_id")
+			continue
+		}
 		if err := pacer.Wait(ctx); err != nil {
-			result.Failed = append(result.Failed, value+": 等待执行失败: "+err.Error())
+			result.Failed = append(result.Failed, name+": 等待执行失败: "+err.Error())
 			continue
 		}
 		var status string
 		var err error
 		if action == "delete" {
-			status, err = manager.DeleteAccountIPAccessBlockRule(ctx, account, value)
+			status, err = manager.DeleteIPBlockRule(ctx, account, zoneID, values)
 		} else {
-			status, err = manager.EnsureAccountIPAccessBlockRule(ctx, account, value)
+			status, err = manager.EnsureIPBlockRule(ctx, account, zoneID, values)
 		}
 		if err != nil {
-			result.Failed = append(result.Failed, value+": "+err.Error())
+			result.Failed = append(result.Failed, name+": "+err.Error())
 			continue
 		}
+		result.Processed++
 		switch status {
 		case "created":
 			result.Created++
@@ -208,11 +222,15 @@ func (r cfIPBlockBatchResult) Summary() string {
 		skipped += account.Skipped
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Cloudflare 账号级 IP 黑名单完成\n动作: %s\n账号: %d\nIP/IP段: %d\ncreated:%d updated:%d already_exists:%d deleted:%d not_found:%d skipped:%d failed:%d",
-		r.Action, len(r.Accounts), len(r.Values), created, updated, existing, deleted, notFound, skipped, len(r.Failed)))
+	processed := 0
 	for _, account := range r.Accounts {
-		sb.WriteString(fmt.Sprintf("\n- %s | created:%d updated:%d exists:%d deleted:%d not_found:%d failed:%d",
-			account.AccountLabel, account.Created, account.Updated, account.AlreadyExists, account.Deleted, account.NotFound, len(account.Failed)))
+		processed += account.Processed
+	}
+	sb.WriteString(fmt.Sprintf("Cloudflare WAF IP 黑名单完成\n动作: %s\n账号: %d\nIP/IP段: %d\n已处理域名:%d\ncreated:%d updated:%d already_exists:%d deleted:%d not_found:%d skipped:%d failed:%d",
+		r.Action, len(r.Accounts), len(r.Values), processed, created, updated, existing, deleted, notFound, skipped, len(r.Failed)))
+	for _, account := range r.Accounts {
+		sb.WriteString(fmt.Sprintf("\n- %s | domains:%d created:%d updated:%d exists:%d deleted:%d not_found:%d failed:%d",
+			account.AccountLabel, account.Processed, account.Created, account.Updated, account.AlreadyExists, account.Deleted, account.NotFound, len(account.Failed)))
 	}
 	if len(r.Failed) > 0 {
 		sb.WriteString("\n\n失败明细:")

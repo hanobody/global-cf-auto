@@ -5,25 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"strings"
 
 	"DomainC/config"
 )
 
-const accountIPBlacklistNote = "telegram-auto-ip-blacklist"
-
-type AccountIPAccessRule struct {
-	ID            string                    `json:"id"`
-	Mode          string                    `json:"mode"`
-	Configuration accessRuleConfiguration   `json:"configuration"`
-	Notes         string                    `json:"notes"`
-}
-
-type accessRuleConfiguration struct {
-	Target string `json:"target"`
-	Value  string `json:"value"`
-}
+const (
+	ipBlockRuleDesc    = "telegram-auto-block-ips"
+	ipBlockRulesetName = "telegram-auto-ip-waf"
+)
 
 func NormalizeIPAccessRuleValues(values []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(values))
@@ -74,123 +64,238 @@ func normalizeIPAccessRuleValue(raw string) (string, string, error) {
 	return "ip", ip.String(), nil
 }
 
-func (c *apiClient) EnsureAccountIPAccessBlockRule(ctx context.Context, account config.CF, value string) (string, error) {
-	target, normalized, err := normalizeIPAccessRuleValue(value)
+func buildIPBlockExpression(values []string) string {
+	return fmt.Sprintf("ip.src in {%s}", strings.Join(values, " "))
+}
+
+func (c *apiClient) EnsureIPBlockRule(ctx context.Context, account config.CF, zoneID string, values []string) (string, error) {
+	normalized, err := NormalizeIPAccessRuleValues(values)
 	if err != nil {
 		return "", err
 	}
-	if normalized == "" {
+	if len(normalized) == 0 {
 		return statusSkipped, nil
 	}
-	accountID, err := c.GetAccountID(ctx, account)
+	existing, err := c.currentIPBlockValues(ctx, account, zoneID)
 	if err != nil {
 		return "", err
 	}
-	rules, err := c.listAccountIPAccessRules(ctx, account, accountID, "", target, normalized)
+	normalized = mergeIPAccessRuleValues(existing, normalized)
+	expression := buildIPBlockExpression(normalized)
+	rule := rulesetRule{
+		Description: ipBlockRuleDesc,
+		Expression:  expression,
+		Action:      "block",
+		Enabled:     true,
+	}
+	status, err := c.ensureFirewallCustomRuleByDescription(ctx, account, zoneID, ipBlockRulesetName, ipBlockRuleDesc, rule)
 	if err != nil {
 		return "", err
 	}
-	for _, rule := range rules {
-		if !accessRuleMatches(rule, target, normalized) {
+	if err := c.verifyFirewallCustomRule(ctx, account, zoneID, ipBlockRuleDesc, expression); err != nil {
+		return "", err
+	}
+	return status, nil
+}
+
+func (c *apiClient) DeleteIPBlockRule(ctx context.Context, account config.CF, zoneID string, values []string) (string, error) {
+	remove, err := NormalizeIPAccessRuleValues(values)
+	if err != nil {
+		return "", err
+	}
+	if len(remove) == 0 {
+		return statusSkipped, nil
+	}
+	existing, err := c.currentIPBlockValues(ctx, account, zoneID)
+	if err != nil {
+		return "", err
+	}
+	if len(existing) == 0 {
+		return statusNotFound, nil
+	}
+	remaining := removeIPAccessRuleValues(existing, remove)
+	if len(remaining) == len(existing) {
+		return statusNotFound, nil
+	}
+	if len(remaining) == 0 {
+		return c.deleteRulesetRuleByDescription(ctx, account, zoneID, firewallCustomPhase, ipBlockRuleDesc)
+	}
+	expression := buildIPBlockExpression(remaining)
+	rule := rulesetRule{
+		Description: ipBlockRuleDesc,
+		Expression:  expression,
+		Action:      "block",
+		Enabled:     true,
+	}
+	status, err := c.ensureFirewallCustomRuleByDescription(ctx, account, zoneID, ipBlockRulesetName, ipBlockRuleDesc, rule)
+	if err != nil {
+		return "", err
+	}
+	if err := c.verifyFirewallCustomRule(ctx, account, zoneID, ipBlockRuleDesc, expression); err != nil {
+		return "", err
+	}
+	return status, nil
+}
+
+func (c *apiClient) currentIPBlockValues(ctx context.Context, account config.CF, zoneID string) ([]string, error) {
+	var entry rulesetEntryPoint
+	path := fmt.Sprintf("/zones/%s/rulesets/phases/%s/entrypoint", zoneID, firewallCustomPhase)
+	err := c.Do(ctx, account, "GET", path, nil, &entry)
+	if err != nil {
+		var apiErr *CloudflareAPIError
+		if errors.As(err, &apiErr) && apiErr.IsStatus(404) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	for _, rule := range entry.Rules {
+		if rule.Description != ipBlockRuleDesc {
 			continue
 		}
-		if strings.EqualFold(rule.Mode, "block") {
-			return statusAlreadyExists, nil
+		return parseIPBlockExpression(rule.Expression), nil
+	}
+	return nil, nil
+}
+
+func parseIPBlockExpression(expression string) []string {
+	start := strings.Index(expression, "{")
+	end := strings.LastIndex(expression, "}")
+	if start < 0 || end <= start {
+		return nil
+	}
+	fields := strings.Fields(expression[start+1 : end])
+	values, err := NormalizeIPAccessRuleValues(fields)
+	if err != nil {
+		return nil
+	}
+	return values
+}
+
+func mergeIPAccessRuleValues(existing []string, add []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(add))
+	out := make([]string, 0, len(existing)+len(add))
+	for _, value := range append(append([]string(nil), existing...), add...) {
+		if strings.TrimSpace(value) == "" {
+			continue
 		}
-		if strings.TrimSpace(rule.ID) == "" {
-			return "", errors.New("Cloudflare account IP access rule id is empty")
+		if _, ok := seen[value]; ok {
+			continue
 		}
-		req := map[string]any{
-			"mode":  "block",
-			"notes": accountIPBlacklistNote,
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func removeIPAccessRuleValues(existing []string, remove []string) []string {
+	removeSet := make(map[string]struct{}, len(remove))
+	for _, value := range remove {
+		removeSet[value] = struct{}{}
+	}
+	out := make([]string, 0, len(existing))
+	for _, value := range existing {
+		if _, ok := removeSet[value]; ok {
+			continue
 		}
-		path := fmt.Sprintf("/accounts/%s/firewall/access_rules/rules/%s", accountID, rule.ID)
-		if err := c.Do(ctx, account, "PATCH", path, req, nil); err != nil {
-			return "", err
+		out = append(out, value)
+	}
+	return out
+}
+
+func (c *apiClient) ensureFirewallCustomRuleByDescription(ctx context.Context, account config.CF, zoneID string, rulesetName string, description string, rule rulesetRule) (string, error) {
+	var entry rulesetEntryPoint
+	path := fmt.Sprintf("/zones/%s/rulesets/phases/%s/entrypoint", zoneID, firewallCustomPhase)
+	err := c.Do(ctx, account, "GET", path, nil, &entry)
+	if err != nil {
+		var apiErr *CloudflareAPIError
+		if errors.As(err, &apiErr) && apiErr.IsStatus(404) {
+			req := map[string]any{
+				"name":  rulesetName,
+				"kind":  "zone",
+				"phase": firewallCustomPhase,
+				"rules": []rulesetRule{rule},
+			}
+			if err := c.Do(ctx, account, "POST", fmt.Sprintf("/zones/%s/rulesets", zoneID), req, nil); err != nil {
+				return "", err
+			}
+			return statusCreated, nil
 		}
-		return statusUpdated, nil
+		return "", err
+	}
+	if strings.TrimSpace(entry.ID) == "" {
+		return "", errors.New("Cloudflare firewall entrypoint ruleset id is empty")
 	}
 
-	req := map[string]any{
-		"mode": "block",
-		"configuration": map[string]string{
-			"target": target,
-			"value":  normalized,
-		},
-		"notes": accountIPBlacklistNote,
+	var target rulesetRule
+	var duplicates []rulesetRule
+	for _, existing := range entry.Rules {
+		if existing.Description != description {
+			continue
+		}
+		if strings.TrimSpace(target.Description) == "" {
+			target = existing
+			continue
+		}
+		duplicates = append(duplicates, existing)
 	}
-	if err := c.Do(ctx, account, "POST", fmt.Sprintf("/accounts/%s/firewall/access_rules/rules", accountID), req, nil); err != nil {
+	if strings.TrimSpace(target.Description) != "" {
+		if strings.TrimSpace(target.ID) == "" {
+			return "", errors.New("Cloudflare firewall rule id is empty")
+		}
+		status := statusAlreadyExists
+		if !firewallRuleMatches(target, rule.Expression, rule.Action, rule.Enabled) {
+			rule.ID = target.ID
+			updatePath := fmt.Sprintf("/zones/%s/rulesets/%s/rules/%s", zoneID, entry.ID, target.ID)
+			if err := c.Do(ctx, account, "PATCH", updatePath, rule, nil); err != nil {
+				return "", err
+			}
+			status = statusUpdated
+		}
+		for _, duplicate := range duplicates {
+			if strings.TrimSpace(duplicate.ID) == "" {
+				return "", errors.New("Cloudflare duplicate firewall rule id is empty")
+			}
+			deletePath := fmt.Sprintf("/zones/%s/rulesets/%s/rules/%s", zoneID, entry.ID, duplicate.ID)
+			if err := c.Do(ctx, account, "DELETE", deletePath, nil, nil); err != nil {
+				return "", err
+			}
+			status = statusUpdated
+		}
+		return status, nil
+	}
+	if err := c.Do(ctx, account, "POST", fmt.Sprintf("/zones/%s/rulesets/%s/rules", zoneID, entry.ID), rule, nil); err != nil {
 		return "", err
 	}
 	return statusCreated, nil
 }
 
-func (c *apiClient) DeleteAccountIPAccessBlockRule(ctx context.Context, account config.CF, value string) (string, error) {
-	target, normalized, err := normalizeIPAccessRuleValue(value)
-	if err != nil {
-		return "", err
-	}
-	if normalized == "" {
-		return statusSkipped, nil
-	}
-	accountID, err := c.GetAccountID(ctx, account)
-	if err != nil {
-		return "", err
-	}
-	rules, err := c.listAccountIPAccessRules(ctx, account, accountID, "block", target, normalized)
-	if err != nil {
-		return "", err
-	}
-	deleted := false
-	for _, rule := range rules {
-		if !accessRuleMatches(rule, target, normalized) || !strings.EqualFold(rule.Mode, "block") {
+func (c *apiClient) verifyFirewallCustomRule(ctx context.Context, account config.CF, zoneID string, description string, expression string) error {
+	path := fmt.Sprintf("/zones/%s/rulesets/phases/%s/entrypoint", zoneID, firewallCustomPhase)
+	var lastErr error
+	for attempt := 0; attempt < countryBlockVerifyAttempts; attempt++ {
+		if err := waitCountryBlockVerifyRetry(ctx, attempt); err != nil {
+			return err
+		}
+		var entry rulesetEntryPoint
+		if err := c.Do(ctx, account, "GET", path, nil, &entry); err != nil {
+			lastErr = err
 			continue
 		}
-		if strings.TrimSpace(rule.ID) == "" {
-			return "", errors.New("Cloudflare account IP access rule id is empty")
+		for _, existing := range entry.Rules {
+			if existing.Description == description && firewallRuleMatches(existing, expression, "block", true) {
+				return nil
+			}
 		}
-		path := fmt.Sprintf("/accounts/%s/firewall/access_rules/rules/%s", accountID, rule.ID)
-		if err := c.Do(ctx, account, "DELETE", path, nil, nil); err != nil {
-			return "", err
-		}
-		deleted = true
+		lastErr = fmt.Errorf("Cloudflare firewall rule %q is not visible after write", description)
 	}
-	if deleted {
-		return statusDeleted, nil
+	if lastErr != nil {
+		return fmt.Errorf("verify Cloudflare firewall rule failed: %w", lastErr)
 	}
-	return statusNotFound, nil
+	return errors.New("verify Cloudflare firewall rule failed")
 }
 
-func (c *apiClient) listAccountIPAccessRules(ctx context.Context, account config.CF, accountID string, mode string, target string, value string) ([]AccountIPAccessRule, error) {
-	const perPage = 100
-	var out []AccountIPAccessRule
-	for page := 1; ; page++ {
-		q := url.Values{}
-		q.Set("page", fmt.Sprintf("%d", page))
-		q.Set("per_page", fmt.Sprintf("%d", perPage))
-		if strings.TrimSpace(mode) != "" {
-			q.Set("mode", strings.TrimSpace(mode))
-		}
-		if strings.TrimSpace(target) != "" {
-			q.Set("configuration.target", strings.TrimSpace(target))
-		}
-		if strings.TrimSpace(value) != "" {
-			q.Set("configuration.value", strings.TrimSpace(value))
-		}
-		var pageItems []AccountIPAccessRule
-		path := fmt.Sprintf("/accounts/%s/firewall/access_rules/rules?%s", accountID, q.Encode())
-		if err := c.Do(ctx, account, "GET", path, nil, &pageItems); err != nil {
-			return nil, err
-		}
-		out = append(out, pageItems...)
-		if len(pageItems) < perPage {
-			break
-		}
-	}
-	return out, nil
-}
-
-func accessRuleMatches(rule AccountIPAccessRule, target string, value string) bool {
-	return strings.EqualFold(strings.TrimSpace(rule.Configuration.Target), strings.TrimSpace(target)) &&
-		strings.EqualFold(strings.TrimSpace(rule.Configuration.Value), strings.TrimSpace(value))
+func firewallRuleMatches(rule rulesetRule, expression string, action string, enabled bool) bool {
+	return strings.TrimSpace(rule.Expression) == strings.TrimSpace(expression) &&
+		strings.EqualFold(rule.Action, action) &&
+		rule.Enabled == enabled
 }
