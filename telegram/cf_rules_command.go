@@ -6,12 +6,17 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"DomainC/cfclient"
 	"DomainC/config"
 )
 
-const cfRulesItemsPerPage = 8
+const (
+	cfRulesItemsPerPage        = 8
+	cfRulesPerAccountInterval  = 2500 * time.Millisecond
+	cfRulesAllAccountsMaxLines = 80
+)
 
 type CFRulesDomainItem struct {
 	Key          string
@@ -53,6 +58,14 @@ type CFRulesBatchResult struct {
 	Failed       []string
 }
 
+type CFRulesAllAccountsResult struct {
+	Action         string
+	Feature        string
+	BlockCountries []string
+	Accounts       []CFRulesBatchResult
+	Failed         []string
+}
+
 type cloudflareFeatureManager interface {
 	ManageZoneFeatures(ctx context.Context, account config.CF, domain string, zoneID string, opts cfclient.FeatureManageOptions) cfclient.FeatureManageResult
 }
@@ -75,6 +88,26 @@ func (h *CommandHandler) handleCFRulesCommand(args []string) {
 	}
 	if len(args) == 0 {
 		h.sendCFRulesAccountSelector()
+		return
+	}
+
+	if isCFRulesAllAccountsArg(args[0]) {
+		action, feature, blockCountries, err := parseCFRulesAllAccountsArgs(args[1:])
+		if err != nil {
+			h.sendText(err.Error())
+			return
+		}
+		if CFRulesNeedsBlockCountries(action, feature) && len(blockCountries) == 0 {
+			h.sendText("启用安全规则需要国家/地区代码。示例：/cf_rules all block=AM,HK")
+			return
+		}
+		accounts := append([]config.CF(nil), h.Accounts...)
+		go func() {
+			result := ProcessCFRulesAllAccounts(context.Background(), h.CFClient, accounts, action, feature, blockCountries)
+			h.sendText(result.Summary())
+		}()
+		h.sendText(fmt.Sprintf("Cloudflare 全账号规则检查任务已提交：账号 %d，动作 %s，功能 %s，拦截 %s。账号之间并发执行，每个账号内部限速 %s/域名。",
+			len(accounts), action, feature, strings.Join(blockCountries, ","), cfRulesPerAccountInterval))
 		return
 	}
 
@@ -168,7 +201,8 @@ func (h *CommandHandler) sendCFRulesAccountSelector() {
 			CallbackData: fmt.Sprintf("cfrules_account|%s", token),
 		}})
 	}
-	if err := h.Sender.SendWithButtons(context.Background(), "请选择要检查规则的 Cloudflare 账号：", buttons); err != nil {
+	msg := "请选择要检查规则的 Cloudflare 账号：\n\n批量所有账号安全规则示例：\n/cf_rules all block=AM,HK"
+	if err := h.Sender.SendWithButtons(context.Background(), msg, buttons); err != nil {
 		h.sendText(fmt.Sprintf("发送账号选择失败: %v", err))
 	}
 }
@@ -562,7 +596,12 @@ func ProcessCFRulesItems(ctx context.Context, client cfclient.Client, account co
 	security := feature == "all" || feature == "security"
 	speed := feature == "all" || feature == "speed"
 	cache := feature == "all" || feature == "cache"
+	pacer := newBatchAPIPacerWithInterval(cfRulesPerAccountInterval)
 	for _, item := range items {
+		if err := pacer.Wait(ctx); err != nil {
+			result.Failed = append(result.Failed, item.Name+": 等待执行失败: "+err.Error())
+			continue
+		}
 		zoneID := strings.TrimSpace(item.ZoneID)
 		if zoneID == "" {
 			result.Failed = append(result.Failed, item.Name+": 缺少 zone_id")
@@ -586,6 +625,58 @@ func ProcessCFRulesItems(ctx context.Context, client cfclient.Client, account co
 	return result
 }
 
+func ProcessCFRulesAllAccounts(ctx context.Context, client cfclient.Client, accounts []config.CF, action string, feature string, blockCountries []string) CFRulesAllAccountsResult {
+	result := CFRulesAllAccountsResult{
+		Action:         action,
+		Feature:        feature,
+		BlockCountries: append([]string(nil), blockCountries...),
+	}
+	if len(accounts) == 0 {
+		result.Failed = append(result.Failed, "未配置可用的 Cloudflare 账号")
+		return result
+	}
+
+	ch := make(chan CFRulesBatchResult, len(accounts))
+	var wg sync.WaitGroup
+	for _, account := range accounts {
+		account := account
+		if strings.TrimSpace(account.Label) == "" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			accountResult := CFRulesBatchResult{AccountLabel: account.Label, Action: action, Feature: feature}
+			zones, err := client.ListZones(ctx, account)
+			if err != nil {
+				accountResult.Failed = append(accountResult.Failed, fmt.Sprintf("读取域名失败: %v", err))
+				ch <- accountResult
+				return
+			}
+			items := buildCFRulesDomainItemsFromZones(account.Label, zones)
+			if len(items) == 0 {
+				ch <- accountResult
+				return
+			}
+			ch <- ProcessCFRulesItems(ctx, client, account, items, action, feature, blockCountries)
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	for accountResult := range ch {
+		result.Accounts = append(result.Accounts, accountResult)
+		for _, failed := range accountResult.Failed {
+			result.Failed = append(result.Failed, accountResult.AccountLabel+": "+failed)
+		}
+	}
+	sort.Slice(result.Accounts, func(i, j int) bool { return result.Accounts[i].AccountLabel < result.Accounts[j].AccountLabel })
+	sort.Strings(result.Failed)
+	return result
+}
+
 func (r CFRulesBatchResult) Summary() string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Cloudflare 规则检查完成\n账号: %s\n动作: %s\n功能: %s\n已处理: %d", r.AccountLabel, r.Action, r.Feature, len(r.Success)))
@@ -604,6 +695,110 @@ func (r CFRulesBatchResult) Summary() string {
 		}
 	}
 	return sb.String()
+}
+
+func (r CFRulesAllAccountsResult) Summary() string {
+	processed := 0
+	for _, account := range r.Accounts {
+		processed += len(account.Success)
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Cloudflare 全账号规则检查完成\n动作: %s\n功能: %s\n拦截: %s\n账号: %d\n已处理域名: %d\n失败: %d",
+		r.Action, r.Feature, strings.Join(r.BlockCountries, ","), len(r.Accounts), processed, len(r.Failed)))
+	for _, account := range r.Accounts {
+		sb.WriteString(fmt.Sprintf("\n- %s | 已处理:%d | 失败:%d", account.AccountLabel, len(account.Success), len(account.Failed)))
+	}
+	if len(r.Failed) > 0 {
+		sb.WriteString("\n\n失败明细:")
+		limit := len(r.Failed)
+		if limit > cfRulesAllAccountsMaxLines {
+			limit = cfRulesAllAccountsMaxLines
+		}
+		for _, item := range r.Failed[:limit] {
+			sb.WriteString("\n- " + item)
+		}
+		if len(r.Failed) > limit {
+			sb.WriteString(fmt.Sprintf("\n- 还有 %d 条失败明细未显示，请查看日志或分账号重试。", len(r.Failed)-limit))
+		}
+	}
+	return sb.String()
+}
+
+func parseCFRulesAllAccountsArgs(args []string) (string, string, []string, error) {
+	action := "enable"
+	feature := "security"
+	blockCountries := config.DefaultBlockCountries()
+	start := 0
+	if len(args) > 0 && !strings.Contains(args[0], "=") {
+		if isCFRulesAllDomainsArg(args[0]) {
+			start = 1
+		} else if parsedFeature := normalizeCFRulesFeature(args[0]); parsedFeature != "" {
+			feature = parsedFeature
+			start = 1
+		} else if parsedAction := normalizeCFRulesAction(args[0]); parsedAction != "" {
+			action = parsedAction
+			start = 1
+		}
+	}
+	for _, arg := range args[start:] {
+		key, value, ok := strings.Cut(arg, "=")
+		if !ok {
+			if parsedFeature := normalizeCFRulesFeature(arg); parsedFeature != "" {
+				feature = parsedFeature
+				continue
+			}
+			if parsedAction := normalizeCFRulesAction(arg); parsedAction != "" {
+				action = parsedAction
+				continue
+			}
+			return action, feature, blockCountries, fmt.Errorf("无法识别参数：%s", arg)
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "action":
+			parsed := normalizeCFRulesAction(value)
+			if parsed == "" {
+				return action, feature, blockCountries, fmt.Errorf("action 参数必须是 enable/update/on 或 disable/delete/off")
+			}
+			action = parsed
+		case "feature":
+			parsed := normalizeCFRulesFeature(value)
+			if parsed == "" {
+				return action, feature, blockCountries, fmt.Errorf("feature 参数必须是 all/security/speed/cache")
+			}
+			feature = parsed
+		case "block", "blocks", "country", "countries":
+			if isNoneValue(value) {
+				blockCountries = nil
+				continue
+			}
+			countries, err := cfclient.NormalizeCountryCodes([]string{value})
+			if err != nil {
+				return action, feature, blockCountries, fmt.Errorf("block 参数错误：%v", err)
+			}
+			blockCountries = countries
+		default:
+			return action, feature, blockCountries, fmt.Errorf("未知参数 %s", key)
+		}
+	}
+	return action, feature, blockCountries, nil
+}
+
+func isCFRulesAllAccountsArg(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "all", "*", "all_accounts", "allaccounts", "accounts", "全部", "全部账号", "所有账号":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCFRulesAllDomainsArg(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "all", "*", "domains", "all_domains", "alldomains", "全部", "全部域名", "所有域名":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeCFRulesAction(raw string) string {
