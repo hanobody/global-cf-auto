@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"DomainC/config"
@@ -13,7 +15,26 @@ import (
 const (
 	ipBlockRuleDesc    = "telegram-auto-block-ips"
 	ipBlockRulesetName = "telegram-auto-ip-waf"
+
+	AccountIPAccessRuleNote = "telegram-auto-ip-blacklist"
 )
+
+type AccountIPAccessRuleDeleteResult struct {
+	Matched  int
+	Deleted  int
+	NotFound int
+	Failed   []string
+}
+
+type accountIPAccessRule struct {
+	ID            string `json:"id"`
+	Mode          string `json:"mode"`
+	Notes         string `json:"notes"`
+	Configuration struct {
+		Target string `json:"target"`
+		Value  string `json:"value"`
+	} `json:"configuration"`
+}
 
 func NormalizeIPAccessRuleValues(values []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(values))
@@ -135,6 +156,141 @@ func (c *apiClient) DeleteIPBlockRule(ctx context.Context, account config.CF, zo
 		return "", err
 	}
 	return status, nil
+}
+
+func (c *apiClient) ClearIPBlockRule(ctx context.Context, account config.CF, zoneID string) (string, error) {
+	return c.deleteRulesetRuleByDescription(ctx, account, zoneID, firewallCustomPhase, ipBlockRuleDesc)
+}
+
+func (c *apiClient) DeleteAccountIPAccessRules(ctx context.Context, account config.CF, values []string) (AccountIPAccessRuleDeleteResult, error) {
+	var result AccountIPAccessRuleDeleteResult
+	normalized, err := NormalizeIPAccessRuleValues(values)
+	if err != nil {
+		return result, err
+	}
+	if len(normalized) == 0 {
+		return result, nil
+	}
+	accountID, err := c.GetAccountID(ctx, account)
+	if err != nil {
+		return result, err
+	}
+	for _, value := range normalized {
+		target, normalizedValue, err := normalizeIPAccessRuleValue(value)
+		if err != nil {
+			return result, err
+		}
+		q := url.Values{}
+		q.Set("configuration.target", target)
+		q.Set("configuration.value", normalizedValue)
+		rules, err := c.listAccountIPAccessRules(ctx, account, accountID, q)
+		if err != nil {
+			return result, err
+		}
+		matched := filterBotAccountIPAccessRules(rules, AccountIPAccessRuleNote)
+		if len(matched) == 0 {
+			result.NotFound++
+			continue
+		}
+		result.Matched += len(matched)
+		for _, rule := range matched {
+			if strings.TrimSpace(rule.ID) == "" {
+				result.Failed = append(result.Failed, normalizedValue+": Cloudflare account IP access rule id is empty")
+				continue
+			}
+			if err := c.deleteAccountIPAccessRule(ctx, account, accountID, rule.ID); err != nil {
+				result.Failed = append(result.Failed, normalizedValue+": "+err.Error())
+				continue
+			}
+			result.Deleted++
+		}
+	}
+	return result, nil
+}
+
+func (c *apiClient) ClearAccountIPAccessRulesByNote(ctx context.Context, account config.CF, note string) (AccountIPAccessRuleDeleteResult, error) {
+	var result AccountIPAccessRuleDeleteResult
+	note = strings.TrimSpace(note)
+	if note == "" {
+		note = AccountIPAccessRuleNote
+	}
+	accountID, err := c.GetAccountID(ctx, account)
+	if err != nil {
+		return result, err
+	}
+	q := url.Values{}
+	q.Set("mode", "block")
+	rules, err := c.listAccountIPAccessRules(ctx, account, accountID, q)
+	if err != nil {
+		return result, err
+	}
+	matched := filterBotAccountIPAccessRules(rules, note)
+	if len(matched) == 0 {
+		result.NotFound = 1
+		return result, nil
+	}
+	result.Matched = len(matched)
+	for _, rule := range matched {
+		if strings.TrimSpace(rule.ID) == "" {
+			result.Failed = append(result.Failed, rule.Configuration.Value+": Cloudflare account IP access rule id is empty")
+			continue
+		}
+		if err := c.deleteAccountIPAccessRule(ctx, account, accountID, rule.ID); err != nil {
+			result.Failed = append(result.Failed, rule.Configuration.Value+": "+err.Error())
+			continue
+		}
+		result.Deleted++
+	}
+	return result, nil
+}
+
+func (c *apiClient) listAccountIPAccessRules(ctx context.Context, account config.CF, accountID string, query url.Values) ([]accountIPAccessRule, error) {
+	const perPage = 100
+	var out []accountIPAccessRule
+	for page := 1; ; page++ {
+		q := url.Values{}
+		for key, values := range query {
+			for _, value := range values {
+				q.Add(key, value)
+			}
+		}
+		q.Set("page", strconv.Itoa(page))
+		q.Set("per_page", strconv.Itoa(perPage))
+		var rules []accountIPAccessRule
+		path := fmt.Sprintf("/accounts/%s/firewall/access_rules/rules?%s", accountID, q.Encode())
+		if err := c.Do(ctx, account, "GET", path, nil, &rules); err != nil {
+			return nil, err
+		}
+		out = append(out, rules...)
+		if len(rules) < perPage {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (c *apiClient) deleteAccountIPAccessRule(ctx context.Context, account config.CF, accountID string, ruleID string) error {
+	path := fmt.Sprintf("/accounts/%s/firewall/access_rules/rules/%s", accountID, ruleID)
+	return c.Do(ctx, account, "DELETE", path, nil, nil)
+}
+
+func filterBotAccountIPAccessRules(rules []accountIPAccessRule, note string) []accountIPAccessRule {
+	note = strings.TrimSpace(note)
+	out := make([]accountIPAccessRule, 0, len(rules))
+	for _, rule := range rules {
+		target := strings.ToLower(strings.TrimSpace(rule.Configuration.Target))
+		if target != "ip" && target != "ip_range" {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(rule.Mode), "block") {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(rule.Notes), note) {
+			continue
+		}
+		out = append(out, rule)
+	}
+	return out
 }
 
 func (c *apiClient) currentIPBlockValues(ctx context.Context, account config.CF, zoneID string) ([]string, error) {
