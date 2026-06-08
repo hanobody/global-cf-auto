@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"html"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -58,10 +59,13 @@ type originSSLARNEntry struct {
 }
 
 const (
-	originSSLStatusPollInterval = 2 * time.Minute
-	originSSLStatusPollAttempts = 180
-	originSSLTaskConcurrency    = 3
-	originSSLDNSRecordLimit     = 500
+	originSSLStatusPollInterval       = 30 * time.Second
+	originSSLStatusPollAttempts       = 120
+	originSSLTaskConcurrency          = 6
+	originSSLPostInitPollInterval     = 30 * time.Second
+	originSSLPostInitZoneActiveTimeout = 30 * time.Minute
+	originSSLPostInitSSLActiveTimeout = 45 * time.Minute
+	originSSLDNSRecordLimit           = 500
 )
 
 type OriginSSLInteractiveDomainResult struct {
@@ -259,9 +263,7 @@ func (h *CommandHandler) handleOriginSSLCommand(args []string) {
 		AWSAliases:     awsAliases,
 		BlockCountries: config.DefaultBlockCountries(),
 	}
-	result := h.processOriginSSLBatch(req, domains)
-	result.ParseErrors = append(result.ParseErrors, parseErrors...)
-	h.sendOriginSSLResult(result)
+	h.startOriginSSLBatchTask(req, domains, parseErrors)
 }
 
 func (h *CommandHandler) startOriginSSLInteractive() {
@@ -473,12 +475,8 @@ func (h *CommandHandler) handlePendingOriginSSLInput(msgText string, userID int6
 		return true
 	}
 
-	result := h.processOriginSSLBatch(req, domains)
-	result.ParseErrors = append(result.ParseErrors, parseErrors...)
-	if len(result.ParseErrors) == 0 && len(result.Failed) == 0 {
-		ClearPendingOriginSSLInput(userID)
-	}
-	h.sendOriginSSLResult(result)
+	ClearPendingOriginSSLInput(userID)
+	h.startOriginSSLBatchTask(req, domains, parseErrors)
 	return true
 }
 
@@ -1395,9 +1393,9 @@ func applyOriginSSLPostInit(ctx context.Context, client cfclient.Client, account
 		EnableCacheRule:     config.EnableCacheRule(),
 		CloneCacheRule:      true,
 		EnableRUM:           config.EnableRUMAutoInstall(),
-		ZoneActiveTimeout:   6 * time.Hour,
-		SSLActiveTimeout:    6 * time.Hour,
-		PollInterval:        2 * time.Minute,
+		ZoneActiveTimeout:   originSSLPostInitZoneActiveTimeout,
+		SSLActiveTimeout:    originSSLPostInitSSLActiveTimeout,
+		PollInterval:        originSSLPostInitPollInterval,
 	})
 	if postResult != nil {
 		result.CountryBlockStatus = postResult.SecurityRuleStatus
@@ -1414,6 +1412,9 @@ func applyOriginSSLPostInit(ctx context.Context, client cfclient.Client, account
 	}
 	if err != nil {
 		result.PostInitErrors = append(result.PostInitErrors, err.Error())
+		if result.CountryBlockStatus == "" || result.CountryBlockStatus == "skipped" {
+			result.CountryBlockStatus = "failed: " + err.Error()
+		}
 	}
 }
 
@@ -1437,16 +1438,16 @@ func applyOriginSSLPostInitBatch(ctx context.Context, client cfclient.Client, ac
 		EnableCacheRule:     config.EnableCacheRule(),
 		CloneCacheRule:      true,
 		EnableRUM:           config.EnableRUMAutoInstall(),
-		ZoneActiveTimeout:   6 * time.Hour,
-		SSLActiveTimeout:    6 * time.Hour,
-		PollInterval:        2 * time.Minute,
+		ZoneActiveTimeout:   originSSLPostInitZoneActiveTimeout,
+		SSLActiveTimeout:    originSSLPostInitSSLActiveTimeout,
+		PollInterval:        originSSLPostInitPollInterval,
 	})
 	if postResult != nil {
 		result.CountryBlockStatus = postResult.SecurityRuleStatus
 		result.CacheRuleStatus = postResult.CacheRuleStatus
 		result.RUMStatus = postResult.RUMStatus
 	}
-	if err != nil && result.CountryBlockStatus == "" {
+	if err != nil && (result.CountryBlockStatus == "" || result.CountryBlockStatus == "skipped") {
 		result.CountryBlockStatus = "failed: " + err.Error()
 	}
 }
@@ -1521,6 +1522,31 @@ func waitOriginSSLRetry(ctx context.Context, attempt int) error {
 	}
 }
 
+func (h *CommandHandler) startOriginSSLBatchTask(req OriginSSLInputRequest, domains []string, parseErrors []string) {
+	domains = normalizeOriginSSLSelectedDomains(domains)
+	req.AWSAliases = append([]string(nil), req.AWSAliases...)
+	req.BlockCountries = append([]string(nil), req.BlockCountries...)
+	parseErrors = append([]string(nil), parseErrors...)
+	log.Printf("[/ssl] batch submitted domains=%d aws_targets=%d concurrency=%d poll=%s", len(domains), len(req.AWSAliases), originSSLTaskConcurrency, originSSLStatusPollInterval)
+
+	h.sendText(fmt.Sprintf("SSL 后台任务已提交\n域名: %d\nAWS 目标: %s\n并发: %d\n轮询: %s\n\n完成后会发送证书结果和 ARN 对照。",
+		len(domains), formatOriginSSLSubmittedAWSTargets(req.AWSAliases), originSSLTaskConcurrency, originSSLStatusPollInterval))
+
+	go func() {
+		result := h.processOriginSSLBatch(req, domains)
+		result.ParseErrors = append(result.ParseErrors, parseErrors...)
+		log.Printf("[/ssl] batch completed domains=%d success=%d failed=%d parse_errors=%d", len(domains), len(result.Success), len(result.Failed), len(result.ParseErrors))
+		h.sendOriginSSLResult(result)
+	}()
+}
+
+func formatOriginSSLSubmittedAWSTargets(aliases []string) string {
+	if len(aliases) == 0 {
+		return "未选择"
+	}
+	return strings.Join(formatAWSTargets(aliases), ", ")
+}
+
 func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domains []string) originSSLBatchResult {
 	result := originSSLBatchResult{
 		AWSAliases:    append([]string(nil), req.AWSAliases...),
@@ -1533,75 +1559,113 @@ func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domain
 	}
 
 	ctx := context.Background()
-	cfPacer := newBatchAPIPacer()
-	awsPacer := newBatchAPIPacer()
+	cfPacer := newBatchAPIPacerWithInterval(2 * time.Second)
+	awsPacer := newBatchAPIPacerWithInterval(2 * time.Second)
+	sem := make(chan struct{}, originSSLTaskConcurrency)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
 	for _, domain := range domains {
-		acc, zone, err := h.findAccountByDomainInAccounts(ctx, domain, accounts)
-		if err != nil {
-			result.Failed = append(result.Failed, fmt.Sprintf("%s: %v", domain, err))
-			continue
-		}
+		domain := domain
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		hostnames := []string{domain, "*." + domain}
-		if err := cfPacer.Wait(ctx); err != nil {
-			result.Failed = append(result.Failed, fmt.Sprintf("%s: 创建源站证书前等待失败: %v", domain, err))
-			continue
-		}
-		cert, err := h.CFClient.CreateOriginCertificate(ctx, acc, hostnames)
-		if err != nil {
-			result.Failed = append(result.Failed, fmt.Sprintf("%s: 创建源站证书失败: %v", domain, err))
-			continue
-		}
-
-		domainResult := originSSLDomainResult{
-			Domain:       domain,
-			AccountLabel: acc.Label,
-		}
-
-		if err := cfPacer.Wait(ctx); err != nil {
-			domainResult.StrictErr = fmt.Errorf("设置 Full(Strict) 前等待失败: %w", err)
-		} else if serr := h.CFClient.SetZoneSSLFullStrict(ctx, acc, zone.ID); serr != nil {
-			domainResult.StrictErr = serr
-		}
-
-		if err := cfPacer.Wait(ctx); err != nil {
-			domainResult.CountryBlockStatus = "failed: " + err.Error()
-		} else {
-			applyOriginSSLPostInitBatch(ctx, h.CFClient, acc, domain, zone.ID, req.BlockCountries, &domainResult)
-		}
-
-		for _, awsAlias := range req.AWSAliases {
-			target, ok := config.Cfg.AWSTargets[awsAlias]
-			if !ok {
-				domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
-					Alias: awsAlias,
-					Err:   fmt.Errorf("未知 AWS 目标别名"),
-				})
-				continue
+			log.Printf("[/ssl] domain task started domain=%s", domain)
+			domainResult, err := h.processOriginSSLDirectDomain(ctx, req, domain, accounts, cfPacer, awsPacer)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				log.Printf("[/ssl] domain task failed domain=%s err=%v", domain, err)
+				result.Failed = append(result.Failed, fmt.Sprintf("%s: %v", domain, err))
+				return
 			}
+			log.Printf("[/ssl] domain task completed domain=%s account=%s imports=%d waf=%s cache=%s", domainResult.Domain, domainResult.AccountLabel, len(domainResult.Imports), domainResult.CountryBlockStatus, domainResult.CacheRuleStatus)
+			result.Success = append(result.Success, domainResult)
+		}()
+	}
 
-			if err := awsPacer.Wait(ctx); err != nil {
-				domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
-					Alias:  awsAlias,
-					Region: target.Region,
-					Err:    fmt.Errorf("导入 ACM 前等待失败: %w", err),
-				})
-				continue
-			}
+	wg.Wait()
+	sort.Slice(result.Success, func(i, j int) bool {
+		return result.Success[i].Domain < result.Success[j].Domain
+	})
+	sort.Strings(result.Failed)
+	return result
+}
 
-			arn, importErr := importToACM(ctx, target, cert.CertificatePEM, cert.PrivateKeyPEM)
+func (h *CommandHandler) processOriginSSLDirectDomain(ctx context.Context, req OriginSSLInputRequest, domain string, accounts []config.CF, cfPacer *batchAPIPacer, awsPacer *batchAPIPacer) (originSSLDomainResult, error) {
+	acc, zone, err := h.findAccountByDomainInAccounts(ctx, domain, accounts)
+	if err != nil {
+		return originSSLDomainResult{}, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(zone.Status), "active") || zone.Paused {
+		zone, err = waitOriginSSLZoneActive(ctx, h.CFClient, acc, OriginSSLDomainItem{
+			Name:   domain,
+			ZoneID: zone.ID,
+			Status: zone.Status,
+			Paused: zone.Paused,
+		})
+		if err != nil {
+			return originSSLDomainResult{}, err
+		}
+	}
+
+	if err := cfPacer.Wait(ctx); err != nil {
+		return originSSLDomainResult{}, fmt.Errorf("创建源站证书前等待失败: %w", err)
+	}
+	cert, err := createOriginSSLCertWithRetry(ctx, h.CFClient, acc, domain)
+	if err != nil {
+		return originSSLDomainResult{}, err
+	}
+
+	domainResult := originSSLDomainResult{
+		Domain:       domain,
+		AccountLabel: acc.Label,
+	}
+
+	if err := cfPacer.Wait(ctx); err != nil {
+		domainResult.StrictErr = fmt.Errorf("设置 Full(Strict) 前等待失败: %w", err)
+	} else if serr := setOriginSSLStrictWithRetry(ctx, h.CFClient, acc, zone.ID); serr != nil {
+		domainResult.StrictErr = serr
+	}
+
+	for _, awsAlias := range req.AWSAliases {
+		target, ok := config.Cfg.AWSTargets[awsAlias]
+		if !ok {
+			domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
+				Alias: awsAlias,
+				Err:   fmt.Errorf("未知 AWS 目标别名"),
+			})
+			continue
+		}
+
+		if err := awsPacer.Wait(ctx); err != nil {
 			domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
 				Alias:  awsAlias,
 				Region: target.Region,
-				ARN:    arn,
-				Err:    importErr,
+				Err:    fmt.Errorf("导入 ACM 前等待失败: %w", err),
 			})
+			continue
 		}
 
-		result.Success = append(result.Success, domainResult)
+		arn, importErr := importToACM(ctx, target, cert.CertificatePEM, cert.PrivateKeyPEM)
+		domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
+			Alias:  awsAlias,
+			Region: target.Region,
+			ARN:    arn,
+			Err:    importErr,
+		})
 	}
 
-	return result
+	if err := cfPacer.Wait(ctx); err != nil {
+		domainResult.CountryBlockStatus = "failed: " + err.Error()
+	} else {
+		applyOriginSSLPostInitBatch(ctx, h.CFClient, acc, domain, zone.ID, req.BlockCountries, &domainResult)
+	}
+
+	return domainResult, nil
 }
 
 func (h *CommandHandler) findAccountByDomainInAccounts(ctx context.Context, domain string, accounts []config.CF) (config.CF, cfclient.ZoneDetail, error) {
