@@ -375,6 +375,8 @@ func (h *CommandHandler) appendGetNSManualOrSynced(ctx context.Context, domain s
 		manual := fmt.Sprintf("- %s\n  %s", domain, strings.Join(nameServers, "\n  "))
 		if errors.Is(err, registrarclient.ErrDomainNotFound) {
 			manual += "\n  注册商未找到该域名，无法自动同步，请手动设置 NS。"
+		} else if errors.Is(err, registrarclient.ErrRegistrarRateLimited) {
+			manual += fmt.Sprintf("\n  注册商 API 限流，Cloudflare Zone 已处理，但 NS 自动同步未完成。请按以上 NS 手动设置，或稍后重试自动同步。详情: %v", err)
 		} else {
 			manual += fmt.Sprintf("\n  注册商平台/API 异常，自动同步失败: %v", err)
 		}

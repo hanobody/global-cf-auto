@@ -34,6 +34,7 @@ func NewClient() Client {
 var (
 	ErrDomainNotFound       = errors.New("domain not found")
 	ErrUnsupportedRegistrar = errors.New("unsupported registrar")
+	ErrRegistrarRateLimited = errors.New("registrar rate limited")
 )
 
 func (c *apiClient) GetNameServers(ctx context.Context, registrar config.Registrar, domain string) ([]string, error) {
@@ -215,6 +216,8 @@ func (c *apiClient) namecheapSetNameServers(ctx context.Context, cfg config.Name
 		if equalStringSliceIgnoreOrder(current, nameServers) {
 			return nil // 已经一致，直接返回
 		}
+	} else {
+		return err
 	}
 	if len(nameServers) == 0 {
 		return fmt.Errorf("NS 不能为空")
@@ -288,6 +291,9 @@ func (c *apiClient) namecheapRequest(ctx context.Context, params url.Values) ([]
 		return nil, fmt.Errorf("namecheap 读取响应失败: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, fmt.Errorf("%w: namecheap HTTP 429: %s", ErrRegistrarRateLimited, strings.TrimSpace(string(data)))
+		}
 		return nil, fmt.Errorf("namecheap 响应异常: %s", strings.TrimSpace(string(data)))
 	}
 	return data, nil
@@ -313,7 +319,10 @@ func parseNamecheapResponse(data []byte) (namecheapResponse, error) {
 				continue
 			}
 			messages = append(messages, msg)
-			if strings.Contains(strings.ToLower(msg), "domain not found") {
+			if isRegistrarRateLimitMessage(msg) {
+				return resp, fmt.Errorf("%w: namecheap 错误: %s", ErrRegistrarRateLimited, msg)
+			}
+			if isRegistrarDomainNotFoundMessage(msg) {
 				return resp, ErrDomainNotFound
 			}
 		}
@@ -354,6 +363,9 @@ func (c *apiClient) goDaddyGetNameServers(ctx context.Context, cfg config.GoDadd
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, ErrDomainNotFound
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, fmt.Errorf("%w: godaddy HTTP 429: %s", ErrRegistrarRateLimited, strings.TrimSpace(string(data)))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("godaddy 响应异常: %s", strings.TrimSpace(string(data)))
@@ -406,6 +418,9 @@ func (c *apiClient) goDaddySetNameServers(ctx context.Context, cfg config.GoDadd
 	if resp.StatusCode == http.StatusNotFound {
 		return ErrDomainNotFound
 	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("%w: godaddy HTTP 429: %s", ErrRegistrarRateLimited, strings.TrimSpace(string(data)))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("godaddy 设置失败: %s", strings.TrimSpace(string(data)))
 	}
@@ -430,6 +445,9 @@ func (c *apiClient) goDaddyListDomains(ctx context.Context, cfg config.GoDaddyCo
 		return nil, fmt.Errorf("godaddy 读取响应失败: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, fmt.Errorf("%w: godaddy HTTP 429: %s", ErrRegistrarRateLimited, strings.TrimSpace(string(data)))
+		}
 		return nil, fmt.Errorf("godaddy 响应异常: %s", strings.TrimSpace(string(data)))
 	}
 	var items []goDaddyDomainListItem
@@ -447,6 +465,22 @@ func (c *apiClient) goDaddyListDomains(ctx context.Context, cfg config.GoDaddyCo
 		return nil, fmt.Errorf("godaddy 未返回域名列表")
 	}
 	return domains, nil
+}
+
+func isRegistrarRateLimitMessage(msg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(msg))
+	return strings.Contains(lower, "too many requests") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "rate limited") ||
+		strings.Contains(lower, "temporarily blocked")
+}
+
+func isRegistrarDomainNotFoundMessage(msg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(msg))
+	return strings.Contains(lower, "domain not found") ||
+		strings.Contains(lower, "object not found") ||
+		strings.Contains(lower, "not found") ||
+		strings.Contains(lower, "not associated with your account")
 }
 
 func applyGoDaddyAuth(req *http.Request, cfg config.GoDaddyConfig) {
