@@ -1376,13 +1376,8 @@ func ensureOriginSSLCountryBlock(ctx context.Context, client cfclient.Client, ac
 func applyOriginSSLPostInit(ctx context.Context, client cfclient.Client, account config.CF, domain string, zoneID string, blockCountries []string, result *OriginSSLInteractiveDomainResult) {
 	initializer, ok := client.(cloudflarePostInitializer)
 	if !ok {
-		status, countries, err := ensureOriginSSLCountryBlock(ctx, client, account, zoneID, blockCountries)
-		result.CountryBlockStatus = status
-		result.CountryBlockCountries = countries
-		if err != nil {
-			result.CountryBlockStatus = "failed: " + err.Error()
-			result.PostInitErrors = append(result.PostInitErrors, err.Error())
-		}
+		result.CountryBlockStatus = "skipped"
+		result.CountryBlockCountries = nil
 		for _, setting := range client.ApplyRecommendedSpeedSettings(ctx, account, zoneID) {
 			if setting.Err != nil {
 				result.SpeedFailed = append(result.SpeedFailed, fmt.Sprintf("%s: %v", setting.Name, setting.Err))
@@ -1395,8 +1390,8 @@ func applyOriginSSLPostInit(ctx context.Context, client cfclient.Client, account
 
 	postResult, err := initializer.RunPostSSLInit(ctx, account, domain, zoneID, cfclient.PostInitOptions{
 		AccountID:           account.AccountID,
-		BlockCountries:      blockCountries,
-		EnableSecurityRules: len(blockCountries) > 0,
+		BlockCountries:      nil,
+		EnableSecurityRules: false,
 		EnableSpeedSettings: config.EnableSpeedRecommendations(),
 		EnableCacheRule:     config.EnableCacheRule(),
 		CloneCacheRule:      true,
@@ -1420,8 +1415,8 @@ func applyOriginSSLPostInit(ctx context.Context, client cfclient.Client, account
 	}
 	if err != nil {
 		result.PostInitErrors = append(result.PostInitErrors, err.Error())
-		if result.CountryBlockStatus == "" || result.CountryBlockStatus == "skipped" {
-			result.CountryBlockStatus = "failed: " + err.Error()
+		if result.CountryBlockStatus == "" {
+			result.CountryBlockStatus = "skipped"
 		}
 	}
 }
@@ -1429,19 +1424,15 @@ func applyOriginSSLPostInit(ctx context.Context, client cfclient.Client, account
 func applyOriginSSLPostInitBatch(ctx context.Context, client cfclient.Client, account config.CF, domain string, zoneID string, blockCountries []string, result *originSSLDomainResult) {
 	initializer, ok := client.(cloudflarePostInitializer)
 	if !ok {
-		status, countries, err := ensureOriginSSLCountryBlock(ctx, client, account, zoneID, blockCountries)
-		result.CountryBlockStatus = status
-		result.CountryBlockCountries = countries
-		if err != nil {
-			result.CountryBlockStatus = "failed: " + err.Error()
-		}
+		result.CountryBlockStatus = "skipped"
+		result.CountryBlockCountries = nil
 		_ = client.ApplyRecommendedSpeedSettings(ctx, account, zoneID)
 		return
 	}
 	postResult, err := initializer.RunPostSSLInit(ctx, account, domain, zoneID, cfclient.PostInitOptions{
 		AccountID:           account.AccountID,
-		BlockCountries:      blockCountries,
-		EnableSecurityRules: len(blockCountries) > 0,
+		BlockCountries:      nil,
+		EnableSecurityRules: false,
 		EnableSpeedSettings: config.EnableSpeedRecommendations(),
 		EnableCacheRule:     config.EnableCacheRule(),
 		CloneCacheRule:      true,
@@ -1455,8 +1446,8 @@ func applyOriginSSLPostInitBatch(ctx context.Context, client cfclient.Client, ac
 		result.CacheRuleStatus = postResult.CacheRuleStatus
 		result.RUMStatus = postResult.RUMStatus
 	}
-	if err != nil && (result.CountryBlockStatus == "" || result.CountryBlockStatus == "skipped") {
-		result.CountryBlockStatus = "failed: " + err.Error()
+	if err != nil && result.CountryBlockStatus == "" {
+		result.CountryBlockStatus = "skipped"
 	}
 }
 

@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"unicode"
 	"time"
 
@@ -13,7 +15,10 @@ import (
 	"DomainC/registrarclient"
 )
 
-const getNSCreateZoneInterval = 3 * time.Second
+const (
+	getNSCreateZoneInterval  = 3 * time.Second
+	getNSFeatureInitInterval = 2 * time.Second
+)
 
 type getNSDomainResult struct {
 	Domain       string
@@ -36,6 +41,13 @@ type getNSBatchResult struct {
 type getNSRegistrarSyncTask struct {
 	Domain      string
 	NameServers []string
+}
+
+type getNSFeatureInitTask struct {
+	Account config.CF
+	Domain  string
+	ZoneID  string
+	Options getNSPostInitOptions
 }
 
 type getNSRegistrarSyncResult struct {
@@ -284,6 +296,7 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 	ctx := context.Background()
 	cfPacer := newBatchAPIPacerWithInterval(getNSCreateZoneInterval)
 	var registrarTasks []getNSRegistrarSyncTask
+	var featureTasks []getNSFeatureInitTask
 
 	for _, domain := range domains {
 		if acc, zone, err := h.findZone(domain); err == nil {
@@ -291,6 +304,7 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 				Domain:       zone.Name,
 				AccountLabel: acc.Label,
 			}
+			h.queueGetNSFeatureInit(*acc, zone.Name, zone.ID, postInitOpts, &result, &featureTasks)
 			h.queueGetNSRegistrarSync(domain, zone.NameServers, &result, &registrarTasks)
 			result.Existing = append(result.Existing, item)
 			continue
@@ -310,20 +324,9 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 			continue
 		}
 		if provisionResult != nil {
-			if postInitOpts.Any() {
-				var blockCountries []string
-				if postInitOpts.EnableSecurity {
-					blockCountries = append([]string(nil), postInitOpts.BlockCountries...)
-				}
-				result.PostInitQueued = append(result.PostInitQueued, provisionResult.Domain)
-				h.startCloudflarePostInitTask(selected, provisionResult.Domain, provisionResult.ZoneID, cfProvisionCommandOptions{
-					Domain:         provisionResult.Domain,
-					BlockCountries: blockCountries,
-					EnableSpeed:    postInitOpts.EnableSpeed,
-					EnableCache:    postInitOpts.EnableCache,
-					EnableRUM:      postInitOpts.EnableRUM,
-				})
-			}
+			h.queueGetNSFeatureInit(selected, provisionResult.Domain, provisionResult.ZoneID, postInitOpts, &result, &featureTasks)
+		} else {
+			h.queueGetNSFeatureInit(selected, zone.Name, zone.ID, postInitOpts, &result, &featureTasks)
 		}
 
 		item := getNSDomainResult{
@@ -335,6 +338,9 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 	}
 	if len(registrarTasks) > 0 {
 		h.startGetNSRegistrarSyncTask(registrarTasks)
+	}
+	if len(featureTasks) > 0 {
+		h.startGetNSFeatureInitBatch(featureTasks)
 	}
 
 	return result
@@ -378,6 +384,169 @@ func (h *CommandHandler) queueGetNSRegistrarSync(domain string, nameServers []st
 		NameServers: append([]string(nil), nameServers...),
 	})
 	result.RegistrarSyncQueued = append(result.RegistrarSyncQueued, domain)
+}
+
+func (h *CommandHandler) queueGetNSFeatureInit(account config.CF, domain string, zoneID string, opts getNSPostInitOptions, result *getNSBatchResult, tasks *[]getNSFeatureInitTask) {
+	if !opts.Any() {
+		return
+	}
+	domain = strings.TrimSpace(domain)
+	zoneID = strings.TrimSpace(zoneID)
+	if domain == "" || zoneID == "" {
+		result.Failed = append(result.Failed, fmt.Sprintf("%s: Cloudflare 初始化缺少 Zone ID", domain))
+		return
+	}
+
+	result.PostInitQueued = append(result.PostInitQueued, domain)
+	if opts.EnableSecurity || opts.EnableSpeed || opts.EnableCache {
+		*tasks = append(*tasks, getNSFeatureInitTask{
+			Account: account,
+			Domain:  domain,
+			ZoneID:  zoneID,
+			Options: opts,
+		})
+	}
+	if opts.EnableRUM {
+		h.startCloudflarePostInitTask(account, domain, zoneID, cfProvisionCommandOptions{
+			Domain:    domain,
+			EnableRUM: true,
+		})
+	}
+}
+
+func (h *CommandHandler) startGetNSFeatureInitBatch(tasks []getNSFeatureInitTask) {
+	manager, ok := h.CFClient.(cloudflareFeatureManager)
+	if !ok {
+		h.sendText("当前 Cloudflare 客户端不支持 /getns 规则初始化。")
+		return
+	}
+	grouped := make(map[string][]getNSFeatureInitTask)
+	labels := make([]string, 0)
+	for _, task := range tasks {
+		label := strings.TrimSpace(task.Account.Label)
+		if label == "" {
+			label = task.Account.AccountID
+		}
+		if _, ok := grouped[label]; !ok {
+			labels = append(labels, label)
+		}
+		grouped[label] = append(grouped[label], task)
+	}
+	sort.Strings(labels)
+
+	go func() {
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var managed []cfclient.FeatureManageResult
+		var failed []string
+
+		for _, label := range labels {
+			accountTasks := append([]getNSFeatureInitTask(nil), grouped[label]...)
+			wg.Add(1)
+			go func(accountTasks []getNSFeatureInitTask) {
+				defer wg.Done()
+				pacer := newBatchAPIPacerWithInterval(getNSFeatureInitInterval)
+				ctx := context.Background()
+				for _, task := range accountTasks {
+					if err := pacer.Wait(ctx); err != nil {
+						mu.Lock()
+						failed = append(failed, fmt.Sprintf("%s: 等待 Cloudflare 初始化失败: %v", task.Domain, err))
+						mu.Unlock()
+						continue
+					}
+					item := manager.ManageZoneFeatures(ctx, task.Account, task.Domain, task.ZoneID, getNSFeatureManageOptions(task.Account, task.Options))
+					mu.Lock()
+					managed = append(managed, item)
+					mu.Unlock()
+				}
+			}(accountTasks)
+		}
+		wg.Wait()
+		sort.Slice(managed, func(i, j int) bool {
+			return managed[i].Domain < managed[j].Domain
+		})
+		sort.Strings(failed)
+		h.sendText(formatGetNSFeatureInitBatchResult(managed, failed))
+	}()
+}
+
+func getNSFeatureManageOptions(account config.CF, opts getNSPostInitOptions) cfclient.FeatureManageOptions {
+	featureOpts := cfclient.FeatureManageOptions{
+		AccountID: account.AccountID,
+		Action:    "enable",
+		Security:  opts.EnableSecurity,
+		Speed:     opts.EnableSpeed,
+		Cache:     opts.EnableCache,
+	}
+	if opts.EnableSecurity {
+		featureOpts.BlockCountries = append([]string(nil), opts.BlockCountries...)
+	}
+	return featureOpts
+}
+
+func formatGetNSFeatureInitBatchResult(results []cfclient.FeatureManageResult, failed []string) string {
+	var sb strings.Builder
+	hasErrors := len(failed) > 0
+	for _, result := range results {
+		if len(result.Errors) > 0 {
+			hasErrors = true
+			break
+		}
+	}
+	if hasErrors {
+		sb.WriteString("⚠️ /getns Cloudflare 初始化完成但有异常\n\n")
+	} else {
+		sb.WriteString("✅ /getns Cloudflare 初始化完成\n\n")
+	}
+
+	sb.WriteString(fmt.Sprintf("已处理: %d", len(results)))
+	for i, result := range results {
+		if i >= 40 {
+			sb.WriteString(fmt.Sprintf("\n- ... 其余 %d 个域名略", len(results)-i))
+			break
+		}
+		sb.WriteString(fmt.Sprintf("\n- %s | 安全:%s | 速度:%s | 缓存:%s",
+			normalizeDisplayValue(result.Domain),
+			normalizeDisplayValue(result.SecurityRuleStatus),
+			compactSpeedStatus(result.SpeedStatus),
+			normalizeDisplayValue(result.CacheRuleStatus)))
+	}
+
+	var warnings []string
+	var errorsList []string
+	for _, result := range results {
+		for _, item := range result.Warnings {
+			warnings = append(warnings, fmt.Sprintf("%s: %s", result.Domain, item))
+		}
+		for _, item := range result.Errors {
+			errorsList = append(errorsList, fmt.Sprintf("%s: %s", result.Domain, item))
+		}
+	}
+	errorsList = append(errorsList, failed...)
+	sort.Strings(warnings)
+	sort.Strings(errorsList)
+
+	if len(warnings) > 0 {
+		sb.WriteString("\n\n提示:")
+		for i, item := range warnings {
+			if i >= 20 {
+				sb.WriteString(fmt.Sprintf("\n- ... 其余 %d 条提示略", len(warnings)-i))
+				break
+			}
+			sb.WriteString("\n- " + item)
+		}
+	}
+	if len(errorsList) > 0 {
+		sb.WriteString("\n\n错误：")
+		for i, item := range errorsList {
+			if i >= 20 {
+				sb.WriteString(fmt.Sprintf("\n- ... 其余 %d 条错误略", len(errorsList)-i))
+				break
+			}
+			sb.WriteString("\n- " + item)
+		}
+	}
+	return sb.String()
 }
 
 func (h *CommandHandler) startGetNSRegistrarSyncTask(tasks []getNSRegistrarSyncTask) {
