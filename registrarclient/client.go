@@ -37,6 +37,8 @@ var (
 	ErrRegistrarRateLimited = errors.New("registrar rate limited")
 )
 
+const namecheapSetAfterReadDelay = 2 * time.Second
+
 func (c *apiClient) GetNameServers(ctx context.Context, registrar config.Registrar, domain string) ([]string, error) {
 	switch strings.ToLower(strings.TrimSpace(registrar.Type)) {
 	case "namecheap":
@@ -221,6 +223,9 @@ func (c *apiClient) namecheapSetNameServers(ctx context.Context, cfg config.Name
 	}
 	if len(nameServers) == 0 {
 		return fmt.Errorf("NS 不能为空")
+	}
+	if err := waitRegistrarDelay(ctx, namecheapSetAfterReadDelay); err != nil {
+		return err
 	}
 	sld, tld, err := splitDomain(domain)
 	if err != nil {
@@ -481,6 +486,20 @@ func isRegistrarDomainNotFoundMessage(msg string) bool {
 		strings.Contains(lower, "object not found") ||
 		strings.Contains(lower, "not found") ||
 		strings.Contains(lower, "not associated with your account")
+}
+
+func waitRegistrarDelay(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func applyGoDaddyAuth(req *http.Request, cfg config.GoDaddyConfig) {

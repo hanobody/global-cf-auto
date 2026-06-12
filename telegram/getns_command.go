@@ -28,8 +28,20 @@ type getNSBatchResult struct {
 	Failed          []string
 	ManualNS        []string
 	RegistrarSynced int
+	RegistrarSyncQueued []string
 	Provisioned     []cfclient.ProvisionResult
 	PostInitQueued  []string
+}
+
+type getNSRegistrarSyncTask struct {
+	Domain      string
+	NameServers []string
+}
+
+type getNSRegistrarSyncResult struct {
+	Synced   []string
+	ManualNS []string
+	Failed   []string
 }
 
 type getNSPostInitOptions struct {
@@ -57,6 +69,9 @@ func (r getNSBatchResult) Summary() string {
 	sb.WriteString(fmt.Sprintf("✅ /getns 处理完成\n目标账号: %s\n新增: %d\n已存在: %d", r.TargetAccount, len(r.Created), len(r.Existing)))
 	if r.RegistrarSynced > 0 {
 		sb.WriteString(fmt.Sprintf("\n注册商已自动同步: %d", r.RegistrarSynced))
+	}
+	if len(r.RegistrarSyncQueued) > 0 {
+		sb.WriteString(fmt.Sprintf("\n注册商后台同步已提交: %d", len(r.RegistrarSyncQueued)))
 	}
 
 	if len(r.Existing) > 0 {
@@ -109,6 +124,30 @@ func (r getNSBatchResult) Summary() string {
 		sb.WriteString("\n\n可继续直接发送失败域名重试。")
 	}
 
+	return sb.String()
+}
+
+func (r getNSRegistrarSyncResult) Summary() string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("注册商 NS 后台同步完成\n已同步: %d\n需手动: %d\n失败: %d", len(r.Synced), len(r.ManualNS), len(r.Failed)))
+	if len(r.Synced) > 0 {
+		sb.WriteString("\n\n已同步:")
+		for _, item := range r.Synced {
+			sb.WriteString("\n- " + item)
+		}
+	}
+	if len(r.ManualNS) > 0 {
+		sb.WriteString("\n\n需手动设置 NS:")
+		for _, item := range r.ManualNS {
+			sb.WriteString("\n" + item)
+		}
+	}
+	if len(r.Failed) > 0 {
+		sb.WriteString("\n\n失败:")
+		for _, item := range r.Failed {
+			sb.WriteString("\n- " + item)
+		}
+	}
 	return sb.String()
 }
 
@@ -244,7 +283,7 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 	}
 	ctx := context.Background()
 	cfPacer := newBatchAPIPacerWithInterval(getNSCreateZoneInterval)
-	registrarPacer := newBatchAPIPacer()
+	var registrarTasks []getNSRegistrarSyncTask
 
 	for _, domain := range domains {
 		if acc, zone, err := h.findZone(domain); err == nil {
@@ -252,7 +291,7 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 				Domain:       zone.Name,
 				AccountLabel: acc.Label,
 			}
-			_ = h.appendGetNSManualOrSynced(ctx, domain, zone.NameServers, &result, registrarPacer)
+			h.queueGetNSRegistrarSync(domain, zone.NameServers, &result, &registrarTasks)
 			result.Existing = append(result.Existing, item)
 			continue
 		} else if !errors.Is(err, cfclient.ErrZoneNotFound) {
@@ -291,8 +330,11 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 			Domain:       zone.Name,
 			AccountLabel: selected.Label,
 		}
-		_ = h.appendGetNSManualOrSynced(ctx, domain, zone.NameServers, &result, registrarPacer)
+		h.queueGetNSRegistrarSync(domain, zone.NameServers, &result, &registrarTasks)
 		result.Created = append(result.Created, item)
+	}
+	if len(registrarTasks) > 0 {
+		h.startGetNSRegistrarSyncTask(registrarTasks)
 	}
 
 	return result
@@ -320,6 +362,74 @@ func (h *CommandHandler) createOrProvisionGetNSZone(ctx context.Context, selecte
 
 	zone, err := h.CFClient.CreateZone(ctx, selected, domain)
 	return zone, nil, err
+}
+
+func (h *CommandHandler) queueGetNSRegistrarSync(domain string, nameServers []string, result *getNSBatchResult, tasks *[]getNSRegistrarSyncTask) {
+	if len(nameServers) == 0 {
+		result.ManualNS = append(result.ManualNS, fmt.Sprintf("- %s\n  未获取到 NS", domain))
+		return
+	}
+	if h.RegistrarManager == nil {
+		result.ManualNS = append(result.ManualNS, fmt.Sprintf("- %s\n  %s", domain, strings.Join(nameServers, "\n  ")))
+		return
+	}
+	*tasks = append(*tasks, getNSRegistrarSyncTask{
+		Domain:      domain,
+		NameServers: append([]string(nil), nameServers...),
+	})
+	result.RegistrarSyncQueued = append(result.RegistrarSyncQueued, domain)
+}
+
+func (h *CommandHandler) startGetNSRegistrarSyncTask(tasks []getNSRegistrarSyncTask) {
+	if len(tasks) == 0 || h.RegistrarManager == nil {
+		return
+	}
+	copied := make([]getNSRegistrarSyncTask, 0, len(tasks))
+	for _, task := range tasks {
+		if strings.TrimSpace(task.Domain) == "" {
+			continue
+		}
+		copied = append(copied, getNSRegistrarSyncTask{
+			Domain:      strings.TrimSpace(task.Domain),
+			NameServers: append([]string(nil), task.NameServers...),
+		})
+	}
+	if len(copied) == 0 {
+		return
+	}
+	go func() {
+		result := h.runGetNSRegistrarSyncBatch(context.Background(), copied)
+		h.sendText(result.Summary())
+	}()
+}
+
+func (h *CommandHandler) runGetNSRegistrarSyncBatch(ctx context.Context, tasks []getNSRegistrarSyncTask) getNSRegistrarSyncResult {
+	var result getNSRegistrarSyncResult
+	pacer := newBatchAPIPacerWithInterval(500 * time.Millisecond)
+	for _, task := range tasks {
+		if err := pacer.Wait(ctx); err != nil {
+			result.Failed = append(result.Failed, fmt.Sprintf("%s: 等待同步失败: %v", task.Domain, err))
+			continue
+		}
+		registrar, err := h.syncRegistrarNameServers(task.Domain, task.NameServers)
+		if err != nil {
+			result.ManualNS = append(result.ManualNS, formatGetNSRegistrarSyncManual(task.Domain, task.NameServers, err))
+			continue
+		}
+		result.Synced = append(result.Synced, fmt.Sprintf("%s -> %s (%s)", task.Domain, registrar.Label, registrar.Type))
+	}
+	return result
+}
+
+func formatGetNSRegistrarSyncManual(domain string, nameServers []string, err error) string {
+	manual := fmt.Sprintf("- %s\n  %s", domain, strings.Join(nameServers, "\n  "))
+	if errors.Is(err, registrarclient.ErrDomainNotFound) {
+		return manual + "\n  注册商未找到该域名，无法自动同步，请手动设置 NS。"
+	}
+	if errors.Is(err, registrarclient.ErrRegistrarRateLimited) {
+		return manual + fmt.Sprintf("\n  注册商 API 限流，NS 自动同步未完成。限流账号是自动扫描经过的注册商账号，不一定是该域名所属账号。请按以上 NS 手动设置，或稍后重试自动同步。详情: %v", err)
+	}
+	return manual + fmt.Sprintf("\n  注册商平台/API 异常，自动同步失败: %v", err)
 }
 
 func compactSpeedStatus(status map[string]string) string {
@@ -350,42 +460,6 @@ func compactSpeedStatus(status map[string]string) string {
 		return fmt.Sprintf("ok %d/%d skipped %d", okCount, len(status), skipped)
 	}
 	return fmt.Sprintf("ok %d/%d skipped %d failed %d", okCount, len(status), skipped, failed)
-}
-
-func (h *CommandHandler) appendGetNSManualOrSynced(ctx context.Context, domain string, nameServers []string, result *getNSBatchResult, pacer *batchAPIPacer) error {
-	if len(nameServers) == 0 {
-		result.ManualNS = append(result.ManualNS, fmt.Sprintf("- %s\n  未获取到 NS", domain))
-		return fmt.Errorf("未获取到 NS")
-	}
-
-	if h.RegistrarManager == nil {
-		result.ManualNS = append(result.ManualNS, fmt.Sprintf("- %s\n  %s", domain, strings.Join(nameServers, "\n  ")))
-		return fmt.Errorf("未配置注册商")
-	}
-
-	if pacer != nil {
-		if err := pacer.Wait(ctx); err != nil {
-			manual := fmt.Sprintf("- %s\n  %s\n  同步失败: %v", domain, strings.Join(nameServers, "\n  "), err)
-			result.ManualNS = append(result.ManualNS, manual)
-			return err
-		}
-	}
-
-	if _, err := h.syncRegistrarNameServers(domain, nameServers); err != nil {
-		manual := fmt.Sprintf("- %s\n  %s", domain, strings.Join(nameServers, "\n  "))
-		if errors.Is(err, registrarclient.ErrDomainNotFound) {
-			manual += "\n  注册商未找到该域名，无法自动同步，请手动设置 NS。"
-		} else if errors.Is(err, registrarclient.ErrRegistrarRateLimited) {
-			manual += fmt.Sprintf("\n  注册商 API 限流，Cloudflare Zone 已处理，但 NS 自动同步未完成。请按以上 NS 手动设置，或稍后重试自动同步。详情: %v", err)
-		} else {
-			manual += fmt.Sprintf("\n  注册商平台/API 异常，自动同步失败: %v", err)
-		}
-		result.ManualNS = append(result.ManualNS, manual)
-		return err
-	}
-
-	result.RegistrarSynced++
-	return nil
 }
 
 func parseGetNSPostInitArgs(args []string) ([]string, getNSPostInitOptions, error) {
