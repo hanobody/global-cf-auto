@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"html"
 	"log"
@@ -61,7 +62,11 @@ type originSSLARNEntry struct {
 const (
 	originSSLStatusPollInterval       = 30 * time.Second
 	originSSLStatusPollAttempts       = 120
-	originSSLTaskConcurrency          = 6
+	originSSLTaskConcurrency          = 3
+	originSSLCFCallInterval           = 5 * time.Second
+	originSSLAWSCallInterval          = 2 * time.Second
+	originSSLCertRequestTimeout       = 2 * time.Minute
+	originSSLCertRetryAttempts        = 5
 	originSSLPostInitPollInterval     = 30 * time.Second
 	originSSLPostInitZoneActiveTimeout = 30 * time.Minute
 	originSSLPostInitSSLActiveTimeout = 45 * time.Minute
@@ -1176,8 +1181,8 @@ func ProcessOriginSSLDomainItems(ctx context.Context, client cfclient.Client, ac
 		return items[i].Name < items[j].Name
 	})
 
-	cfPacer := newBatchAPIPacerWithInterval(2 * time.Second)
-	awsPacer := newBatchAPIPacerWithInterval(2 * time.Second)
+	cfPacer := newBatchAPIPacerWithInterval(originSSLCFCallInterval)
+	awsPacer := newBatchAPIPacerWithInterval(originSSLAWSCallInterval)
 	sem := make(chan struct{}, originSSLTaskConcurrency)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -1311,15 +1316,18 @@ func waitOriginSSLZoneActive(ctx context.Context, client cfclient.Client, accoun
 func createOriginSSLCertWithRetry(ctx context.Context, client cfclient.Client, account config.CF, domain string) (cfclient.OriginCert, error) {
 	hostnames := []string{domain, "*." + domain}
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		cert, err := client.CreateOriginCertificate(ctx, account, hostnames)
+	for attempt := 0; attempt < originSSLCertRetryAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, originSSLCertRequestTimeout)
+		cert, err := client.CreateOriginCertificate(attemptCtx, account, hostnames)
+		cancel()
 		if err == nil {
 			return cert, nil
 		}
 		lastErr = err
-		if !isRetryableCloudflareError(err) || attempt == 2 {
+		if !isRetryableCloudflareError(err) || attempt == originSSLCertRetryAttempts-1 {
 			break
 		}
+		log.Printf("[/ssl] create Origin CA retry domain=%s account=%s attempt=%d/%d err=%v", domain, account.Label, attempt+1, originSSLCertRetryAttempts, err)
 		if err := waitOriginSSLRetry(ctx, attempt); err != nil {
 			return cfclient.OriginCert{}, err
 		}
@@ -1559,8 +1567,8 @@ func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domain
 	}
 
 	ctx := context.Background()
-	cfPacer := newBatchAPIPacerWithInterval(2 * time.Second)
-	awsPacer := newBatchAPIPacerWithInterval(2 * time.Second)
+	cfPacer := newBatchAPIPacerWithInterval(originSSLCFCallInterval)
+	awsPacer := newBatchAPIPacerWithInterval(originSSLAWSCallInterval)
 	sem := make(chan struct{}, originSSLTaskConcurrency)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -1596,7 +1604,7 @@ func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domain
 }
 
 func (h *CommandHandler) processOriginSSLDirectDomain(ctx context.Context, req OriginSSLInputRequest, domain string, accounts []config.CF, cfPacer *batchAPIPacer, awsPacer *batchAPIPacer) (originSSLDomainResult, error) {
-	acc, zone, err := h.findAccountByDomainInAccounts(ctx, domain, accounts)
+	acc, zone, err := h.findAccountByDomainInAccountsPaced(ctx, domain, accounts, cfPacer)
 	if err != nil {
 		return originSSLDomainResult{}, err
 	}
@@ -1666,6 +1674,45 @@ func (h *CommandHandler) processOriginSSLDirectDomain(ctx context.Context, req O
 	}
 
 	return domainResult, nil
+}
+
+func (h *CommandHandler) findAccountByDomainInAccountsPaced(ctx context.Context, domain string, accounts []config.CF, pacer *batchAPIPacer) (config.CF, cfclient.ZoneDetail, error) {
+	if pacer == nil {
+		return h.findAccountByDomainInAccounts(ctx, domain, accounts)
+	}
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名为空")
+	}
+
+	type matchedItem struct {
+		Account config.CF
+		Zone    cfclient.ZoneDetail
+	}
+	var matches []matchedItem
+	for _, acc := range accounts {
+		if err := pacer.Wait(ctx); err != nil {
+			return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("识别 Cloudflare 账号前等待失败: %w", err)
+		}
+		zone, err := h.CFClient.GetZoneDetails(ctx, acc, domain)
+		if err != nil {
+			if errors.Is(err, cfclient.ErrZoneNotFound) || strings.Contains(strings.ToLower(err.Error()), "zone not found") {
+				continue
+			}
+			return config.CF{}, cfclient.ZoneDetail{}, err
+		}
+		if !strings.EqualFold(strings.TrimSpace(zone.Name), domain) {
+			continue
+		}
+		matches = append(matches, matchedItem{Account: acc, Zone: zone})
+	}
+	if len(matches) == 0 {
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名 %s 不在任何可用 Cloudflare 账号中", domain)
+	}
+	if len(matches) > 1 {
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名 %s 在多个 Cloudflare 账号中重复，无法确定唯一来源", domain)
+	}
+	return matches[0].Account, matches[0].Zone, nil
 }
 
 func (h *CommandHandler) findAccountByDomainInAccounts(ctx context.Context, domain string, accounts []config.CF) (config.CF, cfclient.ZoneDetail, error) {

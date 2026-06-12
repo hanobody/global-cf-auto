@@ -82,6 +82,11 @@ func isRetryableCloudflareError(err error) bool {
 		strings.Contains(msg, "rate limit") ||
 		strings.Contains(msg, "too many requests") ||
 		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "client.timeout") ||
+		strings.Contains(msg, "context deadline") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "request canceled") ||
+		strings.Contains(msg, "awaiting headers") ||
 		strings.Contains(msg, "temporary") ||
 		strings.Contains(msg, "temporarily") ||
 		strings.Contains(msg, "connection reset") ||
