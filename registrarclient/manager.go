@@ -339,19 +339,47 @@ func (m *Manager) GetNameServersForDomain(ctx context.Context, domain string) (c
 	if len(m.registrars) == 0 {
 		return config.Registrar{}, nil, fmt.Errorf("未配置注册商")
 	}
-	var lastErr error
+	syncErr := &SyncError{Domain: strings.TrimSpace(domain)}
 	for _, r := range m.registrarsForDomain(domain) {
-		ns, err := m.client.GetNameServers(ctx, r, domain)
-		if err != nil {
-			lastErr = err
+		isCached := m.isCachedRegistrar(domain, r)
+		if m.isRegistrarRateLimited(r) {
+			syncErr.RateLimited = append(syncErr.RateLimited, strings.TrimSpace(r.Label)+"(cooldown)")
+			if isCached {
+				return config.Registrar{}, nil, syncErr
+			}
 			continue
 		}
+		if err := m.waitRegistrarPace(ctx, r); err != nil {
+			syncErr.Failed = append(syncErr.Failed, fmt.Sprintf("[%s] 等待限速失败: %v", r.Label, err))
+			continue
+		}
+		ns, err := m.client.GetNameServers(ctx, r, domain)
+		if err != nil {
+			if errors.Is(err, ErrDomainNotFound) {
+				syncErr.NotFound = append(syncErr.NotFound, strings.TrimSpace(r.Label))
+				if isCached {
+					m.clearDomainRegistrar(domain)
+				}
+				continue
+			}
+			if errors.Is(err, ErrRegistrarRateLimited) {
+				m.markRegistrarRateLimited(r)
+				syncErr.RateLimited = append(syncErr.RateLimited, strings.TrimSpace(r.Label))
+				if isCached {
+					return config.Registrar{}, nil, syncErr
+				}
+				continue
+			}
+			syncErr.Failed = append(syncErr.Failed, fmt.Sprintf("[%s] %v", r.Label, err))
+			continue
+		}
+		m.rememberDomainRegistrar(domain, r)
 		return r, ns, nil
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("没有可用的注册商")
+	if len(syncErr.NotFound) == 0 && len(syncErr.RateLimited) == 0 && len(syncErr.Failed) == 0 {
+		return config.Registrar{}, nil, fmt.Errorf("没有可用的注册商")
 	}
-	return config.Registrar{}, nil, lastErr
+	return config.Registrar{}, nil, syncErr
 }
 
 // ListDomainsForRegistrar 查询指定注册商的域名列表。
