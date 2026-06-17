@@ -98,7 +98,7 @@ func (h *CommandHandler) handleCFRulesCommand(args []string) {
 			return
 		}
 		if CFRulesNeedsBlockCountries(action, feature) && len(blockCountries) == 0 {
-			h.sendText("启用安全规则需要国家/地区代码。示例：/cf_rules all block=AM,HK")
+			h.sendText("启用国家/地区安全规则需要代码。SQL 拦截示例：/cf_rules all sql；国家拦截示例：/cf_rules all security block=AM,HK")
 			return
 		}
 		accounts := append([]config.CF(nil), h.Accounts...)
@@ -106,8 +106,8 @@ func (h *CommandHandler) handleCFRulesCommand(args []string) {
 			result := ProcessCFRulesAllAccounts(context.Background(), h.CFClient, accounts, action, feature, blockCountries)
 			h.sendText(result.Summary())
 		}()
-		h.sendText(fmt.Sprintf("Cloudflare 全账号规则检查任务已提交：账号 %d，动作 %s，功能 %s，拦截 %s。账号之间并发执行，每个账号内部限速 %s/域名。",
-			len(accounts), action, feature, strings.Join(blockCountries, ","), cfRulesPerAccountInterval))
+		h.sendText(fmt.Sprintf("Cloudflare 全账号规则检查任务已提交：账号 %d，动作 %s，功能 %s，国家拦截 %s。账号之间并发执行，每个账号内部限速 %s/域名。",
+			len(accounts), action, feature, formatCFRulesBlockCountries(feature, blockCountries), cfRulesPerAccountInterval))
 		return
 	}
 
@@ -135,7 +135,16 @@ func (h *CommandHandler) handleCFRulesCommand(args []string) {
 	for _, arg := range args[2:] {
 		key, value, ok := strings.Cut(arg, "=")
 		if !ok {
-			continue
+			if parsedFeature := normalizeCFRulesFeature(arg); parsedFeature != "" {
+				feature = parsedFeature
+				continue
+			}
+			if parsedAction := normalizeCFRulesAction(arg); parsedAction != "" {
+				action = parsedAction
+				continue
+			}
+			h.sendText("无法识别参数：" + arg)
+			return
 		}
 		switch strings.ToLower(strings.TrimSpace(key)) {
 		case "action":
@@ -147,7 +156,7 @@ func (h *CommandHandler) handleCFRulesCommand(args []string) {
 		case "feature":
 			feature = normalizeCFRulesFeature(value)
 			if feature == "" {
-				h.sendText("feature 参数必须是 all/security/speed/cache")
+				h.sendText("feature 参数必须是 all/security/sql/speed/cache")
 				return
 			}
 		case "block", "blocks", "country", "countries":
@@ -164,7 +173,7 @@ func (h *CommandHandler) handleCFRulesCommand(args []string) {
 		}
 	}
 	if CFRulesNeedsBlockCountries(action, feature) && len(blockCountries) == 0 {
-		h.sendText("启用安全规则需要国家/地区代码。请使用 block=CN,RU，或配置 CF_DEFAULT_BLOCK_COUNTRIES。")
+		h.sendText("启用国家/地区安全规则需要代码。请使用 block=CN,RU，或配置 CF_DEFAULT_BLOCK_COUNTRIES。SQL 拦截可直接使用 feature=sql。")
 		return
 	}
 
@@ -201,7 +210,7 @@ func (h *CommandHandler) sendCFRulesAccountSelector() {
 			CallbackData: fmt.Sprintf("cfrules_account|%s", token),
 		}})
 	}
-	msg := "请选择要检查规则的 Cloudflare 账号：\n\n批量所有账号安全规则示例：\n/cf_rules all block=AM,HK"
+	msg := "请选择要检查规则的 Cloudflare 账号：\n\n批量所有账号 SQL 拦截示例：\n/cf_rules all sql\n\n批量所有账号国家拦截示例：\n/cf_rules all security block=AM,HK"
 	if err := h.Sender.SendWithButtons(context.Background(), msg, buttons); err != nil {
 		h.sendText(fmt.Sprintf("发送账号选择失败: %v", err))
 	}
@@ -506,6 +515,10 @@ func BuildCFRulesActionView(sessionID string, items []CFRulesDomainItem) IPListP
 				{Text: "关闭缓存", CallbackData: fmt.Sprintf("cfrules_run|%s", token("disable", "cache"))},
 			},
 			{
+				{Text: "开启/更新SQL拦截", CallbackData: fmt.Sprintf("cfrules_run|%s", token("enable", "sql"))},
+				{Text: "关闭SQL拦截", CallbackData: fmt.Sprintf("cfrules_run|%s", token("disable", "sql"))},
+			},
+			{
 				{Text: "返回选择", CallbackData: fmt.Sprintf("cfrules_back|%s", token("", ""))},
 				{Text: "取消", CallbackData: fmt.Sprintf("cfrules_cancel|%s", token("", ""))},
 			},
@@ -581,8 +594,8 @@ func (h *CommandHandler) handlePendingCFRulesInput(msgText string, userID int64)
 		ClearCFRulesSelection(req.SessionID)
 		h.sendText(result.Summary())
 	}()
-	h.sendText(fmt.Sprintf("Cloudflare 规则检查任务已提交：账号 %s，域名 %d，动作 %s，功能 %s，拦截 %s",
-		account.Label, len(items), req.Action, req.Feature, strings.Join(countries, ",")))
+	h.sendText(fmt.Sprintf("Cloudflare 规则检查任务已提交：账号 %s，域名 %d，动作 %s，功能 %s，国家拦截 %s",
+		account.Label, len(items), req.Action, req.Feature, formatCFRulesBlockCountries(req.Feature, countries)))
 	return true
 }
 
@@ -594,6 +607,7 @@ func ProcessCFRulesItems(ctx context.Context, client cfclient.Client, account co
 		return result
 	}
 	security := feature == "all" || feature == "security"
+	sqli := feature == "all" || feature == "sql"
 	speed := feature == "all" || feature == "speed"
 	cache := feature == "all" || feature == "cache"
 	pacer := newBatchAPIPacerWithInterval(cfRulesPerAccountInterval)
@@ -612,6 +626,7 @@ func ProcessCFRulesItems(ctx context.Context, client cfclient.Client, account co
 			BlockCountries: blockCountries,
 			Action:         action,
 			Security:       security,
+			SQLi:           sqli,
 			Speed:          speed,
 			Cache:          cache,
 		})
@@ -681,9 +696,10 @@ func (r CFRulesBatchResult) Summary() string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Cloudflare 规则检查完成\n账号: %s\n动作: %s\n功能: %s\n已处理: %d", r.AccountLabel, r.Action, r.Feature, len(r.Success)))
 	for _, item := range r.Success {
-		sb.WriteString(fmt.Sprintf("\n- %s | 安全:%s | 速度:%s | 缓存:%s",
+		sb.WriteString(fmt.Sprintf("\n- %s | 国家:%s | SQL:%s | 速度:%s | 缓存:%s",
 			item.Domain,
 			normalizeDisplayValue(item.SecurityRuleStatus),
+			normalizeDisplayValue(item.SQLiRuleStatus),
 			compactSpeedStatus(item.SpeedStatus),
 			normalizeDisplayValue(item.CacheRuleStatus),
 		))
@@ -703,8 +719,8 @@ func (r CFRulesAllAccountsResult) Summary() string {
 		processed += len(account.Success)
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Cloudflare 全账号规则检查完成\n动作: %s\n功能: %s\n拦截: %s\n账号: %d\n已处理域名: %d\n失败: %d",
-		r.Action, r.Feature, strings.Join(r.BlockCountries, ","), len(r.Accounts), processed, len(r.Failed)))
+	sb.WriteString(fmt.Sprintf("Cloudflare 全账号规则检查完成\n动作: %s\n功能: %s\n国家拦截: %s\n账号: %d\n已处理域名: %d\n失败: %d",
+		r.Action, r.Feature, formatCFRulesBlockCountries(r.Feature, r.BlockCountries), len(r.Accounts), processed, len(r.Failed)))
 	for _, account := range r.Accounts {
 		sb.WriteString(fmt.Sprintf("\n- %s | 已处理:%d | 失败:%d", account.AccountLabel, len(account.Success), len(account.Failed)))
 	}
@@ -722,6 +738,17 @@ func (r CFRulesAllAccountsResult) Summary() string {
 		}
 	}
 	return sb.String()
+}
+
+func formatCFRulesBlockCountries(feature string, countries []string) string {
+	feature = normalizeCFRulesFeature(feature)
+	if feature != "all" && feature != "security" {
+		return "-"
+	}
+	if len(countries) == 0 {
+		return "-"
+	}
+	return strings.Join(countries, ",")
 }
 
 func parseCFRulesAllAccountsArgs(args []string) (string, string, []string, error) {
@@ -763,7 +790,7 @@ func parseCFRulesAllAccountsArgs(args []string) (string, string, []string, error
 		case "feature":
 			parsed := normalizeCFRulesFeature(value)
 			if parsed == "" {
-				return action, feature, blockCountries, fmt.Errorf("feature 参数必须是 all/security/speed/cache")
+				return action, feature, blockCountries, fmt.Errorf("feature 参数必须是 all/security/sql/speed/cache")
 			}
 			feature = parsed
 		case "block", "blocks", "country", "countries":
@@ -816,8 +843,10 @@ func normalizeCFRulesFeature(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", "all":
 		return "all"
-	case "security", "waf":
+	case "security", "waf", "country", "countries":
 		return "security"
+	case "sql", "sqli", "sqlblock", "sql_block", "sql-block":
+		return "sql"
 	case "speed":
 		return "speed"
 	case "cache":

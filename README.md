@@ -65,7 +65,10 @@ go build ./...
 - `/delete <domain.com>`：触发删除确认，会发送带按钮的确认消息。
 - `/setdns <domain> <type> <name> <content> [proxied] [ttl]`：创建或更新解析记录。
 - `/csv <label|all>`：导出指定账号或全部账号的 DNS 为 CSV 并发送文件。
+- `/cf_rules <label> all feature=sql` 或 `/cf_rules <label> all sql`：给指定 Cloudflare 账号下所有域名开启/更新 SQL 注入拦截 WAF 自定义规则。
+- `/cf_rules all sql`：给配置中的全部 Cloudflare 账号、全部域名开启/更新 SQL 注入拦截规则；`/cf_rules all sql action=disable` 可删除该规则。
 - `/originssl domain.com *`：生成源站15年的ssl证书,host 为domain.com 和  *.domain.com
+
 **开发与测试**
 
 - 运行所有测试：
@@ -83,3 +86,9 @@ go test ./...
 - 为长运行命令添加进度反馈与限流控制。
 - 将查询的到期时间缓存起来，到期前不用再次查询，提高效率
 - 将无法查询到的域名统一报出来
+
+**SQL 注入拦截规则说明**
+
+`/cf_rules ... sql` 会在每个 Zone 的 `http_request_firewall_custom` 入口规则集中创建或升级描述为 `telegram-auto-sqli-block` 的 Block 规则。规则优先安装“query + body”版本，覆盖 URL query、原始请求体、表单字段值、multipart 字段值中的 `sleep()`、`benchmark()`、`pg_sleep()`、`waitfor delay`、`information_schema`、`performance_schema`、`ord()`、`mid()`、`substring()`、`find_in_set()` 等时间盲注/结构枚举特征；如果当前 Zone 套餐不支持正则匹配，会自动回退到 `contains` 兼容表达式；如果当前套餐或权限不支持 Cloudflare 请求体字段，会继续降级为 query-only 版本，并在执行结果中显示 `query_only_regex` 或 `query_only_contains`。
+
+SQL 拦截结果状态后缀说明：`query_body_regex` 表示已覆盖 URL query + request body 且使用正则；`query_body_contains` 表示已覆盖 URL query + request body 但使用兼容 contains；`query_only_regex` / `query_only_contains` 表示 Cloudflare 不接受请求体字段或正则能力不足，只安装了 URL query 版本。

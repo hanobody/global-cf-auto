@@ -19,12 +19,22 @@ const (
 	cacheSettingsPhase     = "http_request_cache_settings"
 	cacheRulesetName       = "telegram-auto-cache-rules"
 	staticCacheRuleDesc    = "缓存默认文件扩展名 [模板]"
-	staticCacheRuleExpr    = `(http.request.uri.path.extension in {"7z" "avi" "avif" "apk" "bin" "bmp" "bz2" "class" "css" "csv" "doc" "docx" "dmg" "ejs" "eot" "eps" "exe" "flac" "gif" "gz" "ico" "iso" "jar" "jpg" "jpeg" "js" "mid" "midi" "mkv" "mp3" "mp4" "ogg" "otf" "pdf" "pict" "pls" "png" "ppt" "pptx" "ps" "rar" "svg" "svgz" "swf" "tar" "tif" "tiff" "ttf" "webm" "webp" "woff" "woff2" "xls" "xlsx" "zip" "zst"})`
+	staticCacheRuleExpr    = `(http.request.uri.path.extension in {"7z" "avi" "avif" "apk" "bin" "bmp" "bz2" "class" "css" "csv" "doc" "docx" "dmg" "ejs" "eot" "eps" "exe" "flac" "gif" "gz" "ico" "iso" "jar" "jpg" "jpeg" "js" "mid" "midi" "mkv" "mp3" "ogg" "otf" "pdf" "pict" "pls" "png" "ppt" "pptx" "ps" "rar" "svg" "svgz" "swf" "tar" "tif" "tiff" "ttf" "webm" "webp" "woff" "woff2" "xls" "xlsx" "zip" "zst"})`
+	sqlBlockRuleDesc       = "telegram-auto-sqli-block"
+	sqlBlockRulesetName    = "telegram-auto-sqli-waf"
+	sqlBlockRulePattern    = `(^|[^a-z0-9_])((sleep|benchmark|pg_sleep)[\s/\*]*\(|waitfor[\s]+delay|dbms_lock\.sleep|dbms_pipe\.receive_message|information_schema|performance_schema|mysql\.user|pg_catalog|sysobjects|syscolumns|ord[\s/\*]*\(|mid[\s/\*]*\(|substring[\s/\*]*\(|find_in_set[\s/\*]*\()`
 	statusMissing          = "missing"
 	statusDeleted          = "deleted"
 	statusNotFound         = "not_found"
 	defaultPostInitTimeout = 6 * time.Hour
 	defaultSSLPollInterval = 2 * time.Minute
+)
+
+var (
+	sqlBlockRuleExpr            = buildSQLiMatchExpression(true)
+	sqlBlockRuleCompatExpr      = buildSQLiContainsExpression(true)
+	sqlBlockRuleQueryExpr       = buildSQLiMatchExpression(false)
+	sqlBlockRuleQueryCompatExpr = buildSQLiContainsExpression(false)
 )
 
 type PostInitOptions struct {
@@ -48,7 +58,7 @@ type PostInitResult struct {
 	SecurityRuleStatus string
 	SpeedStatus        map[string]string
 	CacheRuleStatus    string
-	RUMStatus           string
+	RUMStatus          string
 	Warnings           []string
 	Errors             []string
 }
@@ -58,6 +68,7 @@ type FeatureManageOptions struct {
 	BlockCountries []string
 	Action         string
 	Security       bool
+	SQLi           bool
 	Speed          bool
 	Cache          bool
 }
@@ -66,6 +77,7 @@ type FeatureManageResult struct {
 	Domain             string
 	ZoneID             string
 	SecurityRuleStatus string
+	SQLiRuleStatus     string
 	SpeedStatus        map[string]string
 	CacheRuleStatus    string
 	Warnings           []string
@@ -73,11 +85,11 @@ type FeatureManageResult struct {
 }
 
 type zoneStatusResult struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Status      string   `json:"status"`
-	NameServers []string `json:"name_servers"`
-	Paused      bool     `json:"paused"`
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Status      string    `json:"status"`
+	NameServers []string  `json:"name_servers"`
+	Paused      bool      `json:"paused"`
 	CreatedOn   time.Time `json:"created_on"`
 }
 
@@ -180,6 +192,77 @@ func (c *apiClient) RunPostSSLInit(ctx context.Context, account config.CF, domai
 	}
 
 	return result, nil
+}
+
+func buildSQLiMatchExpression(includeBody bool) string {
+	pattern := `r"` + sqlBlockRulePattern + `"`
+	clauses := make([]string, 0, 4)
+	for _, field := range sqliScalarFields(includeBody) {
+		clauses = append(clauses, field+" matches "+pattern)
+	}
+	for _, field := range sqliArrayFields(includeBody) {
+		clauses = append(clauses, "any("+field+"[*] matches "+pattern+")")
+	}
+	return "(" + strings.Join(clauses, " or ") + ")"
+}
+
+func buildSQLiContainsExpression(includeBody bool) string {
+	needles := []string{
+		"sleep(",
+		"sleep/**/(",
+		"benchmark(",
+		"pg_sleep(",
+		"waitfor delay",
+		"dbms_lock.sleep",
+		"dbms_pipe.receive_message",
+		"information_schema",
+		"performance_schema",
+		"mysql.user",
+		"pg_catalog",
+		"sysobjects",
+		"syscolumns",
+		"ord(",
+		"mid(",
+		"substring(",
+		"find_in_set(",
+	}
+
+	// The contains fallback must stay under Cloudflare's 4,096-character expression limit.
+	// http.request.body.raw already includes JSON, form, and multipart payload bytes, so
+	// the compatibility expression checks scalar query/raw-body sources only.
+	clauses := make([]string, 0, len(needles)*len(sqliScalarFields(includeBody)))
+	for _, field := range sqliScalarFields(includeBody) {
+		for _, needle := range needles {
+			clauses = append(clauses, field+" contains "+quoteRuleLiteral(needle))
+		}
+	}
+	return "(" + strings.Join(clauses, " or ") + ")"
+}
+
+func sqliScalarFields(includeBody bool) []string {
+	fields := []string{`lower(url_decode(http.request.uri.query, "r"))`}
+	if includeBody {
+		fields = append(fields, `lower(url_decode(http.request.body.raw, "r"))`)
+	}
+	return fields
+}
+
+func sqliArrayFields(includeBody bool) []string {
+	if !includeBody {
+		return nil
+	}
+	return []string{
+		`lower(url_decode(http.request.body.form.values[*], "r"))`,
+		`lower(url_decode(http.request.body.multipart.values[*], "r"))`,
+	}
+}
+
+func quoteRuleLiteral(value string) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return `""`
+	}
+	return string(encoded)
 }
 
 func normalizePostInitOptions(opts PostInitOptions) PostInitOptions {
@@ -750,6 +833,76 @@ func classifyCacheRuleError(err error) (string, error) {
 	}
 }
 
+func (c *apiClient) EnsureSQLiBlockRule(ctx context.Context, account config.CF, zoneID string) (string, error) {
+	attempts := []struct {
+		expression string
+		suffix     string
+	}{
+		{expression: sqlBlockRuleExpr, suffix: "query_body_regex"},
+		{expression: sqlBlockRuleCompatExpr, suffix: "query_body_contains"},
+		{expression: sqlBlockRuleQueryExpr, suffix: "query_only_regex"},
+		{expression: sqlBlockRuleQueryCompatExpr, suffix: "query_only_contains"},
+	}
+
+	var firstErr error
+	var lastErr error
+	for _, attempt := range attempts {
+		rule := rulesetRule{
+			Description: sqlBlockRuleDesc,
+			Expression:  attempt.expression,
+			Action:      "block",
+			Enabled:     true,
+		}
+		status, err := c.ensureFirewallCustomRuleByDescription(ctx, account, zoneID, sqlBlockRulesetName, sqlBlockRuleDesc, rule)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			lastErr = err
+			if shouldTrySQLiCompatExpression(err) {
+				continue
+			}
+			return "", err
+		}
+		if verifyErr := c.verifyFirewallCustomRule(ctx, account, zoneID, sqlBlockRuleDesc, attempt.expression); verifyErr != nil {
+			if firstErr == nil {
+				firstErr = verifyErr
+			}
+			lastErr = verifyErr
+			if shouldTrySQLiCompatExpression(verifyErr) {
+				continue
+			}
+			return "", verifyErr
+		}
+		return status + " " + attempt.suffix, nil
+	}
+
+	if firstErr != nil && lastErr != nil && firstErr.Error() != lastErr.Error() {
+		return "", fmt.Errorf("%w; last fallback failed: %v", firstErr, lastErr)
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", errors.New("failed to create SQLi block rule")
+}
+
+func shouldTrySQLiCompatExpression(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "matches") ||
+		strings.Contains(msg, "regex") ||
+		strings.Contains(msg, "regular expression") ||
+		strings.Contains(msg, "not entitled") ||
+		strings.Contains(msg, "not supported") ||
+		strings.Contains(msg, "expression")
+}
+
+func (c *apiClient) DeleteSQLiBlockRule(ctx context.Context, account config.CF, zoneID string) (string, error) {
+	return c.deleteRulesetRuleByDescription(ctx, account, zoneID, firewallCustomPhase, sqlBlockRuleDesc)
+}
+
 func (c *apiClient) DeleteCountryBlockRule(ctx context.Context, account config.CF, zoneID string) (string, error) {
 	return c.deleteRulesetRuleByDescription(ctx, account, zoneID, firewallCustomPhase, countryBlockRuleDesc)
 }
@@ -794,6 +947,7 @@ func (c *apiClient) ManageZoneFeatures(ctx context.Context, account config.CF, d
 		Domain:             domain,
 		ZoneID:             zoneID,
 		SecurityRuleStatus: statusSkipped,
+		SQLiRuleStatus:     statusSkipped,
 		SpeedStatus:        map[string]string{},
 		CacheRuleStatus:    statusSkipped,
 	}
@@ -823,6 +977,23 @@ func (c *apiClient) ManageZoneFeatures(ctx context.Context, account config.CF, d
 				if err != nil {
 					result.Errors = append(result.Errors, err.Error())
 				}
+			}
+		}
+	}
+
+	if opts.SQLi {
+		switch action {
+		case "disable", "delete", "off":
+			status, err := c.DeleteSQLiBlockRule(ctx, account, zoneID)
+			result.SQLiRuleStatus = statusOrFailed(status, err)
+			if err != nil {
+				result.Errors = append(result.Errors, err.Error())
+			}
+		default:
+			status, err := c.EnsureSQLiBlockRule(ctx, account, zoneID)
+			result.SQLiRuleStatus = statusOrFailed(status, err)
+			if err != nil {
+				result.Errors = append(result.Errors, err.Error())
 			}
 		}
 	}
