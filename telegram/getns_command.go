@@ -7,12 +7,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"unicode"
 	"time"
+	"unicode"
 
 	"DomainC/cfclient"
 	"DomainC/config"
 	"DomainC/registrarclient"
+	"DomainC/reminder"
 )
 
 const (
@@ -26,16 +27,16 @@ type getNSDomainResult struct {
 }
 
 type getNSBatchResult struct {
-	TargetAccount   string
-	Created         []getNSDomainResult
-	Existing        []getNSDomainResult
-	ParseErrors     []string
-	Failed          []string
-	ManualNS        []string
-	RegistrarSynced int
+	TargetAccount       string
+	Created             []getNSDomainResult
+	Existing            []getNSDomainResult
+	ParseErrors         []string
+	Failed              []string
+	ManualNS            []string
+	RegistrarSynced     int
 	RegistrarSyncQueued []string
-	Provisioned     []cfclient.ProvisionResult
-	PostInitQueued  []string
+	Provisioned         []cfclient.ProvisionResult
+	PostInitQueued      []string
 }
 
 type getNSRegistrarSyncTask struct {
@@ -304,6 +305,9 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 				Domain:       zone.Name,
 				AccountLabel: acc.Label,
 			}
+			if rt := reminder.DefaultRuntime(); rt != nil {
+				rt.RecordDomainChange(ctx, reminder.DomainChange{Domain: zone.Name, Source: acc.Label, IsCF: true, ZoneID: zone.ID, Status: zone.Status, Paused: zone.Paused})
+			}
 			h.queueGetNSFeatureInit(*acc, zone.Name, zone.ID, postInitOpts, &result, &featureTasks)
 			h.queueGetNSRegistrarSync(domain, zone.NameServers, &result, &registrarTasks)
 			result.Existing = append(result.Existing, item)
@@ -332,6 +336,9 @@ func (h *CommandHandler) processGetNSBatch(selected config.CF, rawDomains []stri
 		item := getNSDomainResult{
 			Domain:       zone.Name,
 			AccountLabel: selected.Label,
+		}
+		if rt := reminder.DefaultRuntime(); rt != nil {
+			rt.RecordDomainChange(ctx, reminder.DomainChange{Domain: zone.Name, Source: selected.Label, IsCF: true, ZoneID: zone.ID, Status: zone.Status, Paused: zone.Paused})
 		}
 		h.queueGetNSRegistrarSync(domain, zone.NameServers, &result, &registrarTasks)
 		result.Created = append(result.Created, item)

@@ -11,12 +11,13 @@ import (
 )
 
 type Config struct {
-	AlertDays          int         `yaml:"alertDays"`
-	Telegram           Telegram    `yaml:"telegram"`
-	CloudflareAccounts []CF        `yaml:"cloudflareAccounts"`
+	AlertDays           int         `yaml:"alertDays"`
+	AssetCacheFile      string      `yaml:"assetCacheFile"`
+	Telegram            Telegram    `yaml:"telegram"`
+	CloudflareAccounts  []CF        `yaml:"cloudflareAccounts"`
 	CloudflareProvision CFProvision `yaml:"cloudflareProvision"`
-	Registrars         []Registrar `yaml:"registrars"`
-	DomainFiles        []string    `yaml:"domainFiles"`
+	Registrars          []Registrar `yaml:"registrars"`
+	DomainFiles         []string    `yaml:"domainFiles"`
 
 	AWSTargets map[string]AWSTarget `yaml:"awsTargets"`
 }
@@ -126,6 +127,13 @@ func applyEnvOverrides() {
 	if value := strings.TrimSpace(os.Getenv("TELEGRAM_ALLOWED_CHAT_IDS")); value != "" {
 		Cfg.Telegram.AllowedChatIDs = parseInt64List(value)
 	}
+}
+
+func EffectiveAlertDays() int {
+	if Cfg.AlertDays <= 0 {
+		return 7
+	}
+	return Cfg.AlertDays
 }
 
 func DefaultBlockCountries() []string {

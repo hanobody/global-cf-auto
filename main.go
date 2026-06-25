@@ -8,17 +8,11 @@ import (
 	"DomainC/callback"
 	"DomainC/cfclient"
 	"DomainC/config"
-	"DomainC/domain"
 	"DomainC/internal/app"
 	"DomainC/registrarclient"
+	"DomainC/reminder"
 	"DomainC/scheduler"
 	"DomainC/telegram"
-)
-
-const (
-	expiringFile      = "expiring_domains.txt"
-	failedFile        = "failed_domains.txt"
-	expiryCacheTarget = "expiry_cache.txt"
 )
 
 func main() {
@@ -47,6 +41,23 @@ func main() {
 		sender = botSender
 	}
 
+	cachePath := config.Cfg.AssetCacheFile
+	if cachePath == "" {
+		cachePath = reminder.DefaultCachePath
+	}
+	reminderRuntime := reminder.NewRuntime(reminder.RuntimeOptions{
+		Store:        reminder.NewFileStore(cachePath),
+		CFClient:     cfClient,
+		Accounts:     config.Cfg.CloudflareAccounts,
+		Registrar:    registrarManager,
+		Whois:        app.DefaultWhoisClient{},
+		RefreshDelay: 2 * time.Second,
+		QueryTimeout: 15 * time.Second,
+		TLS:          10 * time.Second,
+	})
+	reminder.SetDefaultRuntime(reminderRuntime)
+	go reminderRuntime.Run(ctx)
+
 	commandHandler := telegram.NewCommandHandler(cfClient, registrarManager, sender, config.Cfg.CloudflareAccounts, int64(config.Cfg.Telegram.ChatID))
 
 	go func() {
@@ -55,31 +66,18 @@ func main() {
 		}
 	}()
 
-	repository := domain.NewFileRepository(config.Cfg.DomainFiles, expiringFile, failedFile, expiryCacheTarget)
-	service := domain.NewService(cfClient, repository)
-
-	collector := &app.Collector{Service: service, Accounts: config.Cfg.CloudflareAccounts}
-	checker := &app.ExpiryCheckerService{
-		Whois:        app.DefaultWhoisClient{},
-		Repo:         repository,
-		AlertWithin:  app.AlertDaysDuration(config.Cfg.AlertDays),
-		RateLimit:    time.Second,
-		QueryTimeout: 15 * time.Second,
-		Registrar:    registrarManager,
+	assetReminder := &app.AssetReminderService{
+		Runtime:   reminderRuntime,
+		Sender:    sender,
+		AlertDays: config.EffectiveAlertDays(),
 	}
-	notifier := &app.NotifierService{Sender: sender, CFClient: cfClient, DeleteTimeout: 10 * time.Second}
 	sched := scheduler.NewDailyScheduler()
+	sched.ScheduleDaily(ctx, 15, 0, func() {
+		log.Printf("开始每日到期提醒任务")
+		if err := assetReminder.RunDaily(ctx); err != nil {
+			log.Printf("每日到期提醒任务失败: %v", err)
+		}
+	})
 
-	application := &app.App{
-		Collector: collector,
-		Checker:   checker,
-		Notifier:  notifier,
-		Scheduler: sched,
-		AlertHour: 15,
-		AlertMin:  0,
-	}
-
-	if err := application.Run(ctx); err != nil {
-		log.Fatalf("程序退出: %v", err)
-	}
+	<-ctx.Done()
 }

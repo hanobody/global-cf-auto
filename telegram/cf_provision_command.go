@@ -10,6 +10,7 @@ import (
 
 	"DomainC/cfclient"
 	"DomainC/config"
+	"DomainC/reminder"
 )
 
 type cfProvisionCommandOptions struct {
@@ -68,6 +69,9 @@ func (h *CommandHandler) handleCFProvisionCommand(command string, args []string)
 	if err != nil {
 		h.sendText(fmt.Sprintf("Cloudflare 初始化失败：%v", err))
 		return
+	}
+	if rt := reminder.DefaultRuntime(); rt != nil {
+		rt.RecordDomainChange(context.Background(), reminder.DomainChange{Domain: result.Domain, Source: account.Label, IsCF: true, ZoneID: result.ZoneID, Status: result.ZoneStatus})
 	}
 	if opts.CreateIfMissing {
 		h.sendText(formatCFAddSubmitted(*result))

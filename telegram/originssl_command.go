@@ -19,6 +19,7 @@ import (
 
 	"DomainC/cfclient"
 	"DomainC/config"
+	"DomainC/reminder"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
@@ -34,21 +35,21 @@ type originSSLImportResult struct {
 }
 
 type originSSLDomainResult struct {
-	Domain       string
-	AccountLabel string
-	StrictErr    error
+	Domain                string
+	AccountLabel          string
+	StrictErr             error
 	CountryBlockStatus    string
 	CountryBlockCountries []string
 	CacheRuleStatus       string
 	RUMStatus             string
-	Imports      []originSSLImportResult
+	Imports               []originSSLImportResult
 }
 
 type originSSLBatchResult struct {
-	AWSAliases    []string
-	Success       []originSSLDomainResult
-	ParseErrors   []string
-	Failed        []string
+	AWSAliases  []string
+	Success     []originSSLDomainResult
+	ParseErrors []string
+	Failed      []string
 }
 
 type originSSLARNEntry struct {
@@ -60,32 +61,32 @@ type originSSLARNEntry struct {
 }
 
 const (
-	originSSLStatusPollInterval       = 30 * time.Second
-	originSSLStatusPollAttempts       = 120
-	originSSLTaskConcurrency          = 3
-	originSSLCFCallInterval           = 5 * time.Second
-	originSSLAWSCallInterval          = 2 * time.Second
-	originSSLCertRequestTimeout       = 2 * time.Minute
-	originSSLCertRetryAttempts        = 5
-	originSSLPostInitPollInterval     = 30 * time.Second
+	originSSLStatusPollInterval        = 30 * time.Second
+	originSSLStatusPollAttempts        = 120
+	originSSLTaskConcurrency           = 3
+	originSSLCFCallInterval            = 5 * time.Second
+	originSSLAWSCallInterval           = 2 * time.Second
+	originSSLCertRequestTimeout        = 2 * time.Minute
+	originSSLCertRetryAttempts         = 5
+	originSSLPostInitPollInterval      = 30 * time.Second
 	originSSLPostInitZoneActiveTimeout = 30 * time.Minute
-	originSSLPostInitSSLActiveTimeout = 45 * time.Minute
-	originSSLDNSRecordLimit           = 500
+	originSSLPostInitSSLActiveTimeout  = 45 * time.Minute
+	originSSLDNSRecordLimit            = 500
 )
 
 type OriginSSLInteractiveDomainResult struct {
-	Domain       string
-	AccountLabel string
-	CertID       string
-	StrictErr    error
+	Domain                string
+	AccountLabel          string
+	CertID                string
+	StrictErr             error
 	CountryBlockStatus    string
 	CountryBlockCountries []string
 	CacheRuleStatus       string
 	RUMStatus             string
 	PostInitErrors        []string
-	Imports      []OriginSSLAWSImportResult
-	SpeedApplied []string
-	SpeedFailed  []string
+	Imports               []OriginSSLAWSImportResult
+	SpeedApplied          []string
+	SpeedFailed           []string
 }
 
 type OriginSSLAWSImportResult struct {
@@ -1227,6 +1228,9 @@ func processOriginSSLDomainItem(ctx context.Context, client cfclient.Client, acc
 	if err != nil {
 		return OriginSSLInteractiveDomainResult{}, err
 	}
+	if rt := reminder.DefaultRuntime(); rt != nil {
+		rt.RecordOriginCert(ctx, item.Name, account.Label, cert)
+	}
 
 	domainResult := OriginSSLInteractiveDomainResult{
 		Domain:       item.Name,
@@ -1548,7 +1552,7 @@ func formatOriginSSLSubmittedAWSTargets(aliases []string) string {
 
 func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domains []string) originSSLBatchResult {
 	result := originSSLBatchResult{
-		AWSAliases:    append([]string(nil), req.AWSAliases...),
+		AWSAliases: append([]string(nil), req.AWSAliases...),
 	}
 
 	accounts := append([]config.CF(nil), h.Accounts...)
@@ -1617,6 +1621,9 @@ func (h *CommandHandler) processOriginSSLDirectDomain(ctx context.Context, req O
 	cert, err := createOriginSSLCertWithRetry(ctx, h.CFClient, acc, domain)
 	if err != nil {
 		return originSSLDomainResult{}, err
+	}
+	if rt := reminder.DefaultRuntime(); rt != nil {
+		rt.RecordOriginCert(ctx, domain, acc.Label, cert)
 	}
 
 	domainResult := originSSLDomainResult{

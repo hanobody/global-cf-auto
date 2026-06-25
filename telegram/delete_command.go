@@ -8,6 +8,7 @@ import (
 
 	"DomainC/cfclient"
 	"DomainC/config"
+	"DomainC/reminder"
 )
 
 type DeleteBatchResult struct {
@@ -85,6 +86,9 @@ func ProcessDeleteBatch(client cfclient.Client, accounts []config.CF, domains []
 		}
 
 		result.Deleted = append(result.Deleted, domain)
+		if rt := reminder.DefaultRuntime(); rt != nil {
+			rt.RecordDomainDeletion(ctx, domain)
+		}
 	}
 
 	return result
