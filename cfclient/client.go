@@ -30,6 +30,7 @@ type DomainInfo struct {
 	Domain string
 	Source string
 	IsCF   bool
+	ZoneID string
 	Status string
 	Paused bool
 }
@@ -860,6 +861,7 @@ func (c *apiClient) FetchAllDomains(ctx context.Context, account config.CF) ([]D
 			Domain: z.Name,
 			Source: account.Label,
 			IsCF:   true,
+			ZoneID: z.ID,
 			Status: z.Status,
 			Paused: z.Paused,
 		})

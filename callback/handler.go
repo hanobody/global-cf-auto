@@ -9,6 +9,7 @@ import (
 
 	"DomainC/cfclient"
 	"DomainC/config"
+	"DomainC/reminder"
 	"DomainC/telegram"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -154,6 +155,9 @@ func HandleCallback(cb *tgbotapi.CallbackQuery) {
 			if err != nil {
 				telegram.SendTelegramAlert(fmt.Sprintf("删除域名失败: %s --- %s (%v)", domain, accountLabel, err))
 				return
+			}
+			if rt := reminder.DefaultRuntime(); rt != nil {
+				rt.RecordDomainDeletion(context.Background(), domain, accountLabel)
 			}
 			telegram.SendTelegramAlert(fmt.Sprintf("✅ 删除域名成功: %s --- %s (操作人: %s)", domain, accountLabel, user.UserName))
 		}()
@@ -943,10 +947,10 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 			return
 		}
 		telegram.SetPendingOriginSSLInput(user.ID, telegram.OriginSSLInputRequest{
-			AccountLabel:     payload.AccountLabel,
-			SessionID:        payload.SessionID,
-			Stage:            telegram.OriginSSLInputDNSTarget,
-			SelectedDomains:  telegram.OriginSSLDomainNames(items),
+			AccountLabel:    payload.AccountLabel,
+			SessionID:       payload.SessionID,
+			Stage:           telegram.OriginSSLInputDNSTarget,
+			SelectedDomains: telegram.OriginSSLDomainNames(items),
 		})
 		if cb.Message != nil {
 			_ = sender.EditButtons(context.Background(), cb.Message.Chat.ID, cb.Message.MessageID, [][]telegram.Button{{
@@ -966,13 +970,13 @@ func handleOriginSSLCallback(action string, parts []string, user *tgbotapi.User,
 			return
 		}
 		req := telegram.OriginSSLInputRequest{
-			AccountLabel:     payload.AccountLabel,
-			SessionID:        payload.SessionID,
-			Stage:            telegram.OriginSSLInputDNSRecords,
-			DNSTarget:        payload.DNSTarget,
-			DNSRecordType:    payload.DNSRecordType,
-			Proxied:          payload.Proxied,
-			SelectedDomains:  telegram.OriginSSLDomainNames(items),
+			AccountLabel:    payload.AccountLabel,
+			SessionID:       payload.SessionID,
+			Stage:           telegram.OriginSSLInputDNSRecords,
+			DNSTarget:       payload.DNSTarget,
+			DNSRecordType:   payload.DNSRecordType,
+			Proxied:         payload.Proxied,
+			SelectedDomains: telegram.OriginSSLDomainNames(items),
 		}
 		telegram.SetPendingOriginSSLInput(user.ID, req)
 		if cb.Message != nil {

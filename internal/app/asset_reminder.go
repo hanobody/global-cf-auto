@@ -70,6 +70,12 @@ func FormatAssetDailyMessageWithSummary(alerts []reminder.Alert, summary AssetSu
 	if len(alerts) == 0 {
 		sb.WriteString("\n\n今日没有域名续费或 SSL 证书到期资源。")
 		sb.WriteString(fmt.Sprintf("\n当前缓存域名: %d 个", summary.TotalDomains))
+		if summary.TotalAccountLinks > 0 && summary.TotalAccountLinks != summary.TotalDomains {
+			sb.WriteString(fmt.Sprintf("；账户归属: %d 条", summary.TotalAccountLinks))
+		}
+		if summary.MultiAccountDomains > 0 {
+			sb.WriteString(fmt.Sprintf("；多账户域名: %d 个", summary.MultiAccountDomains))
+		}
 		if summary.TotalCertificates > 0 {
 			sb.WriteString(fmt.Sprintf("；SSL 证书记录: %d 条", summary.TotalCertificates))
 		}
@@ -77,6 +83,9 @@ func FormatAssetDailyMessageWithSummary(alerts []reminder.Alert, summary AssetSu
 			sb.WriteString("\n\n按账户平台统计:")
 			for _, item := range summary.SourceCounts {
 				sb.WriteString(fmt.Sprintf("\n- %s: %d 个域名", displaySource(item.Source), item.Domains))
+				if item.UnknownDomains > 0 {
+					sb.WriteString(fmt.Sprintf("（未知账户 %d 个）", item.UnknownDomains))
+				}
 				if item.Certificates > 0 {
 					sb.WriteString(fmt.Sprintf("，%d 条证书记录", item.Certificates))
 				}

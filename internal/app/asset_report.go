@@ -14,6 +14,7 @@ import (
 
 type assetReportRow struct {
 	Source           string
+	AccountCount     string
 	Domain           string
 	ResourceType     string
 	ResourceName     string
@@ -31,16 +32,19 @@ type assetReportRow struct {
 
 // AssetSummary 汇总当前本地缓存中的资产规模，用于无到期日报摘要。
 type AssetSummary struct {
-	TotalDomains      int
-	TotalCertificates int
-	SourceCounts      []AssetSourceCount
+	TotalDomains        int
+	TotalAccountLinks   int
+	MultiAccountDomains int
+	TotalCertificates   int
+	SourceCounts        []AssetSourceCount
 }
 
 // AssetSourceCount 表示单个账户平台下的域名和证书数量。
 type AssetSourceCount struct {
-	Source       string
-	Domains      int
-	Certificates int
+	Source         string
+	Domains        int
+	Certificates   int
+	UnknownDomains int
 }
 
 func BuildAssetSummary(store *reminder.Store) (AssetSummary, error) {
@@ -53,20 +57,33 @@ func BuildAssetSummary(store *reminder.Store) (AssetSummary, error) {
 	}
 
 	bySource := map[string]*AssetSourceCount{}
+	summary := AssetSummary{TotalDomains: len(records)}
 	for _, rec := range records {
-		source := displaySource(rec.Source)
-		item := bySource[source]
-		if item == nil {
-			item = &AssetSourceCount{Source: source}
-			bySource[source] = item
+		accounts := reminder.RecordAccounts(rec)
+		if len(accounts) == 0 {
+			accounts = []reminder.AccountRecord{{Source: displaySource(rec.Source)}}
 		}
-		item.Domains++
-		item.Certificates += len(rec.Certificates)
+		if len(accounts) > 1 {
+			summary.MultiAccountDomains++
+		}
+		summary.TotalCertificates += len(rec.Certificates)
+		for _, acc := range accounts {
+			source := displaySource(acc.Source)
+			item := bySource[source]
+			if item == nil {
+				item = &AssetSourceCount{Source: source}
+				bySource[source] = item
+			}
+			item.Domains++
+			item.Certificates += len(rec.Certificates)
+			if acc.Unknown || strings.TrimSpace(acc.Status) == reminder.StatusUnknownAccount {
+				item.UnknownDomains++
+			}
+			summary.TotalAccountLinks++
+		}
 	}
 
-	summary := AssetSummary{TotalDomains: len(records)}
 	for _, item := range bySource {
-		summary.TotalCertificates += item.Certificates
 		summary.SourceCounts = append(summary.SourceCounts, *item)
 	}
 	sort.Slice(summary.SourceCounts, func(i, j int) bool {
@@ -166,6 +183,8 @@ func buildDueAssetRows(store *reminder.Store, alerts []reminder.Alert, now time.
 	for _, alert := range alerts {
 		row := alertRow(alert)
 		if rec := records[reminder.RecordKey(alert.Source, alert.Domain)]; rec != nil {
+			row.Source = displaySource(reminder.RecordSourceDisplay(*rec))
+			row.AccountCount = accountCountText(*rec)
 			row.LastRefreshAt = rec.LastRefreshAt
 			row.LastRefreshError = rec.LastRefreshError
 			if row.Status == "" {
@@ -180,7 +199,8 @@ func buildDueAssetRows(store *reminder.Store, alerts []reminder.Alert, now time.
 
 func domainRowFromRecord(rec reminder.Record, now time.Time) assetReportRow {
 	row := assetReportRow{
-		Source:           displaySource(rec.Source),
+		Source:           displaySource(reminder.RecordSourceDisplay(rec)),
+		AccountCount:     accountCountText(rec),
 		Domain:           rec.Domain,
 		ResourceType:     "域名续费",
 		ResourceName:     "域名注册/续费",
@@ -197,7 +217,8 @@ func domainRowFromRecord(rec reminder.Record, now time.Time) assetReportRow {
 
 func certRowFromRecord(rec reminder.Record, cert reminder.CertificateRecord, now time.Time) assetReportRow {
 	row := assetReportRow{
-		Source:           displaySource(rec.Source),
+		Source:           displaySource(reminder.RecordSourceDisplay(rec)),
+		AccountCount:     accountCountText(rec),
 		Domain:           rec.Domain,
 		ResourceType:     "SSL 证书",
 		ResourceName:     certificateDisplayName(cert),
@@ -220,6 +241,7 @@ func certRowFromRecord(rec reminder.Record, cert reminder.CertificateRecord, now
 func alertRow(alert reminder.Alert) assetReportRow {
 	row := assetReportRow{
 		Source:       displaySource(alert.Source),
+		AccountCount: "1",
 		Domain:       alert.Domain,
 		Expiry:       alert.Expiry.Format("2006-01-02 15:04:05"),
 		DaysLeft:     formatDaysLeft(alert.DaysLeft),
@@ -283,11 +305,11 @@ h1{font-size:22px;margin:0 0 8px;}p{margin:6px 0 16px;color:#4b5563;}table{width
 			sb.WriteString("<tr>")
 			for i, v := range rowValues(row) {
 				className := ""
-				if i == 5 && (strings.Contains(v, "已过期") || strings.Contains(v, "今天到期")) {
+				if i == 6 && (strings.Contains(v, "已过期") || strings.Contains(v, "今天到期")) {
 					className = " class=\"warn nowrap\""
-				} else if i == 13 && strings.TrimSpace(v) != "" {
+				} else if i == 14 && strings.TrimSpace(v) != "" {
 					className = " class=\"err\""
-				} else if i == 4 || i == 5 || i == 12 {
+				} else if i == 5 || i == 6 || i == 13 {
 					className = " class=\"nowrap\""
 				}
 				sb.WriteString("<td")
@@ -342,7 +364,7 @@ func writeAssetCSVReport(prefix string, rows []assetReportRow, now time.Time) (s
 
 func assetReportHeaders() []string {
 	return []string{
-		"账户平台", "域名", "资源类型", "资源名称", "到期时间", "剩余时间", "状态",
+		"账户平台", "账户数", "域名", "资源类型", "资源名称", "到期时间", "剩余时间", "状态",
 		"证书类型", "证书ID", "签发方", "证书主体", "证书域名", "最后刷新时间", "刷新错误",
 	}
 }
@@ -350,6 +372,7 @@ func assetReportHeaders() []string {
 func rowValues(row assetReportRow) []string {
 	return []string{
 		row.Source,
+		row.AccountCount,
 		row.Domain,
 		row.ResourceType,
 		row.ResourceName,
@@ -436,16 +459,38 @@ func certificateDisplayName(cert reminder.CertificateRecord) string {
 	}
 }
 
+func accountCountText(rec reminder.Record) string {
+	count := len(reminder.RecordAccounts(rec))
+	if count <= 0 {
+		return "1"
+	}
+	return fmt.Sprintf("%d", count)
+}
+
 func recordStatus(rec reminder.Record) string {
 	var parts []string
+	accounts := reminder.RecordAccounts(rec)
 	if rec.PendingRefresh {
 		parts = append(parts, "待补全")
 	}
 	if rec.IsCF {
 		parts = append(parts, "Cloudflare")
 	}
-	if strings.TrimSpace(rec.Status) != "" {
-		parts = append(parts, rec.Status)
+	if len(accounts) > 1 {
+		parts = append(parts, "多账户")
+	}
+	var unknown []string
+	for _, acc := range accounts {
+		if acc.Unknown || strings.TrimSpace(acc.Status) == reminder.StatusUnknownAccount {
+			unknown = append(unknown, acc.Source)
+		}
+	}
+	if len(unknown) > 0 {
+		parts = append(parts, "未知账户:"+strings.Join(unknown, ","))
+	}
+	status := strings.TrimSpace(rec.Status)
+	if status != "" && status != reminder.StatusUnknownAccount && !strings.Contains(status, "多账户") && !strings.Contains(status, "部分未知账户") {
+		parts = append(parts, status)
 	}
 	if rec.Paused {
 		parts = append(parts, "paused")

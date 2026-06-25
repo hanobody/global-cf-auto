@@ -43,9 +43,22 @@ type Runtime struct {
 	queryTimeout time.Duration
 	tlsTimeout   time.Duration
 	jobs         chan DomainRef
+	startupOnce  sync.Once
 
 	originMu    sync.Mutex
 	originCache map[string]originCertCacheItem
+}
+
+// StartupSyncSummary 表示一次启动资产同步的结果。
+type StartupSyncSummary struct {
+	ConfiguredAccounts int
+	ScannedAccounts    int
+	DomainsSeen        int
+	Added              int
+	Updated            int
+	MarkedUnknown      int
+	QueuedRefresh      int
+	Errors             []string
 }
 
 type originCertCacheItem struct {
@@ -106,6 +119,146 @@ func NewRuntime(opts RuntimeOptions) *Runtime {
 
 func (r *Runtime) Store() *Store { return r.store }
 
+// SyncCloudflareDomainsOnce 在进程启动后执行一次 Cloudflare 域名基线同步。
+//
+// 该方法只读取各账号的 Zone 清单并与本地缓存做增量合并，不会清空重建缓存；
+// 新增或缺失基础数据的域名会进入后台补全队列，由 Run 的工作循环按 refreshDelay 慢速查询
+// 域名续费时间、Cloudflare Origin CA 源站证书和当前访问证书。
+func (r *Runtime) SyncCloudflareDomainsOnce(ctx context.Context) StartupSyncSummary {
+	summary := StartupSyncSummary{}
+	if r == nil || r.store == nil || r.cfClient == nil {
+		return summary
+	}
+	r.startupOnce.Do(func() {
+		summary = r.syncCloudflareDomains(ctx)
+	})
+	return summary
+}
+
+func (r *Runtime) syncCloudflareDomains(ctx context.Context) StartupSyncSummary {
+	summary := StartupSyncSummary{ConfiguredAccounts: len(r.accounts)}
+	if len(r.accounts) == 0 {
+		log.Printf("[reminder] startup_sync_skip reason=no_cloudflare_accounts")
+		return summary
+	}
+
+	configuredSources := make([]string, 0, len(r.accounts))
+	for _, acc := range r.accounts {
+		configuredSources = append(configuredSources, accountCacheLabel(acc))
+	}
+
+	changes := make([]DomainChange, 0)
+	successfulSources := make([]string, 0, len(r.accounts))
+	for i, acc := range r.accounts {
+		label := accountCacheLabel(acc)
+		if strings.TrimSpace(acc.APIToken) == "" {
+			errText := fmt.Sprintf("Cloudflare 账号 %s 缺少 apiToken，跳过启动同步", label)
+			summary.Errors = append(summary.Errors, errText)
+			log.Printf("[reminder] startup_sync_account_skip source=%s err=%s", label, errText)
+			continue
+		}
+
+		lookupTimeout := r.queryTimeout
+		if lookupTimeout < 60*time.Second {
+			lookupTimeout = 60 * time.Second
+		}
+		lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
+		domains, err := r.cfClient.FetchAllDomains(lookupCtx, acc)
+		cancel()
+		if err != nil {
+			errText := fmt.Sprintf("Cloudflare 账号 %s 启动同步失败: %v", label, err)
+			summary.Errors = append(summary.Errors, errText)
+			log.Printf("[reminder] startup_sync_account_failed source=%s err=%v", label, err)
+			continue
+		}
+
+		successfulSources = append(successfulSources, label)
+		summary.ScannedAccounts++
+		for _, item := range domains {
+			domain := NormalizeDomain(item.Domain)
+			if domain == "" {
+				continue
+			}
+			source := NormalizeSource(item.Source)
+			if source == "" {
+				source = label
+			}
+			changes = append(changes, DomainChange{
+				Domain: domain,
+				Source: source,
+				IsCF:   true,
+				ZoneID: item.ZoneID,
+				Status: item.Status,
+				Paused: item.Paused,
+			})
+			summary.DomainsSeen++
+		}
+		log.Printf("[reminder] startup_sync_account_done source=%s domains=%d", label, len(domains))
+
+		if r.refreshDelay > 0 && i < len(r.accounts)-1 {
+			select {
+			case <-ctx.Done():
+				summary.Errors = append(summary.Errors, ctx.Err().Error())
+				return summary
+			case <-time.After(r.refreshDelay):
+			}
+		}
+	}
+
+	refs, cacheSummary, err := r.store.ReconcileCloudflareDomains(changes, successfulSources, configuredSources)
+	if err != nil {
+		errText := fmt.Sprintf("写入启动同步缓存失败: %v", err)
+		summary.Errors = append(summary.Errors, errText)
+		log.Printf("[reminder] startup_sync_cache_failed err=%v", err)
+		return summary
+	}
+
+	summary.Added = cacheSummary.Added
+	summary.Updated = cacheSummary.Updated
+	summary.MarkedUnknown = cacheSummary.MarkedUnknown
+	summary.QueuedRefresh = len(refs)
+
+	go r.enqueueRefreshesSequentially(ctx, refs)
+	log.Printf("[reminder] startup_sync_done accounts=%d/%d domains=%d added=%d updated=%d unknown=%d merged_multi_account=%d queued_refresh=%d errors=%d",
+		summary.ScannedAccounts, summary.ConfiguredAccounts, summary.DomainsSeen, summary.Added, summary.Updated, summary.MarkedUnknown, cacheSummary.MergedMultiAccount, summary.QueuedRefresh, len(summary.Errors))
+	return summary
+}
+
+func (r *Runtime) enqueueRefreshesSequentially(ctx context.Context, refs []DomainRef) {
+	for _, ref := range refs {
+		if !r.enqueueWait(ctx, ref) {
+			return
+		}
+	}
+}
+
+func (r *Runtime) enqueueWait(ctx context.Context, ref DomainRef) bool {
+	ref.Domain = NormalizeDomain(ref.Domain)
+	ref.Source = NormalizeSource(ref.Source)
+	if ref.Domain == "" {
+		return true
+	}
+	select {
+	case r.jobs <- ref:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func accountCacheLabel(account config.CF) string {
+	if label := strings.TrimSpace(account.Label); label != "" {
+		return label
+	}
+	if accountID := strings.TrimSpace(account.AccountID); accountID != "" {
+		return accountID
+	}
+	if email := strings.TrimSpace(account.Email); email != "" {
+		return email
+	}
+	return "Cloudflare"
+}
+
 func (r *Runtime) Run(ctx context.Context) {
 	if r == nil {
 		return
@@ -143,12 +296,12 @@ func (r *Runtime) RecordDomainChange(ctx context.Context, change DomainChange) {
 	r.enqueue(ctx, ref)
 }
 
-func (r *Runtime) RecordDomainDeletion(ctx context.Context, domain string) {
+func (r *Runtime) RecordDomainDeletion(ctx context.Context, domain string, sources ...string) {
 	if r == nil || r.store == nil {
 		return
 	}
-	if err := r.store.DeleteDomain(domain); err != nil {
-		log.Printf("[reminder] cache_delete_failed domain=%s err=%v", domain, err)
+	if err := r.store.DeleteDomain(domain, sources...); err != nil {
+		log.Printf("[reminder] cache_delete_failed domain=%s sources=%v err=%v", domain, sources, err)
 	}
 }
 
@@ -320,52 +473,95 @@ func (r *Runtime) lookupServedCertificate(ctx context.Context, domain string) (C
 }
 
 func (r *Runtime) lookupOriginCertificates(ctx context.Context, ref DomainRef) ([]CertificateRecord, error) {
-	if r.cfClient == nil || strings.TrimSpace(ref.Source) == "" {
+	if r.cfClient == nil {
 		return nil, nil
 	}
-	acc, ok := r.accountByLabel(ref.Source)
-	if !ok {
+	sources := r.refreshSources(ref)
+	if len(sources) == 0 {
 		return nil, nil
 	}
-	certs, err := r.listOriginCerts(ctx, acc)
-	if err != nil {
-		return nil, fmt.Errorf("Cloudflare Origin CA 查询失败: %w", err)
-	}
+
 	out := make([]CertificateRecord, 0)
-	for _, cert := range certs {
-		if cert.RevokedAt != nil || cert.ExpiresOn.IsZero() {
+	var errorsList []string
+	for _, source := range sources {
+		acc, ok := r.accountByLabel(source)
+		if !ok {
 			continue
 		}
-		matched := false
-		for _, host := range cert.Hostnames {
-			if hostnameMatchesDomain(host, ref.Domain) {
-				matched = true
-				break
+		certs, err := r.listOriginCerts(ctx, acc)
+		if err != nil {
+			errorsList = append(errorsList, fmt.Sprintf("%s: %v", source, err))
+			continue
+		}
+		for _, cert := range certs {
+			if cert.RevokedAt != nil || cert.ExpiresOn.IsZero() {
+				continue
 			}
+			matched := false
+			for _, host := range cert.Hostnames {
+				if hostnameMatchesDomain(host, ref.Domain) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			rec := CertificateRecord{
+				Type:      CertTypeCFOrigin,
+				ID:        cert.ID,
+				Hostnames: append([]string(nil), cert.Hostnames...),
+				Issuer:    "Cloudflare Origin CA",
+				Subject:   strings.Join(cert.Hostnames, ","),
+				NotAfter:  timeString(cert.ExpiresOn),
+				UpdatedAt: time.Now().Format(time.RFC3339),
+			}
+			rec.Key = certificateKey(rec)
+			out = append(out, rec)
 		}
-		if !matched {
-			continue
-		}
-		rec := CertificateRecord{
-			Type:      CertTypeCFOrigin,
-			ID:        cert.ID,
-			Hostnames: append([]string(nil), cert.Hostnames...),
-			Issuer:    "Cloudflare Origin CA",
-			Subject:   strings.Join(cert.Hostnames, ","),
-			NotAfter:  timeString(cert.ExpiresOn),
-			UpdatedAt: time.Now().Format(time.RFC3339),
-		}
-		rec.Key = certificateKey(rec)
-		out = append(out, rec)
+	}
+	if len(errorsList) > 0 && len(out) == 0 {
+		return nil, fmt.Errorf("Cloudflare Origin CA 查询失败: %s", strings.Join(errorsList, "; "))
 	}
 	return out, nil
 }
 
-func (r *Runtime) listOriginCerts(ctx context.Context, account config.CF) ([]cfclient.OriginCACertInfo, error) {
-	label := strings.TrimSpace(account.Label)
-	if label == "" {
-		label = account.AccountID
+func (r *Runtime) refreshSources(ref DomainRef) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(source string) {
+		source = NormalizeSource(source)
+		if source == "" {
+			return
+		}
+		key := normalizedSourceKey(source)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, source)
 	}
+	for _, source := range ref.Sources {
+		add(source)
+	}
+	for _, source := range splitSourceDisplay(ref.Source) {
+		add(source)
+	}
+	if len(out) == 0 && r.store != nil {
+		if rec, ok, err := r.store.GetRecord(ref.Domain); err == nil && ok {
+			for _, acc := range RecordAccounts(rec) {
+				if acc.Unknown || strings.TrimSpace(acc.Status) == StatusUnknownAccount {
+					continue
+				}
+				add(acc.Source)
+			}
+		}
+	}
+	return out
+}
+
+func (r *Runtime) listOriginCerts(ctx context.Context, account config.CF) ([]cfclient.OriginCACertInfo, error) {
+	label := accountCacheLabel(account)
 	r.originMu.Lock()
 	cached, ok := r.originCache[label]
 	if ok && time.Since(cached.loadedAt) < time.Hour {
@@ -384,7 +580,10 @@ func (r *Runtime) listOriginCerts(ctx context.Context, account config.CF) ([]cfc
 func (r *Runtime) accountByLabel(label string) (config.CF, bool) {
 	label = strings.TrimSpace(label)
 	for _, acc := range r.accounts {
-		if strings.EqualFold(strings.TrimSpace(acc.Label), label) {
+		if strings.EqualFold(accountCacheLabel(acc), label) ||
+			strings.EqualFold(strings.TrimSpace(acc.Label), label) ||
+			strings.EqualFold(strings.TrimSpace(acc.AccountID), label) ||
+			strings.EqualFold(strings.TrimSpace(acc.Email), label) {
 			return acc, true
 		}
 	}

@@ -57,6 +57,17 @@ func main() {
 	})
 	reminder.SetDefaultRuntime(reminderRuntime)
 	go reminderRuntime.Run(ctx)
+	go func() {
+		log.Printf("开始启动资产缓存同步")
+		summary := reminderRuntime.SyncCloudflareDomainsOnce(ctx)
+		if len(summary.Errors) > 0 {
+			log.Printf("启动资产缓存同步完成但存在错误: accounts=%d/%d domains=%d added=%d updated=%d unknown=%d queued=%d errors=%v",
+				summary.ScannedAccounts, summary.ConfiguredAccounts, summary.DomainsSeen, summary.Added, summary.Updated, summary.MarkedUnknown, summary.QueuedRefresh, summary.Errors)
+			return
+		}
+		log.Printf("启动资产缓存同步完成: accounts=%d/%d domains=%d added=%d updated=%d unknown=%d queued=%d",
+			summary.ScannedAccounts, summary.ConfiguredAccounts, summary.DomainsSeen, summary.Added, summary.Updated, summary.MarkedUnknown, summary.QueuedRefresh)
+	}()
 
 	commandHandler := telegram.NewCommandHandler(cfClient, registrarManager, sender, config.Cfg.CloudflareAccounts, int64(config.Cfg.Telegram.ChatID))
 

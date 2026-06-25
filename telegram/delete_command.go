@@ -76,7 +76,8 @@ func ProcessDeleteBatch(client cfclient.Client, accounts []config.CF, domains []
 			continue
 		}
 
-		if _, err := deleteDomainAcrossAccounts(ctx, client, accounts, domain); err != nil {
+		deletedAccount, err := deleteDomainAcrossAccounts(ctx, client, accounts, domain)
+		if err != nil {
 			if errors.Is(err, cfclient.ErrZoneNotFound) || strings.Contains(strings.ToLower(err.Error()), "zone not found") {
 				result.Missing = append(result.Missing, domain)
 				continue
@@ -87,7 +88,11 @@ func ProcessDeleteBatch(client cfclient.Client, accounts []config.CF, domains []
 
 		result.Deleted = append(result.Deleted, domain)
 		if rt := reminder.DefaultRuntime(); rt != nil {
-			rt.RecordDomainDeletion(ctx, domain)
+			if deletedAccount != nil {
+				rt.RecordDomainDeletion(ctx, domain, deletedAccount.Label)
+			} else {
+				rt.RecordDomainDeletion(ctx, domain)
+			}
 		}
 	}
 
