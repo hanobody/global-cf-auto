@@ -16,6 +16,27 @@ const (
 	CertTypeServed   = "served"
 )
 
+// IsReportableCertificate 表示该证书是否参与到期提醒和日报展示。
+// 现在提醒系统以域名当前 HTTPS 访问证书为准；旧版本缓存中通过 Cloudflare
+// Origin CA API 拉取到的源站证书只作为历史兼容数据，不再参与日报判断。
+func IsReportableCertificate(cert CertificateRecord) bool {
+	typ := strings.TrimSpace(cert.Type)
+	if typ == "" {
+		return true
+	}
+	return typ == CertTypeServed
+}
+
+func reportableCertificates(certs []CertificateRecord) []CertificateRecord {
+	out := make([]CertificateRecord, 0, len(certs))
+	for _, cert := range certs {
+		if IsReportableCertificate(cert) {
+			out = append(out, cert)
+		}
+	}
+	return out
+}
+
 func certificateKey(cert CertificateRecord) string {
 	if strings.TrimSpace(cert.Key) != "" {
 		return cert.Key

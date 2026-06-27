@@ -23,9 +23,10 @@ func (s *AssetReminderService) RunDaily(ctx context.Context) error {
 	}
 	now := time.Now()
 	alertDays := reminder.EffectiveAlertDays(s.AlertDays)
-	if err := s.Runtime.RefreshCandidates(ctx, alertDays, now); err != nil {
-		log.Printf("[reminder] refresh_candidates_failed err=%v", err)
-	}
+
+	// 日报发送必须优先基于本地缓存计算，避免每天 15:00 被 RDAP/WHOIS/TLS
+	// 批量刷新阻塞，导致 Telegram 报告迟迟发不出去。缓存刷新改为报告发送成功后
+	// 后台异步慢速执行，并且刷新候选本身会做 TTL 控制。
 	alerts, err := s.Runtime.DueAlerts(alertDays, now)
 	if err != nil {
 		return err
@@ -51,7 +52,16 @@ func (s *AssetReminderService) RunDaily(ctx context.Context) error {
 			return err
 		}
 	}
-	return s.Runtime.MarkAlertsSent(alerts, now)
+	if err := s.Runtime.MarkAlertsSent(alerts, now); err != nil {
+		return err
+	}
+
+	go func() {
+		if err := s.Runtime.EnqueueRefreshCandidates(ctx, alertDays, now); err != nil {
+			log.Printf("[reminder] enqueue_refresh_candidates_failed err=%v", err)
+		}
+	}()
+	return nil
 }
 
 func FormatAssetDailyMessage(alerts []reminder.Alert, alertDays int, now time.Time) string {

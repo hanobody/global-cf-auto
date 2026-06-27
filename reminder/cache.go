@@ -790,7 +790,7 @@ func (s *Store) ReconcileCloudflareDomains(changes []DomainChange, successfulSou
 		}
 
 		beforeSources := len(RecordSources(*rec))
-		needsRefresh := created || rec.PendingRefresh || strings.TrimSpace(rec.DomainExpiry) == "" || len(rec.Certificates) == 0 || strings.TrimSpace(rec.LastRefreshError) != ""
+		needsRefresh := created || shouldRefreshRecord(*rec, DefaultAlertDays, time.Now())
 		changed := applyDomainChange(rec, change, now)
 		rec.Deleted = false
 		if needsRefresh {
@@ -918,19 +918,55 @@ func shouldRefreshRecord(rec Record, alertDays int, now time.Time) bool {
 	if rec.PendingRefresh {
 		return true
 	}
+	return shouldRefreshDomainExpiry(rec, alertDays, now) || shouldRefreshCertificates(rec, alertDays, now)
+}
+
+func shouldRefreshDomainExpiry(rec Record, alertDays int, now time.Time) bool {
 	if strings.TrimSpace(rec.DomainExpiry) == "" {
 		return true
 	}
-	if dateWithin(rec.DomainExpiry, alertDays+1, now) {
-		return true
+	interval := domainExpiryRefreshInterval()
+	if dateWithin(rec.DomainExpiry, EffectiveAlertDays(alertDays)+1, now) {
+		interval = nearExpiryRefreshInterval()
 	}
+	return timeValueOlderThan(rec.DomainExpiryUpdatedAt, interval, now)
+}
+
+func shouldRefreshCertificates(rec Record, alertDays int, now time.Time) bool {
 	if len(rec.Certificates) == 0 {
-		return true
+		return timeValueOlderThan(rec.LastRefreshAt, certificateRefreshInterval(), now)
 	}
 	for _, cert := range rec.Certificates {
-		if strings.TrimSpace(cert.NotAfter) == "" || timeWithin(cert.NotAfter, alertDays+1, now) {
+		if strings.TrimSpace(cert.NotAfter) == "" {
+			return true
+		}
+		interval := certificateRefreshInterval()
+		if timeWithin(cert.NotAfter, EffectiveAlertDays(alertDays)+1, now) {
+			interval = nearExpiryRefreshInterval()
+		}
+		if timeValueOlderThan(cert.UpdatedAt, interval, now) {
 			return true
 		}
 	}
 	return false
+}
+
+func domainExpiryRefreshInterval() time.Duration { return 7 * 24 * time.Hour }
+func certificateRefreshInterval() time.Duration  { return 7 * 24 * time.Hour }
+func nearExpiryRefreshInterval() time.Duration   { return 24 * time.Hour }
+
+func timeValueOlderThan(raw string, interval time.Duration, now time.Time) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return true
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return now.Sub(t) >= interval
+		}
+	}
+	return true
 }

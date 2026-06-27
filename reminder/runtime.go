@@ -44,9 +44,6 @@ type Runtime struct {
 	tlsTimeout   time.Duration
 	jobs         chan DomainRef
 	startupOnce  sync.Once
-
-	originMu    sync.Mutex
-	originCache map[string]originCertCacheItem
 }
 
 // StartupSyncSummary 表示一次启动资产同步的结果。
@@ -59,12 +56,6 @@ type StartupSyncSummary struct {
 	MarkedUnknown      int
 	QueuedRefresh      int
 	Errors             []string
-}
-
-type originCertCacheItem struct {
-	loadedAt time.Time
-	certs    []cfclient.OriginCACertInfo
-	err      error
 }
 
 var defaultRuntime atomic.Value
@@ -113,7 +104,6 @@ func NewRuntime(opts RuntimeOptions) *Runtime {
 		queryTimeout: queryTimeout,
 		tlsTimeout:   tlsTimeout,
 		jobs:         make(chan DomainRef, 1024),
-		originCache:  map[string]originCertCacheItem{},
 	}
 }
 
@@ -123,7 +113,7 @@ func (r *Runtime) Store() *Store { return r.store }
 //
 // 该方法只读取各账号的 Zone 清单并与本地缓存做增量合并，不会清空重建缓存；
 // 新增或缺失基础数据的域名会进入后台补全队列，由 Run 的工作循环按 refreshDelay 慢速查询
-// 域名续费时间、Cloudflare Origin CA 源站证书和当前访问证书。
+// 域名续费时间和当前 HTTPS 访问证书。
 func (r *Runtime) SyncCloudflareDomainsOnce(ctx context.Context) StartupSyncSummary {
 	summary := StartupSyncSummary{}
 	if r == nil || r.store == nil || r.cfClient == nil {
@@ -358,6 +348,23 @@ func (r *Runtime) enqueue(ctx context.Context, ref DomainRef) {
 	}
 }
 
+func (r *Runtime) EnqueueRefreshCandidates(ctx context.Context, alertDays int, now time.Time) error {
+	if r == nil || r.store == nil {
+		return nil
+	}
+	refs, err := r.store.ListRefreshCandidates(alertDays, now)
+	if err != nil {
+		return err
+	}
+	if len(refs) == 0 {
+		log.Printf("[reminder] daily_refresh_enqueue_skip reason=no_candidates")
+		return nil
+	}
+	log.Printf("[reminder] daily_refresh_enqueue candidates=%d", len(refs))
+	go r.enqueueRefreshesSequentially(ctx, refs)
+	return nil
+}
+
 func (r *Runtime) RefreshCandidates(ctx context.Context, alertDays int, now time.Time) error {
 	if r == nil || r.store == nil {
 		return nil
@@ -391,27 +398,37 @@ func (r *Runtime) RefreshDomain(ctx context.Context, ref DomainRef) error {
 		return fmt.Errorf("域名为空")
 	}
 
+	nowTime := time.Now()
+	existing, exists, err := r.store.GetRecord(ref.Domain)
+	if err != nil {
+		return err
+	}
+	lookupDomainExpiry := !exists || shouldRefreshDomainExpiry(existing, DefaultAlertDays, nowTime)
+	lookupCertificates := !exists || shouldRefreshCertificates(existing, DefaultAlertDays, nowTime)
+
 	var errorsList []string
 	var domainExpiry string
-	if t, ok, err := r.lookupDomainExpiry(ctx, ref.Domain); err == nil && ok {
-		domainExpiry = dateString(t)
-	} else if err != nil {
-		errorsList = append(errorsList, err.Error())
+	if lookupDomainExpiry {
+		if t, ok, err := r.lookupDomainExpiry(ctx, ref.Domain); err == nil && ok {
+			domainExpiry = dateString(t)
+		} else if err != nil {
+			errorsList = append(errorsList, err.Error())
+		}
 	}
 
-	certs := make([]CertificateRecord, 0, 4)
-	if origin, err := r.lookupOriginCertificates(ctx, ref); err == nil {
-		certs = append(certs, origin...)
-	} else if err != nil {
-		errorsList = append(errorsList, err.Error())
-	}
-	if served, err := r.lookupServedCertificate(ctx, ref.Domain); err == nil {
-		certs = append(certs, served)
-	} else if err != nil {
-		errorsList = append(errorsList, err.Error())
+	certs := make([]CertificateRecord, 0, 1)
+	if lookupCertificates {
+		// 证书到期提醒只检查域名当前 HTTPS 访问时真实返回的证书。
+		// 不再调用 Cloudflare Origin CA API 列证书，避免账号/zone 权限差异导致
+		// “Please provide a zone id...” 等平台 API 错误阻塞或污染日报。
+		if served, err := r.lookupServedCertificate(ctx, ref.Domain); err == nil {
+			certs = append(certs, served)
+		} else if err != nil {
+			errorsList = append(errorsList, err.Error())
+		}
 	}
 
-	now := time.Now().Format(time.RFC3339)
+	now := nowTime.Format(time.RFC3339)
 	return r.store.UpdateRecord(ref, func(rec *Record) {
 		if domainExpiry != "" {
 			if rec.DomainExpiry != domainExpiry {
@@ -419,6 +436,11 @@ func (r *Runtime) RefreshDomain(ctx context.Context, ref DomainRef) error {
 			}
 			rec.DomainExpiry = domainExpiry
 			rec.DomainExpiryUpdatedAt = now
+		}
+		if lookupCertificates {
+			// 从提醒缓存中清理旧版本通过平台 API 写入的 Origin CA 证书记录；
+			// 后续日报/提醒以当前 HTTPS 访问证书为准。
+			rec.Certificates = reportableCertificates(rec.Certificates)
 		}
 		if len(certs) > 0 {
 			rec.Certificates = mergeCertificates(rec.Certificates, certs)
@@ -470,122 +492,4 @@ func (r *Runtime) lookupServedCertificate(ctx context.Context, domain string) (C
 	lookupCtx, cancel := context.WithTimeout(ctx, r.tlsTimeout)
 	defer cancel()
 	return servedCertificate(lookupCtx, domain, r.tlsTimeout)
-}
-
-func (r *Runtime) lookupOriginCertificates(ctx context.Context, ref DomainRef) ([]CertificateRecord, error) {
-	if r.cfClient == nil {
-		return nil, nil
-	}
-	sources := r.refreshSources(ref)
-	if len(sources) == 0 {
-		return nil, nil
-	}
-
-	out := make([]CertificateRecord, 0)
-	var errorsList []string
-	for _, source := range sources {
-		acc, ok := r.accountByLabel(source)
-		if !ok {
-			continue
-		}
-		certs, err := r.listOriginCerts(ctx, acc)
-		if err != nil {
-			errorsList = append(errorsList, fmt.Sprintf("%s: %v", source, err))
-			continue
-		}
-		for _, cert := range certs {
-			if cert.RevokedAt != nil || cert.ExpiresOn.IsZero() {
-				continue
-			}
-			matched := false
-			for _, host := range cert.Hostnames {
-				if hostnameMatchesDomain(host, ref.Domain) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				continue
-			}
-			rec := CertificateRecord{
-				Type:      CertTypeCFOrigin,
-				ID:        cert.ID,
-				Hostnames: append([]string(nil), cert.Hostnames...),
-				Issuer:    "Cloudflare Origin CA",
-				Subject:   strings.Join(cert.Hostnames, ","),
-				NotAfter:  timeString(cert.ExpiresOn),
-				UpdatedAt: time.Now().Format(time.RFC3339),
-			}
-			rec.Key = certificateKey(rec)
-			out = append(out, rec)
-		}
-	}
-	if len(errorsList) > 0 && len(out) == 0 {
-		return nil, fmt.Errorf("Cloudflare Origin CA 查询失败: %s", strings.Join(errorsList, "; "))
-	}
-	return out, nil
-}
-
-func (r *Runtime) refreshSources(ref DomainRef) []string {
-	seen := map[string]struct{}{}
-	var out []string
-	add := func(source string) {
-		source = NormalizeSource(source)
-		if source == "" {
-			return
-		}
-		key := normalizedSourceKey(source)
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		out = append(out, source)
-	}
-	for _, source := range ref.Sources {
-		add(source)
-	}
-	for _, source := range splitSourceDisplay(ref.Source) {
-		add(source)
-	}
-	if len(out) == 0 && r.store != nil {
-		if rec, ok, err := r.store.GetRecord(ref.Domain); err == nil && ok {
-			for _, acc := range RecordAccounts(rec) {
-				if acc.Unknown || strings.TrimSpace(acc.Status) == StatusUnknownAccount {
-					continue
-				}
-				add(acc.Source)
-			}
-		}
-	}
-	return out
-}
-
-func (r *Runtime) listOriginCerts(ctx context.Context, account config.CF) ([]cfclient.OriginCACertInfo, error) {
-	label := accountCacheLabel(account)
-	r.originMu.Lock()
-	cached, ok := r.originCache[label]
-	if ok && time.Since(cached.loadedAt) < time.Hour {
-		r.originMu.Unlock()
-		return append([]cfclient.OriginCACertInfo(nil), cached.certs...), cached.err
-	}
-	r.originMu.Unlock()
-
-	certs, err := r.cfClient.ListOriginCACertificates(ctx, account)
-	r.originMu.Lock()
-	r.originCache[label] = originCertCacheItem{loadedAt: time.Now(), certs: append([]cfclient.OriginCACertInfo(nil), certs...), err: err}
-	r.originMu.Unlock()
-	return certs, err
-}
-
-func (r *Runtime) accountByLabel(label string) (config.CF, bool) {
-	label = strings.TrimSpace(label)
-	for _, acc := range r.accounts {
-		if strings.EqualFold(accountCacheLabel(acc), label) ||
-			strings.EqualFold(strings.TrimSpace(acc.Label), label) ||
-			strings.EqualFold(strings.TrimSpace(acc.AccountID), label) ||
-			strings.EqualFold(strings.TrimSpace(acc.Email), label) {
-			return acc, true
-		}
-	}
-	return config.CF{}, false
 }

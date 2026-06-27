@@ -20,6 +20,9 @@ func TestBuildAssetSummaryAndNoAlertCSVReport(t *testing.T) {
 			Certificates: []reminder.CertificateRecord{{
 				Type:     reminder.CertTypeServed,
 				NotAfter: "2026-07-01T00:00:00Z",
+			}, {
+				Type:     reminder.CertTypeCFOrigin,
+				NotAfter: "2026-07-02T00:00:00Z",
 			}},
 		},
 		reminder.RecordKey("acc-a", "b.example.com"): {
@@ -46,7 +49,7 @@ func TestBuildAssetSummaryAndNoAlertCSVReport(t *testing.T) {
 		t.Fatalf("TotalDomains = %d, want 4", summary.TotalDomains)
 	}
 	if summary.TotalCertificates != 1 {
-		t.Fatalf("TotalCertificates = %d, want 1", summary.TotalCertificates)
+		t.Fatalf("TotalCertificates = %d, want 1 reportable HTTPS certificate", summary.TotalCertificates)
 	}
 	if summary.MultiAccountDomains != 1 || summary.TotalAccountLinks != 5 {
 		t.Fatalf("unexpected multi-account summary: %+v", summary)
@@ -83,5 +86,8 @@ func TestBuildAssetSummaryAndNoAlertCSVReport(t *testing.T) {
 	}
 	if !strings.Contains(string(content), "a.example.com") || !strings.Contains(string(content), "shared.example.com") || !strings.Contains(string(content), "账户数") {
 		t.Fatalf("csv content missing expected data:\n%s", string(content))
+	}
+	if strings.Contains(string(content), "Cloudflare Origin CA") {
+		t.Fatalf("legacy Cloudflare Origin CA certificate should not be included in daily asset report:\n%s", string(content))
 	}
 }

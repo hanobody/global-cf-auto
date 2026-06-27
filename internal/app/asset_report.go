@@ -47,6 +47,16 @@ type AssetSourceCount struct {
 	UnknownDomains int
 }
 
+func countReportableCertificates(certs []reminder.CertificateRecord) int {
+	count := 0
+	for _, cert := range certs {
+		if reminder.IsReportableCertificate(cert) {
+			count++
+		}
+	}
+	return count
+}
+
 func BuildAssetSummary(store *reminder.Store) (AssetSummary, error) {
 	if store == nil {
 		return AssetSummary{}, ErrMissingDependencies
@@ -66,7 +76,8 @@ func BuildAssetSummary(store *reminder.Store) (AssetSummary, error) {
 		if len(accounts) > 1 {
 			summary.MultiAccountDomains++
 		}
-		summary.TotalCertificates += len(rec.Certificates)
+		reportableCerts := countReportableCertificates(rec.Certificates)
+		summary.TotalCertificates += reportableCerts
 		for _, acc := range accounts {
 			source := displaySource(acc.Source)
 			item := bySource[source]
@@ -75,7 +86,7 @@ func BuildAssetSummary(store *reminder.Store) (AssetSummary, error) {
 				bySource[source] = item
 			}
 			item.Domains++
-			item.Certificates += len(rec.Certificates)
+			item.Certificates += reportableCerts
 			if acc.Unknown || strings.TrimSpace(acc.Status) == reminder.StatusUnknownAccount {
 				item.UnknownDomains++
 			}
@@ -160,6 +171,9 @@ func buildAllAssetRows(store *reminder.Store, now time.Time) ([]assetReportRow, 
 	for _, rec := range records {
 		rows = append(rows, domainRowFromRecord(rec, now))
 		for _, cert := range rec.Certificates {
+			if !reminder.IsReportableCertificate(cert) {
+				continue
+			}
 			rows = append(rows, certRowFromRecord(rec, cert, now))
 		}
 	}
@@ -436,7 +450,7 @@ func displayCertType(typ string) string {
 	case reminder.CertTypeCFOrigin:
 		return "Cloudflare Origin CA"
 	case reminder.CertTypeServed:
-		return "当前访问证书"
+		return "当前 HTTPS 访问证书"
 	case "":
 		return ""
 	default:
@@ -451,9 +465,9 @@ func certificateDisplayName(cert reminder.CertificateRecord) string {
 	case reminder.CertTypeServed:
 		issuer := strings.ToLower(cert.Issuer)
 		if strings.Contains(issuer, "cloudflare") {
-			return "当前访问证书/Cloudflare 边缘证书"
+			return "当前 HTTPS 访问证书/Cloudflare 边缘证书"
 		}
-		return "当前访问证书/三方签发证书"
+		return "当前 HTTPS 访问证书/三方签发证书"
 	default:
 		return "SSL 证书"
 	}

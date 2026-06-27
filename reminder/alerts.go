@@ -70,6 +70,9 @@ func (r *Runtime) DueAlerts(alertDays int, now time.Time) ([]Alert, error) {
 			}
 		}
 		for _, cert := range rec.Certificates {
+			if !IsReportableCertificate(cert) {
+				continue
+			}
 			if t, ok := parseTimeValue(cert.NotAfter); ok {
 				daysLeft := daysUntil(t, now)
 				if daysLeft <= alertDays && strings.TrimSpace(cert.LastAlertDate) != today {
@@ -158,9 +161,9 @@ func certificateDescription(cert CertificateRecord) string {
 	case CertTypeServed:
 		issuer := strings.ToLower(cert.Issuer)
 		if strings.Contains(issuer, "cloudflare") {
-			return "当前访问证书/Cloudflare 边缘证书"
+			return "当前 HTTPS 访问证书/Cloudflare 边缘证书"
 		}
-		return "当前访问证书/三方签发证书"
+		return "当前 HTTPS 访问证书/三方签发证书"
 	default:
 		return "SSL 证书"
 	}
