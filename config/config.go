@@ -13,6 +13,7 @@ import (
 type Config struct {
 	AlertDays           int         `yaml:"alertDays"`
 	AssetCacheFile      string      `yaml:"assetCacheFile"`
+	AbuseReport         AbuseReport `yaml:"abuseReport"`
 	Telegram            Telegram    `yaml:"telegram"`
 	CloudflareAccounts  []CF        `yaml:"cloudflareAccounts"`
 	CloudflareProvision CFProvision `yaml:"cloudflareProvision"`
@@ -59,6 +60,15 @@ type GoDaddyConfig struct {
 	APIKey    string `yaml:"apiKey"`
 	APISecret string `yaml:"apiSecret"`
 }
+type AbuseReport struct {
+	Enabled    *bool  `yaml:"enabled"`
+	CacheFile  string `yaml:"cacheFile"`
+	ScanHour   int    `yaml:"scanHour"`
+	ScanMinute int    `yaml:"scanMinute"`
+	PerPage    int    `yaml:"perPage"`
+	MaxPages   int    `yaml:"maxPages"`
+}
+
 type AWSCreds struct {
 	AccessKeyID     string `yaml:"accessKeyId"`
 	SecretAccessKey string `yaml:"secretAccessKey"`
@@ -127,6 +137,14 @@ func applyEnvOverrides() {
 	if value := strings.TrimSpace(os.Getenv("TELEGRAM_ALLOWED_CHAT_IDS")); value != "" {
 		Cfg.Telegram.AllowedChatIDs = parseInt64List(value)
 	}
+	if value := strings.TrimSpace(os.Getenv("ABUSE_REPORT_ENABLED")); value != "" {
+		if parsed, ok := parseBool(value); ok {
+			Cfg.AbuseReport.Enabled = &parsed
+		}
+	}
+	if value := strings.TrimSpace(os.Getenv("ABUSE_REPORT_CACHE_FILE")); value != "" {
+		Cfg.AbuseReport.CacheFile = value
+	}
 }
 
 func EffectiveAlertDays() int {
@@ -134,6 +152,61 @@ func EffectiveAlertDays() int {
 		return 7
 	}
 	return Cfg.AlertDays
+}
+
+func AbuseReportEnabled() bool {
+	if Cfg.AbuseReport.Enabled == nil {
+		return true
+	}
+	return *Cfg.AbuseReport.Enabled
+}
+
+func AbuseReportCacheFile() string {
+	value := strings.TrimSpace(Cfg.AbuseReport.CacheFile)
+	if value == "" {
+		return "abuse_report_cache.json"
+	}
+	return value
+}
+
+func AbuseReportScanHour() int {
+	if Cfg.AbuseReport.ScanHour < 0 || Cfg.AbuseReport.ScanHour > 23 {
+		return 15
+	}
+	if Cfg.AbuseReport.ScanHour == 0 && Cfg.AbuseReport.ScanMinute == 0 {
+		return 15
+	}
+	return Cfg.AbuseReport.ScanHour
+}
+
+func AbuseReportScanMinute() int {
+	if Cfg.AbuseReport.ScanMinute < 0 || Cfg.AbuseReport.ScanMinute > 59 {
+		return 30
+	}
+	if Cfg.AbuseReport.ScanHour == 0 && Cfg.AbuseReport.ScanMinute == 0 {
+		return 30
+	}
+	return Cfg.AbuseReport.ScanMinute
+}
+
+func AbuseReportPerPage() int {
+	if Cfg.AbuseReport.PerPage <= 0 {
+		return 50
+	}
+	if Cfg.AbuseReport.PerPage > 100 {
+		return 100
+	}
+	return Cfg.AbuseReport.PerPage
+}
+
+func AbuseReportMaxPages() int {
+	if Cfg.AbuseReport.MaxPages <= 0 {
+		return 5
+	}
+	if Cfg.AbuseReport.MaxPages > 20 {
+		return 20
+	}
+	return Cfg.AbuseReport.MaxPages
 }
 
 func DefaultBlockCountries() []string {

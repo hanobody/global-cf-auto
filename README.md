@@ -7,6 +7,7 @@
 **主要功能**
 
 - 基于本地资产缓存监控域名续费到期、当前 HTTPS 访问 SSL 证书到期，并在到期前提醒。证书到期判断通过 TLS 握手读取站点当前返回的证书链，不调用 Cloudflare Origin CA 列表 API。
+- 每日扫描 Cloudflare 滥用报告，发现新报告后发送一次 Telegram 通知，并通过本地缓存去重，避免重复提醒。
 - 通过 Telegram Bot 提供交互式命令：查询 DNS、添加域名、查看 NS、设置解析、删除域名、导出 CSV。
 - 支持将 DNS 导出为 CSV（按账号/Zone/记录分行）。
 - 内置 Cloudflare API 抽象（`cfclient`），方便替换为测试假实现。
@@ -79,6 +80,36 @@ go build ./...
 ```yaml
 alertDays: 7
 assetCacheFile: "domain_asset_cache.json"
+```
+
+
+**Cloudflare 滥用报告提醒**
+
+- 默认启用，每天定时扫描一次所有配置的 Cloudflare 账号。
+- 默认扫描时间为 15:30，避免和 15:00 的域名/SSL 到期日报互相阻塞。
+- 每个滥用报告按 `账号 + 报告ID` 去重；如果接口没有返回报告 ID，会基于账号、域名、报告类型、日期、摘要、URL 生成稳定哈希。
+- 只有新发现且未通知过的报告才会发送 Telegram，已通知过的报告即使仍处于活动状态也不会重复通知。
+- Telegram 消息会汇总新报告数量、按账号统计，并列出核心内容：账号、域名、报告 ID、报告日期、报告类型、状态、Cloudflare 缓解措施、摘要和相关 URL。
+- 新报告较多时，消息正文只展示前 10 条摘要，完整清单会附带 CSV 文件。
+- 本地去重缓存默认 `abuse_report_cache.json`，可通过配置修改。
+
+配置示例：
+
+```yaml
+abuseReport:
+  enabled: true
+  cacheFile: "abuse_report_cache.json"
+  scanHour: 15
+  scanMinute: 30
+  perPage: 50
+  maxPages: 5
+```
+
+环境变量覆盖：
+
+```bash
+ABUSE_REPORT_ENABLED=true
+ABUSE_REPORT_CACHE_FILE=abuse_report_cache.json
 ```
 
 **Telegram 命令（机器人支持）**

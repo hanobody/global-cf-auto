@@ -73,6 +73,30 @@ type OriginCACertInfo struct {
 	RequestType string
 }
 
+// AbuseReportInfo 是 Cloudflare 滥用报告的统一摘要结构。
+// Cloudflare 的滥用报告接口字段可能随报告类型变化，因此这里保留 Raw 供后续扩展，
+// 同时尽量提取日报通知里最有用的字段。
+type AbuseReportInfo struct {
+	ID           string
+	AccountLabel string
+	AccountID    string
+	Domain       string
+	ReportType   string
+	Status       string
+	Date         time.Time
+	Mitigation   string
+	Title        string
+	Summary      string
+	Reporter     string
+	URLs         []string
+	Raw          map[string]any
+}
+
+type AbuseReportListOptions struct {
+	PerPage  int
+	MaxPages int
+}
+
 // Client 定义了 Cloudflare 相关操作的抽象接口
 type Client interface {
 	FetchAllDomains(ctx context.Context, account config.CF) ([]DomainInfo, error)
@@ -97,6 +121,7 @@ type Client interface {
 	DeleteCustomListItem(ctx context.Context, account config.CF, listID string, itemID string) ([]cloudflare.ListItem, error)
 	SetZoneSSLFullStrict(ctx context.Context, account config.CF, domain string) error
 	GetAbuseReportCount(ctx context.Context, account config.CF) (int, error)
+	ListAbuseReports(ctx context.Context, account config.CF, opts AbuseReportListOptions) ([]AbuseReportInfo, error)
 }
 
 type apiClient struct {
@@ -108,6 +133,9 @@ type apiClient struct {
 
 type abuseReportsResponse struct {
 	ResultInfo struct {
+		Page       int `json:"page"`
+		PerPage    int `json:"per_page"`
+		TotalPages int `json:"total_pages"`
 		TotalCount int `json:"total_count"`
 	} `json:"result_info"`
 	Result json.RawMessage `json:"result"`
@@ -285,6 +313,284 @@ func (c *apiClient) GetAbuseReportCount(ctx context.Context, account config.CF) 
 	}
 	return 0, lastErr
 }
+func (c *apiClient) ListAbuseReports(ctx context.Context, account config.CF, opts AbuseReportListOptions) ([]AbuseReportInfo, error) {
+	ctx, cancel := ensureTimeout(ctx)
+	defer cancel()
+
+	accountID, err := c.GetAccountID(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+
+	perPage := opts.PerPage
+	if perPage <= 0 {
+		perPage = 50
+	}
+	if perPage > 100 {
+		perPage = 100
+	}
+	maxPages := opts.MaxPages
+	if maxPages <= 0 {
+		maxPages = 5
+	}
+
+	reports := make([]AbuseReportInfo, 0)
+	for page := 1; page <= maxPages; page++ {
+		endpoint := fmt.Sprintf("%s/accounts/%s/abuse-reports", strings.TrimRight(c.baseURL, "/"), accountID)
+		q := url.Values{}
+		q.Set("page", fmt.Sprintf("%d", page))
+		q.Set("per_page", fmt.Sprintf("%d", perPage))
+		endpoint += "?" + q.Encode()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("构建滥用报告请求失败 [%s]: %v", account.Label, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+account.APIToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		client := c.httpClient
+		if client == nil {
+			client = http.DefaultClient
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("查询滥用报告失败 [%s]: %v", account.Label, err)
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("读取滥用报告响应失败 [%s]: %v", account.Label, readErr)
+		}
+
+		var result abuseReportsResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, fmt.Errorf("解析滥用报告响应失败 [%s]: %v", account.Label, err)
+		}
+		if resp.StatusCode >= http.StatusBadRequest || !result.Success {
+			detail := strings.TrimSpace(string(body))
+			if len(result.Errors) > 0 {
+				detail = result.Errors[0].Message
+			}
+			return nil, fmt.Errorf("查询滥用报告失败 [%s]: HTTP %d %s", account.Label, resp.StatusCode, strings.TrimSpace(detail))
+		}
+
+		items, err := parseAbuseReportItems(result.Result)
+		if err != nil {
+			return nil, fmt.Errorf("解析滥用报告列表失败 [%s]: %v", account.Label, err)
+		}
+		for _, item := range items {
+			info := normalizeAbuseReport(account.Label, accountID, item)
+			reports = append(reports, info)
+		}
+
+		if len(items) == 0 {
+			break
+		}
+		if result.ResultInfo.TotalPages > 0 && page >= result.ResultInfo.TotalPages {
+			break
+		}
+		if len(items) < perPage && result.ResultInfo.TotalPages == 0 {
+			break
+		}
+	}
+	return reports, nil
+}
+
+func parseAbuseReportItems(raw json.RawMessage) ([]map[string]any, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+
+	var arr []map[string]any
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return arr, nil
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, err
+	}
+	for _, key := range []string{"reports", "items", "data", "result"} {
+		if items := anyToMapSlice(obj[key]); len(items) > 0 {
+			return items, nil
+		}
+	}
+	return []map[string]any{obj}, nil
+}
+
+func anyToMapSlice(v any) []map[string]any {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(arr))
+	for _, item := range arr {
+		if m, ok := item.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func normalizeAbuseReport(accountLabel, accountID string, raw map[string]any) AbuseReportInfo {
+	info := AbuseReportInfo{
+		AccountLabel: accountLabel,
+		AccountID:    accountID,
+		Raw:          raw,
+	}
+	info.ID = firstString(raw, "id", "report_id", "reportId", "uuid", "identifier", "case_id", "caseId")
+	info.Domain = firstDomain(raw)
+	info.ReportType = firstString(raw, "report_type", "reportType", "abuse_type", "abuseType", "type", "category", "reason")
+	info.Status = firstString(raw, "status", "state", "report_status", "reportStatus")
+	info.Mitigation = firstString(raw, "mitigation", "mitigations", "mitigation_status", "mitigationStatus", "mitigation_action", "mitigationAction", "mitigation_actions", "mitigationActions", "action", "actions", "cloudflare_mitigation", "cloudflareMitigation", "cloudflare_mitigations", "cloudflareMitigations")
+	info.Title = firstString(raw, "title", "subject", "name")
+	info.Summary = firstString(raw, "summary", "description", "detail", "message", "notes")
+	info.Reporter = firstString(raw, "reporter", "reporter_email", "reporterEmail", "submitter", "submitted_by", "submittedBy")
+	info.URLs = firstStringList(raw, "urls", "url", "reported_urls", "reportedUrls", "evidence_urls", "evidenceUrls")
+	info.Date = firstTime(raw, "created_at", "createdAt", "created", "reported_at", "reportedAt", "date", "timestamp", "submitted_at", "submittedAt")
+	return info
+}
+
+func firstDomain(raw map[string]any) string {
+	if value := firstString(raw, "zone_name", "zoneName", "zone", "domain", "hostname", "host", "offending_host", "offendingHost"); value != "" {
+		return strings.Trim(strings.TrimSpace(value), ".")
+	}
+	for _, candidate := range firstStringList(raw, "urls", "url", "reported_urls", "reportedUrls", "evidence_urls", "evidenceUrls") {
+		if host := hostFromURL(candidate); host != "" {
+			return host
+		}
+	}
+	return ""
+}
+
+func hostFromURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.Trim(strings.TrimSpace(parsed.Hostname()), ".")
+}
+
+func firstString(raw map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringFromAny(raw[key]); value != "" {
+			return value
+		}
+	}
+	for _, v := range raw {
+		if child, ok := v.(map[string]any); ok {
+			if value := firstString(child, keys...); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func firstStringList(raw map[string]any, keys ...string) []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	for _, key := range keys {
+		switch v := raw[key].(type) {
+		case string:
+			add(v)
+		case []any:
+			for _, item := range v {
+				add(stringFromAny(item))
+			}
+		case []string:
+			for _, item := range v {
+				add(item)
+			}
+		}
+	}
+	return out
+}
+
+func stringFromAny(v any) string {
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case fmt.Stringer:
+		return strings.TrimSpace(x.String())
+	case float64:
+		if x == float64(int64(x)) {
+			return fmt.Sprintf("%d", int64(x))
+		}
+		return fmt.Sprintf("%v", x)
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case map[string]any:
+		return firstString(x, "name", "title", "value", "status", "type", "description", "action")
+	case []string:
+		return strings.Join(x, ", ")
+	case []any:
+		parts := make([]string, 0, len(x))
+		for _, item := range x {
+			if value := stringFromAny(item); value != "" {
+				parts = append(parts, value)
+			}
+		}
+		return strings.Join(parts, ", ")
+	default:
+		return ""
+	}
+}
+
+func firstTime(raw map[string]any, keys ...string) time.Time {
+	for _, key := range keys {
+		if t := parseAnyTime(raw[key]); !t.IsZero() {
+			return t
+		}
+	}
+	for _, v := range raw {
+		if child, ok := v.(map[string]any); ok {
+			if t := firstTime(child, keys...); !t.IsZero() {
+				return t
+			}
+		}
+	}
+	return time.Time{}
+}
+
+func parseAnyTime(v any) time.Time {
+	value := stringFromAny(v)
+	if value == "" {
+		return time.Time{}
+	}
+	formats := []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"}
+	for _, layout := range formats {
+		if t, err := time.Parse(layout, value); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 func parseAbuseResultCount(raw json.RawMessage) (int, error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {

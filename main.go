@@ -90,5 +90,22 @@ func main() {
 		}
 	})
 
+	if config.AbuseReportEnabled() {
+		abuseReportService := &app.AbuseReportService{
+			CFClient:  cfClient,
+			Accounts:  config.Cfg.CloudflareAccounts,
+			Sender:    sender,
+			CacheFile: config.AbuseReportCacheFile(),
+			PerPage:   config.AbuseReportPerPage(),
+			MaxPages:  config.AbuseReportMaxPages(),
+		}
+		sched.ScheduleDaily(ctx, config.AbuseReportScanHour(), config.AbuseReportScanMinute(), func() {
+			log.Printf("开始每日 Cloudflare 滥用报告扫描任务")
+			if err := abuseReportService.RunDaily(ctx); err != nil {
+				log.Printf("每日 Cloudflare 滥用报告扫描任务失败: %v", err)
+			}
+		})
+	}
+
 	<-ctx.Done()
 }

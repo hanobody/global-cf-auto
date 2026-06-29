@@ -133,6 +133,9 @@ func (f *fakeCF) SetZoneSSLFullStrict(ctx context.Context, account config.CF, zo
 func (f *fakeCF) GetAbuseReportCount(ctx context.Context, account config.CF) (int, error) {
 	return 0, nil
 }
+func (f *fakeCF) ListAbuseReports(ctx context.Context, account config.CF, opts cfclient.AbuseReportListOptions) ([]cfclient.AbuseReportInfo, error) {
+	return nil, nil
+}
 func TestNotifierSendsAlertsAndDeletes(t *testing.T) {
 	sender := &fakeSender{}
 	cf := &fakeCF{}
