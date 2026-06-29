@@ -449,7 +449,7 @@ func normalizeAbuseReport(accountLabel, accountID string, raw map[string]any) Ab
 	info.Title = firstString(raw, "title", "subject", "name")
 	info.Summary = firstString(raw, "summary", "description", "detail", "message", "notes")
 	info.Reporter = firstString(raw, "reporter", "reporter_email", "reporterEmail", "submitter", "submitted_by", "submittedBy")
-	info.URLs = firstStringList(raw, "urls", "url", "reported_urls", "reportedUrls", "evidence_urls", "evidenceUrls")
+	info.URLs = firstStringList(raw, "urls", "url", "reported_urls", "reportedUrls", "evidence_urls", "evidenceUrls", "evidence", "content_urls", "contentUrls", "reported_content", "reportedContent", "websites", "links")
 	info.Date = firstTime(raw, "created_at", "createdAt", "created", "reported_at", "reportedAt", "date", "timestamp", "submitted_at", "submittedAt")
 	return info
 }
@@ -458,7 +458,7 @@ func firstDomain(raw map[string]any) string {
 	if value := firstString(raw, "zone_name", "zoneName", "zone", "domain", "hostname", "host", "offending_host", "offendingHost"); value != "" {
 		return strings.Trim(strings.TrimSpace(value), ".")
 	}
-	for _, candidate := range firstStringList(raw, "urls", "url", "reported_urls", "reportedUrls", "evidence_urls", "evidenceUrls") {
+	for _, candidate := range firstStringList(raw, "urls", "url", "reported_urls", "reportedUrls", "evidence_urls", "evidenceUrls", "evidence", "content_urls", "contentUrls", "reported_content", "reportedContent", "websites", "links") {
 		if host := hostFromURL(candidate); host != "" {
 			return host
 		}
@@ -500,7 +500,12 @@ func firstString(raw map[string]any, keys ...string) string {
 func firstStringList(raw map[string]any, keys ...string) []string {
 	seen := map[string]struct{}{}
 	out := []string{}
-	add := func(value string) {
+	keySet := map[string]struct{}{}
+	for _, key := range keys {
+		keySet[strings.ToLower(key)] = struct{}{}
+	}
+	var add func(string)
+	add = func(value string) {
 		value = strings.TrimSpace(value)
 		if value == "" {
 			return
@@ -511,19 +516,38 @@ func firstStringList(raw map[string]any, keys ...string) []string {
 		seen[value] = struct{}{}
 		out = append(out, value)
 	}
-	for _, key := range keys {
-		switch v := raw[key].(type) {
+	var walk func(any, string)
+	walk = func(v any, key string) {
+		key = strings.ToLower(key)
+		_, wanted := keySet[key]
+		switch x := v.(type) {
 		case string:
-			add(v)
-		case []any:
-			for _, item := range v {
-				add(stringFromAny(item))
+			if wanted {
+				add(x)
 			}
 		case []string:
-			for _, item := range v {
-				add(item)
+			if wanted {
+				for _, item := range x {
+					add(item)
+				}
+			}
+		case []any:
+			for _, item := range x {
+				walk(item, key)
+			}
+		case map[string]any:
+			if wanted {
+				if value := stringFromAny(x); value != "" {
+					add(value)
+				}
+			}
+			for childKey, child := range x {
+				walk(child, childKey)
 			}
 		}
+	}
+	for key, value := range raw {
+		walk(value, key)
 	}
 	return out
 }
@@ -545,7 +569,7 @@ func stringFromAny(v any) string {
 		}
 		return "false"
 	case map[string]any:
-		return firstString(x, "name", "title", "value", "status", "type", "description", "action")
+		return firstString(x, "url", "href", "link", "hostname", "host", "domain", "name", "title", "value", "status", "type", "description", "action")
 	case []string:
 		return strings.Join(x, ", ")
 	case []any:
