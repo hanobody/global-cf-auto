@@ -727,7 +727,7 @@ func getNSPostInitOptionsFromRequest(req GetNSInputRequest) getNSPostInitOptions
 
 func parseGetNSBlockCountriesInput(input string) ([]string, error) {
 	input = strings.TrimSpace(input)
-	if input == "" || strings.EqualFold(input, "default") {
+	if input == "" || strings.EqualFold(input, "default") || strings.EqualFold(input, "1") {
 		return cfclient.NormalizeCountryCodes(config.DefaultBlockCountries())
 	}
 	if isNoneValue(input) {
@@ -768,7 +768,7 @@ func BuildGetNSBlockCountriesPrompt(req GetNSInputRequest, errText string) strin
 	sb.WriteString("/getns 已开启安全规则初始化，需要指定要拦截的国家/地区代码。\n")
 	defaultCountries := config.DefaultBlockCountries()
 	if len(defaultCountries) > 0 {
-		sb.WriteString("发送 default 使用配置默认: " + strings.Join(defaultCountries, ",") + "\n")
+		sb.WriteString("发送 1 使用配置默认: " + strings.Join(defaultCountries, ",") + "\n")
 	}
 	sb.WriteString("请输入 ISO 3166-1 alpha-2 代码，逗号分隔，例如 CN,RU,KP。")
 	return sb.String()

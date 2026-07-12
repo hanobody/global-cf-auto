@@ -47,20 +47,29 @@ func (NoopSender) EditMessageWithButtons(ctx context.Context, chatID int64, mess
 }
 func (NoopSender) ClearButtons(ctx context.Context, chatID int64, messageID int) error { return nil }
 func (NoopSender) AnswerCallback(ctx context.Context, callbackID, text string) error   { return nil }
-func (NoopSender) SendHTML(ctx context.Context, msg string) error                       { return nil }
+func (NoopSender) SendHTML(ctx context.Context, msg string) error                      { return nil }
 
 // BotSender 实现了带简单重试和节流的 Telegram 发送能力。
 type BotSender struct {
 	bot        *tgbotapi.BotAPI
-	chatID     int64
+	chatIDs    []int64
 	retryTimes int
 	rate       *time.Ticker
 	timeout    time.Duration
 }
 
+// NewBotSender keeps the original single-chat API for existing callers.
 func NewBotSender(token string, chatID int64, retryTimes int, rateInterval time.Duration, timeout time.Duration) (*BotSender, error) {
+	return NewMultiBotSender(token, []int64{chatID}, retryTimes, rateInterval, timeout)
+}
+
+// NewMultiBotSender creates a sender that broadcasts messages to every chat ID.
+func NewMultiBotSender(token string, chatIDs []int64, retryTimes int, rateInterval time.Duration, timeout time.Duration) (*BotSender, error) {
 	if token == "" {
 		return nil, errors.New("telegram token is empty")
+	}
+	if len(chatIDs) == 0 {
+		return nil, errors.New("telegram chatIDs is empty")
 	}
 	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
@@ -68,7 +77,7 @@ func NewBotSender(token string, chatID int64, retryTimes int, rateInterval time.
 	}
 	sender := &BotSender{
 		bot:        bot,
-		chatID:     chatID,
+		chatIDs:    append([]int64(nil), chatIDs...),
 		retryTimes: retryTimes,
 		rate:       time.NewTicker(rateInterval),
 		timeout:    timeout,
@@ -80,23 +89,29 @@ func NewBotSender(token string, chatID int64, retryTimes int, rateInterval time.
 const tgMaxLen = 3800
 
 func (s *BotSender) Send(ctx context.Context, msg string) error {
-	parts := splitTelegramText(msg, tgMaxLen)
-	for i, p := range parts {
-		// 可选：给多段加个序号，方便看
-		if len(parts) > 1 {
-			p = fmt.Sprintf("(%d/%d)\n%s", i+1, len(parts), p)
-		}
-		if err := s.sendWithMarkup(ctx, tgbotapi.NewMessage(s.chatID, p)); err != nil {
-			return err
+	for _, chatID := range s.chatIDs {
+		parts := splitTelegramText(msg, tgMaxLen)
+		for i, p := range parts {
+			if len(parts) > 1 {
+				p = fmt.Sprintf("(%d/%d)\n%s", i+1, len(parts), p)
+			}
+			if err := s.sendWithMarkup(ctx, tgbotapi.NewMessage(chatID, p)); err != nil {
+				return fmt.Errorf("发送到群组 %d: %w", chatID, err)
+			}
 		}
 	}
 	return nil
 }
 
 func (s *BotSender) SendWithButtons(ctx context.Context, msg string, buttons [][]Button) error {
-	message := tgbotapi.NewMessage(s.chatID, msg)
-	message.ReplyMarkup = buildInlineKeyboardMarkup(buttons)
-	return s.sendWithMarkup(ctx, message)
+	for _, chatID := range s.chatIDs {
+		message := tgbotapi.NewMessage(chatID, msg)
+		message.ReplyMarkup = buildInlineKeyboardMarkup(buttons)
+		if err := s.sendWithMarkup(ctx, message); err != nil {
+			return fmt.Errorf("发送到群组 %d: %w", chatID, err)
+		}
+	}
+	return nil
 }
 
 func (s *BotSender) SendHTML(ctx context.Context, msg string) error {
@@ -108,9 +123,14 @@ func (s *BotSender) SendHTML(ctx context.Context, msg string) error {
 		return fmt.Errorf("HTML 消息过长: %d", len(msg))
 	}
 
-	message := tgbotapi.NewMessage(s.chatID, msg)
-	message.ParseMode = tgbotapi.ModeHTML
-	return s.sendWithMarkup(ctx, message)
+	for _, chatID := range s.chatIDs {
+		message := tgbotapi.NewMessage(chatID, msg)
+		message.ParseMode = tgbotapi.ModeHTML
+		if err := s.sendWithMarkup(ctx, message); err != nil {
+			return fmt.Errorf("发送到群组 %d: %w", chatID, err)
+		}
+	}
+	return nil
 }
 func splitTelegramText(s string, limit int) []string {
 	s = strings.TrimSpace(s)
@@ -212,6 +232,15 @@ func (s *BotSender) SendDocumentPath(ctx context.Context, filepath string, capti
 		return errors.New("filepath is empty")
 	}
 
+	for _, chatID := range s.chatIDs {
+		if err := s.sendDocumentTo(ctx, chatID, filepath, caption); err != nil {
+			return fmt.Errorf("发送文件到群组 %d: %w", chatID, err)
+		}
+	}
+	return nil
+}
+
+func (s *BotSender) sendDocumentTo(ctx context.Context, chatID int64, filepath string, caption string) error {
 	for attempt := 0; attempt <= s.retryTimes; attempt++ {
 		select {
 		case <-ctx.Done():
@@ -226,7 +255,7 @@ func (s *BotSender) SendDocumentPath(ctx context.Context, filepath string, capti
 			}
 
 			go func() {
-				doc := tgbotapi.NewDocument(s.chatID, tgbotapi.FilePath(filepath))
+				doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filepath))
 				if caption != "" {
 					doc.Caption = caption
 				}

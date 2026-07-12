@@ -26,6 +26,7 @@ type Config struct {
 type Telegram struct {
 	BotToken       string  `yaml:"botToken"`
 	ChatID         int64   `yaml:"chatID"`
+	ChatIDs        []int64 `yaml:"chatIDs"`
 	AllowedChatIDs []int64 `yaml:"allowedChatIds"`
 }
 
@@ -271,10 +272,43 @@ func IsTelegramChatAllowed(chatID int64) bool {
 		}
 		return false
 	}
-	if Cfg.Telegram.ChatID == 0 {
+	chatIDs := TelegramChatIDs()
+	if len(chatIDs) == 0 {
 		return true
 	}
-	return Cfg.Telegram.ChatID == chatID
+	for _, allowed := range chatIDs {
+		if allowed == chatID {
+			return true
+		}
+	}
+	return false
+}
+
+// TelegramChatIDs returns the configured broadcast destinations. chatIDs is the
+// preferred multi-chat setting; chatID and allowedChatIds remain supported for
+// backwards compatibility.
+func TelegramChatIDs() []int64 {
+	configured := Cfg.Telegram.ChatIDs
+	if len(configured) == 0 && Cfg.Telegram.ChatID != 0 {
+		configured = []int64{Cfg.Telegram.ChatID}
+	}
+	if len(configured) == 0 {
+		configured = Cfg.Telegram.AllowedChatIDs
+	}
+
+	seen := make(map[int64]struct{}, len(configured))
+	out := make([]int64, 0, len(configured))
+	for _, chatID := range configured {
+		if chatID == 0 {
+			continue
+		}
+		if _, exists := seen[chatID]; exists {
+			continue
+		}
+		seen[chatID] = struct{}{}
+		out = append(out, chatID)
+	}
+	return out
 }
 
 func splitConfigList(raw string) []string {

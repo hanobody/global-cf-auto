@@ -494,17 +494,6 @@ func (h *CommandHandler) handlePendingOriginSSLBlockCountries(msgText string, us
 		return
 	}
 
-	countries, err := parseOriginSSLBlockCountriesInput(msgText)
-	if err != nil {
-		h.sendText(BuildOriginSSLBlockCountriesPrompt(req, err.Error()))
-		return
-	}
-	_, ok := SetOriginSSLDomainBlockCountries(req.SessionID, countries)
-	if !ok {
-		ClearPendingOriginSSLInput(userID)
-		h.sendText("/ssl 域名选择已过期，请重新执行 /ssl。")
-		return
-	}
 	items, ok := SelectedOriginSSLDomainItems(req.SessionID)
 	if !ok || len(items) == 0 {
 		ClearPendingOriginSSLInput(userID)
@@ -620,21 +609,6 @@ func BuildOriginSSLInputPrompt(req OriginSSLInputRequest) string {
 		sb.WriteString(strings.Join(formatAWSTargets(req.AWSAliases), ", "))
 	}
 	sb.WriteString("\n\n请直接发送一个或多个主域名，支持多行、空格、逗号或分号分隔。\n示例：\nexample.com\nexample.net")
-	return sb.String()
-}
-
-func BuildOriginSSLBlockCountriesPrompt(req OriginSSLInputRequest, errText string) string {
-	var sb strings.Builder
-	if errText != "" {
-		sb.WriteString("国家/地区代码格式错误: " + errText + "\n\n")
-	}
-	sb.WriteString("/ssl 将在创建证书后创建 WAF 国家/地区拦截规则。\n")
-	defaultCountries := config.DefaultBlockCountries()
-	if len(defaultCountries) > 0 {
-		sb.WriteString("发送 default 使用配置默认: " + strings.Join(defaultCountries, ",") + "\n")
-	}
-	sb.WriteString("请输入要拦截的 ISO 3166-1 alpha-2 代码，逗号分隔，例如 CN,RU,KP。\n")
-	sb.WriteString("发送 none 跳过国家/地区拦截。")
 	return sb.String()
 }
 

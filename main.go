@@ -26,9 +26,9 @@ func main() {
 	cfClient := cfclient.NewClient()
 	registrarManager := registrarclient.NewManager(nil, config.Cfg.Registrars)
 	var sender telegram.Sender
-	botSender, err := telegram.NewBotSender(
+	botSender, err := telegram.NewMultiBotSender(
 		config.Cfg.Telegram.BotToken,
-		int64(config.Cfg.Telegram.ChatID),
+		config.TelegramChatIDs(),
 		2,
 		time.Second,
 		10*time.Second,
@@ -69,7 +69,7 @@ func main() {
 			summary.ScannedAccounts, summary.ConfiguredAccounts, summary.DomainsSeen, summary.Added, summary.Updated, summary.MarkedUnknown, summary.QueuedRefresh)
 	}()
 
-	commandHandler := telegram.NewCommandHandler(cfClient, registrarManager, sender, config.Cfg.CloudflareAccounts, int64(config.Cfg.Telegram.ChatID))
+	commandHandler := telegram.NewCommandHandler(cfClient, registrarManager, sender, config.Cfg.CloudflareAccounts, 0)
 
 	go func() {
 		if err := sender.StartListener(ctx, callback.HandleCallback, commandHandler.HandleMessage); err != nil {
