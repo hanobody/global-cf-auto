@@ -134,7 +134,7 @@ func (h *CommandHandler) sendIPListListSelector(account config.CF) {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("【IP 白名单】\n账号: %s\n请选择要操作的名单：\n", account.Label))
+	sb.WriteString(fmt.Sprintf("【IP 白名单】\n账号: %s\n请选择要操作的名单，或直接进入全部 IP 删除选择：\n", account.Label))
 	for i, list := range lists {
 		sb.WriteString(fmt.Sprintf("%d. %s (%d)\n", i+1, list.Name, list.NumItems))
 	}
@@ -145,7 +145,14 @@ func (h *CommandHandler) sendIPListListSelector(account config.CF) {
 }
 
 func buildIPListListButtons(accountLabel string, lists []cloudflare.List) [][]Button {
-	buttons := make([][]Button, 0, len(lists))
+	buttons := make([][]Button, 0, len(lists)+1)
+	accountToken := SetIPListCallbackPayload(IPListCallbackPayload{
+		AccountLabel: accountLabel,
+	})
+	buttons = append(buttons, []Button{{
+		Text:         "删除IP（全部名单）",
+		CallbackData: fmt.Sprintf("iplist_delete_account|%s", accountToken),
+	}})
 	for _, list := range lists {
 		token := SetIPListCallbackPayload(IPListCallbackPayload{
 			AccountLabel: accountLabel,

@@ -33,7 +33,7 @@ func (h *CommandHandler) HandleMessage(msg *tgbotapi.Message) {
 	if msg == nil {
 		return
 	}
-	if h.ChatID != 0 && msg.Chat != nil && msg.Chat.ID != h.ChatID {
+	if msg.Chat != nil && !config.IsTelegramChatAllowed(msg.Chat.ID) {
 		return
 	}
 	if !msg.IsCommand() {
@@ -44,7 +44,13 @@ func (h *CommandHandler) HandleMessage(msg *tgbotapi.Message) {
 			if h.handlePendingDeleteInput(msg.Text, msg.From.ID) {
 				return
 			}
+			if h.handlePendingSetDNSInput(msg.Text, msg.From.ID) {
+				return
+			}
 			if h.handlePendingGetNSInput(msg.Text, msg.From.ID) {
+				return
+			}
+			if h.handlePendingCFRulesInput(msg.Text, msg.From.ID) {
 				return
 			}
 			if h.handlePendingIPListInput(msg.Text, msg.From.ID) {
@@ -82,6 +88,14 @@ func (h *CommandHandler) HandleMessage(msg *tgbotapi.Message) {
 		go h.handleDelDNSCommand(args)
 	case "iplist":
 		go h.handleIPListCommand(args)
+	case "cf_add":
+		go h.handleCFProvisionCommand("cf_add", args)
+	case "cf_init":
+		go h.handleCFProvisionCommand("cf_init", args)
+	case "cf_rules":
+		go h.handleCFRulesCommand(args)
+	case "cf_ipblock", "ipblock":
+		go h.handleCFIPBlockCommand(args)
 	}
 
 }

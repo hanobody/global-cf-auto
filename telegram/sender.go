@@ -17,6 +17,7 @@ type Sender interface {
 	StartListener(ctx context.Context, handleCallback func(cb *tgbotapi.CallbackQuery), handleMessage func(msg *tgbotapi.Message)) error
 	SendDocumentPath(ctx context.Context, filepath string, caption string) error
 	EditButtons(ctx context.Context, chatID int64, messageID int, buttons [][]Button) error
+	EditMessageWithButtons(ctx context.Context, chatID int64, messageID int, msg string, buttons [][]Button) error
 	ClearButtons(ctx context.Context, chatID int64, messageID int) error
 	AnswerCallback(ctx context.Context, callbackID, text string) error
 }
@@ -39,6 +40,9 @@ func (NoopSender) StartListener(ctx context.Context, handleCallback func(cb *tgb
 	return nil
 }
 func (NoopSender) EditButtons(ctx context.Context, chatID int64, messageID int, buttons [][]Button) error {
+	return nil
+}
+func (NoopSender) EditMessageWithButtons(ctx context.Context, chatID int64, messageID int, msg string, buttons [][]Button) error {
 	return nil
 }
 func (NoopSender) ClearButtons(ctx context.Context, chatID int64, messageID int) error { return nil }
@@ -91,15 +95,7 @@ func (s *BotSender) Send(ctx context.Context, msg string) error {
 
 func (s *BotSender) SendWithButtons(ctx context.Context, msg string, buttons [][]Button) error {
 	message := tgbotapi.NewMessage(s.chatID, msg)
-	var rows [][]tgbotapi.InlineKeyboardButton
-	for _, r := range buttons {
-		var row []tgbotapi.InlineKeyboardButton
-		for _, b := range r {
-			row = append(row, tgbotapi.NewInlineKeyboardButtonData(b.Text, b.CallbackData))
-		}
-		rows = append(rows, row)
-	}
-	message.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	message.ReplyMarkup = buildInlineKeyboardMarkup(buttons)
 	return s.sendWithMarkup(ctx, message)
 }
 
@@ -301,6 +297,18 @@ func (s *BotSender) requestWithRetry(ctx context.Context, cfg tgbotapi.Chattable
 }
 
 func (s *BotSender) EditButtons(ctx context.Context, chatID int64, messageID int, buttons [][]Button) error {
+	markup := buildInlineKeyboardMarkup(buttons)
+	edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, markup)
+	return s.requestWithRetry(ctx, edit)
+}
+
+func (s *BotSender) EditMessageWithButtons(ctx context.Context, chatID int64, messageID int, msg string, buttons [][]Button) error {
+	markup := buildInlineKeyboardMarkup(buttons)
+	edit := tgbotapi.NewEditMessageTextAndMarkup(chatID, messageID, msg, markup)
+	return s.requestWithRetry(ctx, edit)
+}
+
+func buildInlineKeyboardMarkup(buttons [][]Button) tgbotapi.InlineKeyboardMarkup {
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for _, r := range buttons {
 		var row []tgbotapi.InlineKeyboardButton
@@ -309,9 +317,7 @@ func (s *BotSender) EditButtons(ctx context.Context, chatID int64, messageID int
 		}
 		rows = append(rows, row)
 	}
-	markup := tgbotapi.NewInlineKeyboardMarkup(rows...)
-	edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, markup)
-	return s.requestWithRetry(ctx, edit)
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
 
 func (s *BotSender) ClearButtons(ctx context.Context, chatID int64, messageID int) error {

@@ -49,6 +49,9 @@ func (f *fakeSender) SendDocumentPath(ctx context.Context, filepath string, capt
 func (f *fakeSender) EditButtons(ctx context.Context, chatID int64, messageID int, buttons [][]telegram.Button) error {
 	return nil
 }
+func (f *fakeSender) EditMessageWithButtons(ctx context.Context, chatID int64, messageID int, msg string, buttons [][]telegram.Button) error {
+	return nil
+}
 func (f *fakeSender) ClearButtons(ctx context.Context, chatID int64, messageID int) error {
 	return nil
 }
@@ -84,11 +87,20 @@ func (f *fakeCF) CreateZone(ctx context.Context, account config.CF, domain strin
 func (f *fakeCF) UpsertDNSRecord(ctx context.Context, account config.CF, domain string, params cfclient.DNSRecordParams) (cloudflare.DNSRecord, error) {
 	return cloudflare.DNSRecord{}, nil
 }
+func (f *fakeCF) UpdateDNSRecord(ctx context.Context, account config.CF, domain string, params cfclient.DNSRecordUpdateParams) (cloudflare.DNSRecord, error) {
+	return cloudflare.DNSRecord{}, nil
+}
 func (f *fakeCF) DeleteDNSRecord(ctx context.Context, account config.CF, domain string, recordName string) (int, error) {
 	return 0, nil
 }
 func (f *fakeCF) ListZones(ctx context.Context, account config.CF) ([]cfclient.ZoneDetail, error) {
 	return nil, nil
+}
+func (f *fakeCF) ListZoneSummaries(ctx context.Context, account config.CF) ([]cfclient.ZoneSummary, error) {
+	return nil, nil
+}
+func (f *fakeCF) ApplyRecommendedSpeedSettings(ctx context.Context, account config.CF, zoneID string) []cfclient.ZoneSettingResult {
+	return nil
 }
 func (f *fakeCF) PurgeZoneCache(ctx context.Context, account config.CF, zoneID string) error {
 	return nil
@@ -120,6 +132,9 @@ func (f *fakeCF) SetZoneSSLFullStrict(ctx context.Context, account config.CF, zo
 }
 func (f *fakeCF) GetAbuseReportCount(ctx context.Context, account config.CF) (int, error) {
 	return 0, nil
+}
+func (f *fakeCF) ListAbuseReports(ctx context.Context, account config.CF, opts cfclient.AbuseReportListOptions) ([]cfclient.AbuseReportInfo, error) {
+	return nil, nil
 }
 func TestNotifierSendsAlertsAndDeletes(t *testing.T) {
 	sender := &fakeSender{}

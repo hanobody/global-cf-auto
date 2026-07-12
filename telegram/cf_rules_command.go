@@ -1,0 +1,863 @@
+package telegram
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"DomainC/cfclient"
+	"DomainC/config"
+)
+
+const (
+	cfRulesItemsPerPage        = 8
+	cfRulesPerAccountInterval  = 2500 * time.Millisecond
+	cfRulesAllAccountsMaxLines = 80
+)
+
+type CFRulesDomainItem struct {
+	Key          string
+	AccountLabel string
+	ZoneID       string
+	Name         string
+	Status       string
+	Plan         string
+}
+
+type CFRulesSelection struct {
+	AccountLabel string
+	Items        []CFRulesDomainItem
+	Selected     map[string]bool
+	Page         int
+}
+
+type CFRulesCallbackPayload struct {
+	AccountLabel string
+	SessionID    string
+	ItemKey      string
+	Page         int
+	Action       string
+	Feature      string
+}
+
+type CFRulesInputRequest struct {
+	AccountLabel string
+	SessionID    string
+	Action       string
+	Feature      string
+}
+
+type CFRulesBatchResult struct {
+	AccountLabel string
+	Action       string
+	Feature      string
+	Success      []cfclient.FeatureManageResult
+	Failed       []string
+}
+
+type CFRulesAllAccountsResult struct {
+	Action         string
+	Feature        string
+	BlockCountries []string
+	Accounts       []CFRulesBatchResult
+	Failed         []string
+}
+
+type cloudflareFeatureManager interface {
+	ManageZoneFeatures(ctx context.Context, account config.CF, domain string, zoneID string, opts cfclient.FeatureManageOptions) cfclient.FeatureManageResult
+}
+
+var cfRulesState = struct {
+	mu        sync.Mutex
+	callbacks map[string]CFRulesCallbackPayload
+	sessions  map[string]CFRulesSelection
+	pending   map[int64]CFRulesInputRequest
+}{
+	callbacks: make(map[string]CFRulesCallbackPayload),
+	sessions:  make(map[string]CFRulesSelection),
+	pending:   make(map[int64]CFRulesInputRequest),
+}
+
+func (h *CommandHandler) handleCFRulesCommand(args []string) {
+	if len(h.Accounts) == 0 {
+		h.sendText("未配置可用的 Cloudflare 账号，无法检查规则。")
+		return
+	}
+	if len(args) == 0 {
+		h.sendCFRulesAccountSelector()
+		return
+	}
+
+	if isCFRulesAllAccountsArg(args[0]) {
+		action, feature, blockCountries, err := parseCFRulesAllAccountsArgs(args[1:])
+		if err != nil {
+			h.sendText(err.Error())
+			return
+		}
+		if CFRulesNeedsBlockCountries(action, feature) && len(blockCountries) == 0 {
+			h.sendText("启用国家/地区安全规则需要代码。SQL 拦截示例：/cf_rules all sql；国家拦截示例：/cf_rules all security block=AM,HK")
+			return
+		}
+		accounts := append([]config.CF(nil), h.Accounts...)
+		go func() {
+			result := ProcessCFRulesAllAccounts(context.Background(), h.CFClient, accounts, action, feature, blockCountries)
+			h.sendText(result.Summary())
+		}()
+		h.sendText(fmt.Sprintf("Cloudflare 全账号规则检查任务已提交：账号 %d，动作 %s，功能 %s，国家拦截 %s。账号之间并发执行，每个账号内部限速 %s/域名。",
+			len(accounts), action, feature, formatCFRulesBlockCountries(feature, blockCountries), cfRulesPerAccountInterval))
+		return
+	}
+
+	account := h.getAccountByLabel(args[0])
+	if account == nil {
+		h.sendText("未找到 Cloudflare 账号：" + args[0])
+		return
+	}
+	if len(args) == 1 {
+		h.sendText(fmt.Sprintf("正在读取账号 %s 下所有域名，请稍候。", account.Label))
+		if err := BeginCFRulesDomainSelection(context.Background(), h.CFClient, h.Sender, *account); err != nil {
+			h.sendText(fmt.Sprintf("读取域名失败: %v", err))
+		}
+		return
+	}
+
+	domain, err := extractDomainOrHost(args[1])
+	if err != nil && !strings.EqualFold(args[1], "all") {
+		h.sendText(fmt.Sprintf("%s: %v", args[1], err))
+		return
+	}
+	action := "enable"
+	feature := "all"
+	blockCountries := config.DefaultBlockCountries()
+	for _, arg := range args[2:] {
+		key, value, ok := strings.Cut(arg, "=")
+		if !ok {
+			if parsedFeature := normalizeCFRulesFeature(arg); parsedFeature != "" {
+				feature = parsedFeature
+				continue
+			}
+			if parsedAction := normalizeCFRulesAction(arg); parsedAction != "" {
+				action = parsedAction
+				continue
+			}
+			h.sendText("无法识别参数：" + arg)
+			return
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "action":
+			action = normalizeCFRulesAction(value)
+			if action == "" {
+				h.sendText("action 参数必须是 enable/update/on 或 disable/delete/off")
+				return
+			}
+		case "feature":
+			feature = normalizeCFRulesFeature(value)
+			if feature == "" {
+				h.sendText("feature 参数必须是 all/security/sql/speed/cache")
+				return
+			}
+		case "block", "blocks", "country", "countries":
+			if isNoneValue(value) {
+				blockCountries = nil
+				continue
+			}
+			countries, err := cfclient.NormalizeCountryCodes([]string{value})
+			if err != nil {
+				h.sendText(fmt.Sprintf("block 参数错误：%v", err))
+				return
+			}
+			blockCountries = countries
+		}
+	}
+	if CFRulesNeedsBlockCountries(action, feature) && len(blockCountries) == 0 {
+		h.sendText("启用国家/地区安全规则需要代码。请使用 block=CN,RU，或配置 CF_DEFAULT_BLOCK_COUNTRIES。SQL 拦截可直接使用 feature=sql。")
+		return
+	}
+
+	zones, err := h.CFClient.ListZones(context.Background(), *account)
+	if err != nil {
+		h.sendText(fmt.Sprintf("读取域名失败: %v", err))
+		return
+	}
+	items := buildCFRulesDomainItemsFromZones(account.Label, zones)
+	if !strings.EqualFold(args[1], "all") {
+		items = filterCFRulesDomainItems(items, domain)
+	}
+	if len(items) == 0 {
+		h.sendText("没有匹配的域名。")
+		return
+	}
+	go func() {
+		result := ProcessCFRulesItems(context.Background(), h.CFClient, *account, items, action, feature, blockCountries)
+		h.sendText(result.Summary())
+	}()
+	h.sendText(fmt.Sprintf("Cloudflare 规则检查任务已提交：账号 %s，域名 %d，动作 %s，功能 %s", account.Label, len(items), action, feature))
+}
+
+func (h *CommandHandler) sendCFRulesAccountSelector() {
+	var buttons [][]Button
+	for _, acc := range h.Accounts {
+		label := strings.TrimSpace(acc.Label)
+		if label == "" {
+			continue
+		}
+		token := SetCFRulesCallbackPayload(CFRulesCallbackPayload{AccountLabel: label})
+		buttons = append(buttons, []Button{{
+			Text:         label,
+			CallbackData: fmt.Sprintf("cfrules_account|%s", token),
+		}})
+	}
+	msg := "请选择要检查规则的 Cloudflare 账号：\n\n批量所有账号 SQL 拦截示例：\n/cf_rules all sql\n\n批量所有账号国家拦截示例：\n/cf_rules all security block=AM,HK"
+	if err := h.Sender.SendWithButtons(context.Background(), msg, buttons); err != nil {
+		h.sendText(fmt.Sprintf("发送账号选择失败: %v", err))
+	}
+}
+
+func SetCFRulesCallbackPayload(payload CFRulesCallbackPayload) string {
+	token := newInteractionToken()
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	cfRulesState.callbacks[token] = payload
+	return token
+}
+
+func GetCFRulesCallbackPayload(token string) (CFRulesCallbackPayload, bool) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	payload, ok := cfRulesState.callbacks[token]
+	return payload, ok
+}
+
+func SetCFRulesSelection(selection CFRulesSelection) string {
+	sessionID := newInteractionToken()
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	cfRulesState.sessions[sessionID] = cloneCFRulesSelection(selection)
+	return sessionID
+}
+
+func GetCFRulesSelection(sessionID string) (CFRulesSelection, bool) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	selection, ok := cfRulesState.sessions[sessionID]
+	if !ok {
+		return CFRulesSelection{}, false
+	}
+	return cloneCFRulesSelection(selection), true
+}
+
+func ToggleCFRulesSelectionItem(sessionID string, key string) (CFRulesSelection, bool) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	selection, ok := cfRulesState.sessions[sessionID]
+	if !ok {
+		return CFRulesSelection{}, false
+	}
+	if selection.Selected == nil {
+		selection.Selected = make(map[string]bool)
+	}
+	if selection.Selected[key] {
+		delete(selection.Selected, key)
+	} else {
+		selection.Selected[key] = true
+	}
+	cfRulesState.sessions[sessionID] = selection
+	return cloneCFRulesSelection(selection), true
+}
+
+func SelectAllCFRulesDomains(sessionID string) (CFRulesSelection, bool) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	selection, ok := cfRulesState.sessions[sessionID]
+	if !ok {
+		return CFRulesSelection{}, false
+	}
+	if selection.Selected == nil {
+		selection.Selected = make(map[string]bool)
+	}
+	for _, item := range selection.Items {
+		selection.Selected[item.Key] = true
+	}
+	cfRulesState.sessions[sessionID] = selection
+	return cloneCFRulesSelection(selection), true
+}
+
+func SetCFRulesSelectionPage(sessionID string, page int) (CFRulesSelection, bool) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	selection, ok := cfRulesState.sessions[sessionID]
+	if !ok {
+		return CFRulesSelection{}, false
+	}
+	selection.Page = page
+	cfRulesState.sessions[sessionID] = selection
+	return cloneCFRulesSelection(selection), true
+}
+
+func SelectedCFRulesDomainItems(sessionID string) ([]CFRulesDomainItem, bool) {
+	selection, ok := GetCFRulesSelection(sessionID)
+	if !ok {
+		return nil, false
+	}
+	items := make([]CFRulesDomainItem, 0, len(selection.Selected))
+	for _, item := range selection.Items {
+		if selection.Selected[item.Key] {
+			items = append(items, item)
+		}
+	}
+	return items, true
+}
+
+func ClearCFRulesSelection(sessionID string) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	delete(cfRulesState.sessions, sessionID)
+}
+
+func SetPendingCFRulesInput(userID int64, req CFRulesInputRequest) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	cfRulesState.pending[userID] = req
+}
+
+func ClearPendingCFRulesInput(userID int64) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	delete(cfRulesState.pending, userID)
+}
+
+func getPendingCFRulesInput(userID int64) (CFRulesInputRequest, bool) {
+	cfRulesState.mu.Lock()
+	defer cfRulesState.mu.Unlock()
+	req, ok := cfRulesState.pending[userID]
+	return req, ok
+}
+
+func cloneCFRulesSelection(selection CFRulesSelection) CFRulesSelection {
+	out := CFRulesSelection{
+		AccountLabel: selection.AccountLabel,
+		Items:        append([]CFRulesDomainItem(nil), selection.Items...),
+		Selected:     make(map[string]bool, len(selection.Selected)),
+		Page:         selection.Page,
+	}
+	for key, selected := range selection.Selected {
+		out.Selected[key] = selected
+	}
+	return out
+}
+
+func BeginCFRulesDomainSelection(ctx context.Context, client cfclient.Client, sender Sender, account config.CF) error {
+	zones, err := client.ListZones(ctx, account)
+	if err != nil {
+		return err
+	}
+	items := buildCFRulesDomainItemsFromZones(account.Label, zones)
+	if len(items) == 0 {
+		return sender.Send(ctx, fmt.Sprintf("账号 %s 暂无域名。", account.Label))
+	}
+	sessionID := SetCFRulesSelection(CFRulesSelection{
+		AccountLabel: account.Label,
+		Items:        items,
+		Selected:     make(map[string]bool),
+	})
+	selection, _ := GetCFRulesSelection(sessionID)
+	page := BuildCFRulesDomainSelectionView(sessionID, selection)
+	return sender.SendWithButtons(ctx, page.Message, page.Buttons)
+}
+
+func buildCFRulesDomainItems(accountLabel string, zones []cfclient.ZoneSummary) []CFRulesDomainItem {
+	items := make([]CFRulesDomainItem, 0, len(zones))
+	for _, zone := range zones {
+		name := strings.TrimSpace(strings.ToLower(zone.Name))
+		if name == "" {
+			continue
+		}
+		key := strings.TrimSpace(zone.ID)
+		if key == "" {
+			key = name
+		}
+		items = append(items, CFRulesDomainItem{
+			Key:          key,
+			AccountLabel: accountLabel,
+			ZoneID:       zone.ID,
+			Name:         name,
+			Status:       zone.Status,
+			Plan:         zone.Plan,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
+	return items
+}
+
+func buildCFRulesDomainItemsFromZones(accountLabel string, zones []cfclient.ZoneDetail) []CFRulesDomainItem {
+	items := make([]CFRulesDomainItem, 0, len(zones))
+	for _, zone := range zones {
+		name := strings.TrimSpace(strings.ToLower(zone.Name))
+		if name == "" {
+			continue
+		}
+		key := strings.TrimSpace(zone.ID)
+		if key == "" {
+			key = name
+		}
+		items = append(items, CFRulesDomainItem{
+			Key:          key,
+			AccountLabel: accountLabel,
+			ZoneID:       zone.ID,
+			Name:         name,
+			Status:       zone.Status,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
+	return items
+}
+
+func filterCFRulesDomainItems(items []CFRulesDomainItem, domain string) []CFRulesDomainItem {
+	out := make([]CFRulesDomainItem, 0, 1)
+	for _, item := range items {
+		if strings.EqualFold(item.Name, domain) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func BuildCFRulesDomainSelectionView(sessionID string, selection CFRulesSelection) IPListPage {
+	totalPages := pageCount(len(selection.Items), cfRulesItemsPerPage)
+	page := clampPage(selection.Page, totalPages)
+	start := page * cfRulesItemsPerPage
+	end := start + cfRulesItemsPerPage
+	if end > len(selection.Items) {
+		end = len(selection.Items)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("【Cloudflare 规则检查】\n账号: %s\n页码: %d/%d\n已选择: %d/%d\n\n",
+		selection.AccountLabel, page+1, totalPages, countSelected(selection.Selected), len(selection.Items)))
+	for i := start; i < end; i++ {
+		item := selection.Items[i]
+		sb.WriteString(fmt.Sprintf("%d. %s | %s | %s\n", i+1, item.Name, normalizeDisplayValue(item.Status), normalizeDisplayValue(item.Plan)))
+	}
+
+	var buttons [][]Button
+	for i := start; i < end; i++ {
+		item := selection.Items[i]
+		mark := "☐"
+		if selection.Selected[item.Key] {
+			mark = "☑"
+		}
+		token := SetCFRulesCallbackPayload(CFRulesCallbackPayload{
+			AccountLabel: selection.AccountLabel,
+			SessionID:    sessionID,
+			ItemKey:      item.Key,
+			Page:         page,
+		})
+		buttons = append(buttons, []Button{{
+			Text:         fmt.Sprintf("%s %d. %s", mark, i+1, truncateDisplay(item.Name, 36)),
+			CallbackData: fmt.Sprintf("cfrules_toggle|%s", token),
+		}})
+	}
+	var nav []Button
+	if page > 0 {
+		token := SetCFRulesCallbackPayload(CFRulesCallbackPayload{AccountLabel: selection.AccountLabel, SessionID: sessionID, Page: page - 1})
+		nav = append(nav, Button{Text: "上一页", CallbackData: fmt.Sprintf("cfrules_page|%s", token)})
+	}
+	if page+1 < totalPages {
+		token := SetCFRulesCallbackPayload(CFRulesCallbackPayload{AccountLabel: selection.AccountLabel, SessionID: sessionID, Page: page + 1})
+		nav = append(nav, Button{Text: "下一页", CallbackData: fmt.Sprintf("cfrules_page|%s", token)})
+	}
+	if len(nav) > 0 {
+		buttons = append(buttons, nav)
+	}
+	token := SetCFRulesCallbackPayload(CFRulesCallbackPayload{AccountLabel: selection.AccountLabel, SessionID: sessionID})
+	buttons = append(buttons, []Button{
+		{Text: "全选", CallbackData: fmt.Sprintf("cfrules_all|%s", token)},
+		{Text: "确认选择", CallbackData: fmt.Sprintf("cfrules_done|%s", token)},
+		{Text: "取消", CallbackData: fmt.Sprintf("cfrules_cancel|%s", token)},
+	})
+	return IPListPage{Message: sb.String(), Buttons: buttons}
+}
+
+func BuildCFRulesActionView(sessionID string, items []CFRulesDomainItem) IPListPage {
+	accountLabel := ""
+	if len(items) > 0 {
+		accountLabel = items[0].AccountLabel
+	}
+	msg := fmt.Sprintf("已选择账号 %s 的 %d 个域名。\n请选择要异步检查并执行的功能：", accountLabel, len(items))
+	token := func(action string, feature string) string {
+		return SetCFRulesCallbackPayload(CFRulesCallbackPayload{
+			AccountLabel: accountLabel,
+			SessionID:    sessionID,
+			Action:       action,
+			Feature:      feature,
+		})
+	}
+	return IPListPage{
+		Message: msg,
+		Buttons: [][]Button{
+			{
+				{Text: "开启/更新全部", CallbackData: fmt.Sprintf("cfrules_run|%s", token("enable", "all"))},
+				{Text: "关闭/删除全部", CallbackData: fmt.Sprintf("cfrules_run|%s", token("disable", "all"))},
+			},
+			{
+				{Text: "开启/更新安全", CallbackData: fmt.Sprintf("cfrules_run|%s", token("enable", "security"))},
+				{Text: "关闭安全", CallbackData: fmt.Sprintf("cfrules_run|%s", token("disable", "security"))},
+			},
+			{
+				{Text: "开启/更新速度", CallbackData: fmt.Sprintf("cfrules_run|%s", token("enable", "speed"))},
+				{Text: "关闭速度", CallbackData: fmt.Sprintf("cfrules_run|%s", token("disable", "speed"))},
+			},
+			{
+				{Text: "开启/更新缓存", CallbackData: fmt.Sprintf("cfrules_run|%s", token("enable", "cache"))},
+				{Text: "关闭缓存", CallbackData: fmt.Sprintf("cfrules_run|%s", token("disable", "cache"))},
+			},
+			{
+				{Text: "开启/更新SQL拦截", CallbackData: fmt.Sprintf("cfrules_run|%s", token("enable", "sql"))},
+				{Text: "关闭SQL拦截", CallbackData: fmt.Sprintf("cfrules_run|%s", token("disable", "sql"))},
+			},
+			{
+				{Text: "返回选择", CallbackData: fmt.Sprintf("cfrules_back|%s", token("", ""))},
+				{Text: "取消", CallbackData: fmt.Sprintf("cfrules_cancel|%s", token("", ""))},
+			},
+		},
+	}
+}
+
+func BuildCFRulesBlockCountriesPrompt(req CFRulesInputRequest, errText string) string {
+	var sb strings.Builder
+	if strings.TrimSpace(errText) != "" {
+		sb.WriteString("国家/地区代码格式错误: " + errText + "\n\n")
+	}
+	sb.WriteString("启用 Cloudflare 安全规则需要指定要拦截的国家/地区代码。\n")
+	defaultCountries := config.DefaultBlockCountries()
+	if len(defaultCountries) > 0 {
+		sb.WriteString("发送 default 使用配置默认: " + strings.Join(defaultCountries, ",") + "\n")
+	}
+	sb.WriteString("请输入 ISO 3166-1 alpha-2 代码，逗号分隔，例如 CN,RU,KP。\n")
+	sb.WriteString("发送 cancel 取消本次规则检查。")
+	return sb.String()
+}
+
+func (h *CommandHandler) handlePendingCFRulesInput(msgText string, userID int64) bool {
+	req, ok := getPendingCFRulesInput(userID)
+	if !ok {
+		return false
+	}
+	input := strings.TrimSpace(msgText)
+	if input == "" {
+		h.sendText(BuildCFRulesBlockCountriesPrompt(req, "输入为空"))
+		return true
+	}
+	if strings.EqualFold(input, "cancel") || strings.EqualFold(input, "exit") || strings.EqualFold(input, "stop") {
+		ClearPendingCFRulesInput(userID)
+		h.sendText("已取消 Cloudflare 规则检查。")
+		return true
+	}
+
+	var countries []string
+	var err error
+	if strings.EqualFold(input, "default") {
+		countries, err = cfclient.NormalizeCountryCodes(config.DefaultBlockCountries())
+	} else if isNoneValue(input) {
+		countries = nil
+	} else {
+		countries, err = cfclient.NormalizeCountryCodes([]string{input})
+	}
+	if err != nil {
+		h.sendText(BuildCFRulesBlockCountriesPrompt(req, err.Error()))
+		return true
+	}
+	if CFRulesNeedsBlockCountries(req.Action, req.Feature) && len(countries) == 0 {
+		h.sendText(BuildCFRulesBlockCountriesPrompt(req, "启用安全规则不能为空；如需跳过安全规则，请返回选择速度或缓存功能"))
+		return true
+	}
+
+	items, ok := SelectedCFRulesDomainItems(req.SessionID)
+	if !ok || len(items) == 0 {
+		ClearPendingCFRulesInput(userID)
+		h.sendText("Cloudflare 规则检查选择已过期，请重新执行 /cf_rules。")
+		return true
+	}
+	account := h.getAccountByLabel(req.AccountLabel)
+	if account == nil {
+		ClearPendingCFRulesInput(userID)
+		h.sendText("未找到 Cloudflare 账号：" + req.AccountLabel)
+		return true
+	}
+
+	ClearPendingCFRulesInput(userID)
+	go func() {
+		result := ProcessCFRulesItems(context.Background(), h.CFClient, *account, items, req.Action, req.Feature, countries)
+		ClearCFRulesSelection(req.SessionID)
+		h.sendText(result.Summary())
+	}()
+	h.sendText(fmt.Sprintf("Cloudflare 规则检查任务已提交：账号 %s，域名 %d，动作 %s，功能 %s，国家拦截 %s",
+		account.Label, len(items), req.Action, req.Feature, formatCFRulesBlockCountries(req.Feature, countries)))
+	return true
+}
+
+func ProcessCFRulesItems(ctx context.Context, client cfclient.Client, account config.CF, items []CFRulesDomainItem, action string, feature string, blockCountries []string) CFRulesBatchResult {
+	result := CFRulesBatchResult{AccountLabel: account.Label, Action: action, Feature: feature}
+	manager, ok := client.(cloudflareFeatureManager)
+	if !ok {
+		result.Failed = append(result.Failed, "当前 Cloudflare 客户端不支持规则管理")
+		return result
+	}
+	security := feature == "all" || feature == "security"
+	sqli := feature == "all" || feature == "sql"
+	speed := feature == "all" || feature == "speed"
+	cache := feature == "all" || feature == "cache"
+	pacer := newBatchAPIPacerWithInterval(cfRulesPerAccountInterval)
+	for _, item := range items {
+		if err := pacer.Wait(ctx); err != nil {
+			result.Failed = append(result.Failed, item.Name+": 等待执行失败: "+err.Error())
+			continue
+		}
+		zoneID := strings.TrimSpace(item.ZoneID)
+		if zoneID == "" {
+			result.Failed = append(result.Failed, item.Name+": 缺少 zone_id")
+			continue
+		}
+		managed := manager.ManageZoneFeatures(ctx, account, item.Name, zoneID, cfclient.FeatureManageOptions{
+			AccountID:      account.AccountID,
+			BlockCountries: blockCountries,
+			Action:         action,
+			Security:       security,
+			SQLi:           sqli,
+			Speed:          speed,
+			Cache:          cache,
+		})
+		if len(managed.Errors) > 0 {
+			result.Failed = append(result.Failed, fmt.Sprintf("%s: %s", item.Name, strings.Join(managed.Errors, "; ")))
+		}
+		result.Success = append(result.Success, managed)
+	}
+	sort.Slice(result.Success, func(i, j int) bool { return result.Success[i].Domain < result.Success[j].Domain })
+	sort.Strings(result.Failed)
+	return result
+}
+
+func ProcessCFRulesAllAccounts(ctx context.Context, client cfclient.Client, accounts []config.CF, action string, feature string, blockCountries []string) CFRulesAllAccountsResult {
+	result := CFRulesAllAccountsResult{
+		Action:         action,
+		Feature:        feature,
+		BlockCountries: append([]string(nil), blockCountries...),
+	}
+	if len(accounts) == 0 {
+		result.Failed = append(result.Failed, "未配置可用的 Cloudflare 账号")
+		return result
+	}
+
+	ch := make(chan CFRulesBatchResult, len(accounts))
+	var wg sync.WaitGroup
+	for _, account := range accounts {
+		account := account
+		if strings.TrimSpace(account.Label) == "" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			accountResult := CFRulesBatchResult{AccountLabel: account.Label, Action: action, Feature: feature}
+			zones, err := client.ListZones(ctx, account)
+			if err != nil {
+				accountResult.Failed = append(accountResult.Failed, fmt.Sprintf("读取域名失败: %v", err))
+				ch <- accountResult
+				return
+			}
+			items := buildCFRulesDomainItemsFromZones(account.Label, zones)
+			if len(items) == 0 {
+				ch <- accountResult
+				return
+			}
+			ch <- ProcessCFRulesItems(ctx, client, account, items, action, feature, blockCountries)
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	for accountResult := range ch {
+		result.Accounts = append(result.Accounts, accountResult)
+		for _, failed := range accountResult.Failed {
+			result.Failed = append(result.Failed, accountResult.AccountLabel+": "+failed)
+		}
+	}
+	sort.Slice(result.Accounts, func(i, j int) bool { return result.Accounts[i].AccountLabel < result.Accounts[j].AccountLabel })
+	sort.Strings(result.Failed)
+	return result
+}
+
+func (r CFRulesBatchResult) Summary() string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Cloudflare 规则检查完成\n账号: %s\n动作: %s\n功能: %s\n已处理: %d", r.AccountLabel, r.Action, r.Feature, len(r.Success)))
+	for _, item := range r.Success {
+		sb.WriteString(fmt.Sprintf("\n- %s | 国家:%s | SQL:%s | 速度:%s | 缓存:%s",
+			item.Domain,
+			normalizeDisplayValue(item.SecurityRuleStatus),
+			normalizeDisplayValue(item.SQLiRuleStatus),
+			compactSpeedStatus(item.SpeedStatus),
+			normalizeDisplayValue(item.CacheRuleStatus),
+		))
+	}
+	if len(r.Failed) > 0 {
+		sb.WriteString(fmt.Sprintf("\n\n失败: %d", len(r.Failed)))
+		for _, item := range r.Failed {
+			sb.WriteString("\n- " + item)
+		}
+	}
+	return sb.String()
+}
+
+func (r CFRulesAllAccountsResult) Summary() string {
+	processed := 0
+	for _, account := range r.Accounts {
+		processed += len(account.Success)
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Cloudflare 全账号规则检查完成\n动作: %s\n功能: %s\n国家拦截: %s\n账号: %d\n已处理域名: %d\n失败: %d",
+		r.Action, r.Feature, formatCFRulesBlockCountries(r.Feature, r.BlockCountries), len(r.Accounts), processed, len(r.Failed)))
+	for _, account := range r.Accounts {
+		sb.WriteString(fmt.Sprintf("\n- %s | 已处理:%d | 失败:%d", account.AccountLabel, len(account.Success), len(account.Failed)))
+	}
+	if len(r.Failed) > 0 {
+		sb.WriteString("\n\n失败明细:")
+		limit := len(r.Failed)
+		if limit > cfRulesAllAccountsMaxLines {
+			limit = cfRulesAllAccountsMaxLines
+		}
+		for _, item := range r.Failed[:limit] {
+			sb.WriteString("\n- " + item)
+		}
+		if len(r.Failed) > limit {
+			sb.WriteString(fmt.Sprintf("\n- 还有 %d 条失败明细未显示，请查看日志或分账号重试。", len(r.Failed)-limit))
+		}
+	}
+	return sb.String()
+}
+
+func formatCFRulesBlockCountries(feature string, countries []string) string {
+	feature = normalizeCFRulesFeature(feature)
+	if feature != "all" && feature != "security" {
+		return "-"
+	}
+	if len(countries) == 0 {
+		return "-"
+	}
+	return strings.Join(countries, ",")
+}
+
+func parseCFRulesAllAccountsArgs(args []string) (string, string, []string, error) {
+	action := "enable"
+	feature := "security"
+	blockCountries := config.DefaultBlockCountries()
+	start := 0
+	if len(args) > 0 && !strings.Contains(args[0], "=") {
+		if isCFRulesAllDomainsArg(args[0]) {
+			start = 1
+		} else if parsedFeature := normalizeCFRulesFeature(args[0]); parsedFeature != "" {
+			feature = parsedFeature
+			start = 1
+		} else if parsedAction := normalizeCFRulesAction(args[0]); parsedAction != "" {
+			action = parsedAction
+			start = 1
+		}
+	}
+	for _, arg := range args[start:] {
+		key, value, ok := strings.Cut(arg, "=")
+		if !ok {
+			if parsedFeature := normalizeCFRulesFeature(arg); parsedFeature != "" {
+				feature = parsedFeature
+				continue
+			}
+			if parsedAction := normalizeCFRulesAction(arg); parsedAction != "" {
+				action = parsedAction
+				continue
+			}
+			return action, feature, blockCountries, fmt.Errorf("无法识别参数：%s", arg)
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "action":
+			parsed := normalizeCFRulesAction(value)
+			if parsed == "" {
+				return action, feature, blockCountries, fmt.Errorf("action 参数必须是 enable/update/on 或 disable/delete/off")
+			}
+			action = parsed
+		case "feature":
+			parsed := normalizeCFRulesFeature(value)
+			if parsed == "" {
+				return action, feature, blockCountries, fmt.Errorf("feature 参数必须是 all/security/sql/speed/cache")
+			}
+			feature = parsed
+		case "block", "blocks", "country", "countries":
+			if isNoneValue(value) {
+				blockCountries = nil
+				continue
+			}
+			countries, err := cfclient.NormalizeCountryCodes([]string{value})
+			if err != nil {
+				return action, feature, blockCountries, fmt.Errorf("block 参数错误：%v", err)
+			}
+			blockCountries = countries
+		default:
+			return action, feature, blockCountries, fmt.Errorf("未知参数 %s", key)
+		}
+	}
+	return action, feature, blockCountries, nil
+}
+
+func isCFRulesAllAccountsArg(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "all", "*", "all_accounts", "allaccounts", "accounts", "全部", "全部账号", "所有账号":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCFRulesAllDomainsArg(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "all", "*", "domains", "all_domains", "alldomains", "全部", "全部域名", "所有域名":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeCFRulesAction(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "enable", "update", "on":
+		return "enable"
+	case "disable", "delete", "off":
+		return "disable"
+	default:
+		return ""
+	}
+}
+
+func normalizeCFRulesFeature(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "all":
+		return "all"
+	case "security", "waf", "country", "countries":
+		return "security"
+	case "sql", "sqli", "sqlblock", "sql_block", "sql-block":
+		return "sql"
+	case "speed":
+		return "speed"
+	case "cache":
+		return "cache"
+	default:
+		return ""
+	}
+}
+
+func CFRulesNeedsBlockCountries(action string, feature string) bool {
+	action = normalizeCFRulesAction(action)
+	feature = normalizeCFRulesFeature(feature)
+	return action == "enable" && (feature == "all" || feature == "security")
+}

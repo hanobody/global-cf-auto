@@ -4,16 +4,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"html"
+	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	"DomainC/cfclient"
 	"DomainC/config"
+	"DomainC/reminder"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
@@ -29,17 +35,21 @@ type originSSLImportResult struct {
 }
 
 type originSSLDomainResult struct {
-	Domain       string
-	AccountLabel string
-	StrictErr    error
-	Imports      []originSSLImportResult
+	Domain                string
+	AccountLabel          string
+	StrictErr             error
+	CountryBlockStatus    string
+	CountryBlockCountries []string
+	CacheRuleStatus       string
+	RUMStatus             string
+	Imports               []originSSLImportResult
 }
 
 type originSSLBatchResult struct {
-	AWSAliases    []string
-	Success       []originSSLDomainResult
-	ParseErrors   []string
-	Failed        []string
+	AWSAliases  []string
+	Success     []originSSLDomainResult
+	ParseErrors []string
+	Failed      []string
 }
 
 type originSSLARNEntry struct {
@@ -48,6 +58,120 @@ type originSSLARNEntry struct {
 	Alias        string
 	Region       string
 	ARN          string
+}
+
+const (
+	originSSLStatusPollInterval        = 30 * time.Second
+	originSSLStatusPollAttempts        = 120
+	originSSLTaskConcurrency           = 3
+	originSSLCFCallInterval            = 5 * time.Second
+	originSSLAWSCallInterval           = 2 * time.Second
+	originSSLCertRequestTimeout        = 2 * time.Minute
+	originSSLCertRetryAttempts         = 5
+	originSSLPostInitPollInterval      = 30 * time.Second
+	originSSLPostInitZoneActiveTimeout = 30 * time.Minute
+	originSSLPostInitSSLActiveTimeout  = 45 * time.Minute
+	originSSLDNSRecordLimit            = 500
+)
+
+type OriginSSLInteractiveDomainResult struct {
+	Domain                string
+	AccountLabel          string
+	CertID                string
+	StrictErr             error
+	CountryBlockStatus    string
+	CountryBlockCountries []string
+	CacheRuleStatus       string
+	RUMStatus             string
+	PostInitErrors        []string
+	Imports               []OriginSSLAWSImportResult
+	SpeedApplied          []string
+	SpeedFailed           []string
+}
+
+type OriginSSLAWSImportResult struct {
+	Alias  string
+	Region string
+	ARN    string
+	Err    error
+}
+
+type OriginSSLInteractiveResult struct {
+	AccountLabel string
+	AWSAliases   []string
+	Success      []OriginSSLInteractiveDomainResult
+	Failed       []string
+}
+
+type OriginSSLDNSCreateResult struct {
+	AccountLabel string
+	Success      []OriginSSLDNSRecordPlan
+	Failed       []string
+}
+
+func (r OriginSSLInteractiveResult) Summary() string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("SSL 后台任务完成\n账号: %s\n成功: %d", r.AccountLabel, len(r.Success)))
+	if len(r.AWSAliases) == 0 {
+		sb.WriteString("\nAWS 导入: 未选择")
+	} else {
+		sb.WriteString("\nAWS 导入: " + strings.Join(formatAWSTargets(r.AWSAliases), ", "))
+	}
+	if len(r.Success) > 0 {
+		var arnLines []string
+		for _, item := range r.Success {
+			strict := "ok"
+			if item.StrictErr != nil {
+				strict = "failed: " + item.StrictErr.Error()
+			}
+			importOK := 0
+			for _, imp := range item.Imports {
+				if imp.Err == nil && strings.TrimSpace(imp.ARN) != "" {
+					importOK++
+					arnLines = append(arnLines, fmt.Sprintf("%s | %s(%s) | %s", item.Domain, imp.Alias, imp.Region, extractARNResourceID(imp.ARN)))
+				}
+			}
+			sb.WriteString(fmt.Sprintf("\n- %s | Full(Strict): %s | WAF:%s | Speed:%d/%d | Cache:%s | ACM:%d/%d",
+				item.Domain, strict, formatOriginSSLCountryBlock(item.CountryBlockStatus, item.CountryBlockCountries), len(item.SpeedApplied), len(item.SpeedApplied)+len(item.SpeedFailed), normalizeDisplayValue(item.CacheRuleStatus), importOK, len(item.Imports)))
+		}
+		if len(arnLines) > 0 {
+			sb.WriteString("\n\nARN 对照:")
+			for i, line := range arnLines {
+				if i >= 10 {
+					sb.WriteString(fmt.Sprintf("\n- ... 其余 %d 条 ARN", len(arnLines)-i))
+					break
+				}
+				sb.WriteString("\n- " + line)
+			}
+		}
+	}
+	if len(r.Failed) > 0 {
+		sb.WriteString(fmt.Sprintf("\n失败: %d", len(r.Failed)))
+		for i, item := range r.Failed {
+			if i >= 20 {
+				sb.WriteString(fmt.Sprintf("\n- ... 其余 %d 条失败", len(r.Failed)-i))
+				break
+			}
+			sb.WriteString("\n- " + item)
+		}
+	}
+	return sb.String()
+}
+
+func (r OriginSSLDNSCreateResult) Summary() string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("ssl DNS 后台创建完成\n账号: %s\n成功: %d", r.AccountLabel, len(r.Success)))
+	if len(r.Failed) > 0 {
+		sb.WriteString(fmt.Sprintf("\n失败: %d", len(r.Failed)))
+		for i, item := range r.Failed {
+			if i >= 20 {
+				sb.WriteString(fmt.Sprintf("\n- ... 其余 %d 条失败", len(r.Failed)-i))
+				break
+			}
+			sb.WriteString("\n- " + item)
+		}
+	}
+	return sb.String()
 }
 
 func (r originSSLBatchResult) SummaryText() string {
@@ -80,7 +204,7 @@ func (r originSSLBatchResult) SummaryText() string {
 		if item.StrictErr != nil {
 			strictStatus = "失败: " + item.StrictErr.Error()
 		}
-		sb.WriteString(fmt.Sprintf("\n- %s -> %s | Full(Strict): %s | ACM: %d/%d", item.Domain, item.AccountLabel, strictStatus, successImports, len(item.Imports)))
+		sb.WriteString(fmt.Sprintf("\n- %s -> %s | Full(Strict): %s | WAF: %s | Cache: %s | ACM: %d/%d", item.Domain, item.AccountLabel, strictStatus, formatOriginSSLCountryBlock(item.CountryBlockStatus, item.CountryBlockCountries), normalizeDisplayValue(item.CacheRuleStatus), successImports, len(item.Imports)))
 	}
 	sb.WriteString(fmt.Sprintf("\n成功 ARN: %d", arnCount))
 
@@ -119,6 +243,13 @@ func (h *CommandHandler) handleOriginSSLCommand(args []string) {
 		return
 	}
 
+	if len(args) == 1 {
+		if acc := h.getAccountByLabel(strings.TrimSpace(args[0])); acc != nil {
+			h.beginOriginSSLDomainSelection(*acc)
+			return
+		}
+	}
+
 	domainArgs, awsAliases := splitOriginSSLDirectArgs(args)
 	if len(domainArgs) == 0 {
 		h.startOriginSSLInteractive()
@@ -128,28 +259,56 @@ func (h *CommandHandler) handleOriginSSLCommand(args []string) {
 	domains, parseErrors := parseGetNSDomainsInput(strings.Join(domainArgs, "\n"))
 	if len(domains) == 0 {
 		h.sendText(h.originSSLRetryPrompt(OriginSSLInputRequest{
-			AWSAliases:    awsAliases,
+			AWSAliases:     awsAliases,
+			BlockCountries: config.DefaultBlockCountries(),
 		}, parseErrors))
 		return
 	}
 
 	req := OriginSSLInputRequest{
-		AWSAliases:    awsAliases,
+		AWSAliases:     awsAliases,
+		BlockCountries: config.DefaultBlockCountries(),
 	}
-	result := h.processOriginSSLBatch(req, domains)
-	result.ParseErrors = append(result.ParseErrors, parseErrors...)
-	h.sendOriginSSLResult(result)
+	h.startOriginSSLBatchTask(req, domains, parseErrors)
 }
 
 func (h *CommandHandler) startOriginSSLInteractive() {
 	if h.operator != nil {
-		ResetOriginSSLSelection(h.operator.ID)
+		ClearPendingOriginSSLInput(h.operator.ID)
 	}
-	if h.operator == nil {
-		h.sendText(h.originSSLPromptText())
+	h.sendOriginSSLAccountSelector()
+}
+
+func (h *CommandHandler) sendOriginSSLAccountSelector() {
+	var buttons [][]Button
+	for _, acc := range h.Accounts {
+		label := strings.TrimSpace(acc.Label)
+		if label == "" {
+			continue
+		}
+		token := SetOriginSSLCallbackPayload(OriginSSLCallbackPayload{AccountLabel: label})
+		buttons = append(buttons, []Button{{
+			Text:         label,
+			CallbackData: fmt.Sprintf("ssl_account|%s", token),
+		}})
+	}
+	if len(buttons) == 0 {
+		h.sendText("未配置可用的 Cloudflare 账号，无法生成源站证书。")
 		return
 	}
-	h.sendOriginSSLTargetSelector(h.operator.ID)
+	if err := h.Sender.SendWithButtons(context.Background(), h.originSSLPromptText(), buttons); err != nil {
+		h.sendText(fmt.Sprintf("发送 /ssl 账号选择失败: %v", err))
+	}
+}
+
+func (h *CommandHandler) beginOriginSSLDomainSelection(account config.CF) {
+	if h.operator != nil {
+		ClearPendingOriginSSLInput(h.operator.ID)
+	}
+	h.sendText(fmt.Sprintf("正在读取账号 %s 下所有域名，请稍候。", account.Label))
+	if err := BeginOriginSSLDomainSelection(context.Background(), h.CFClient, h.Sender, account); err != nil {
+		h.sendText(fmt.Sprintf("读取 /ssl 域名列表失败: %v", err))
+	}
 }
 
 func (h *CommandHandler) sendOriginSSLTargetSelector(userID int64) {
@@ -213,10 +372,107 @@ func OriginSSLTargetPromptText() string {
 	return sb.String()
 }
 
+func BeginOriginSSLDomainSelection(ctx context.Context, client cfclient.Client, sender Sender, account config.CF) error {
+	if client == nil {
+		client = cfclient.NewClient()
+	}
+	if sender == nil {
+		sender = DefaultSender()
+	}
+
+	zones, err := client.ListZoneSummaries(ctx, account)
+	if err != nil {
+		return err
+	}
+	if len(zones) == 0 {
+		return sender.Send(ctx, fmt.Sprintf("账号 %s 暂无可选择域名。", account.Label))
+	}
+
+	items := buildOriginSSLDomainItems(account.Label, zones)
+	sessionID := SetOriginSSLDomainSelection(OriginSSLDomainSelection{
+		AccountLabel: account.Label,
+		Items:        items,
+		Selected:     make(map[string]bool),
+		Page:         0,
+	})
+	selection, _ := GetOriginSSLDomainSelection(sessionID)
+	page := BuildOriginSSLDomainSelectionView(sessionID, selection)
+	return sender.SendWithButtons(ctx, page.Message, page.Buttons)
+}
+
+func buildOriginSSLDomainItems(accountLabel string, zones []cfclient.ZoneSummary) []OriginSSLDomainItem {
+	items := make([]OriginSSLDomainItem, 0, len(zones))
+	for _, zone := range zones {
+		name := strings.TrimSpace(strings.ToLower(zone.Name))
+		if name == "" {
+			continue
+		}
+		key := strings.TrimSpace(zone.ID)
+		if key == "" {
+			key = name
+		}
+		items = append(items, OriginSSLDomainItem{
+			Key:              key,
+			AccountLabel:     accountLabel,
+			ZoneID:           zone.ID,
+			Name:             name,
+			Status:           zone.Status,
+			Paused:           zone.Paused,
+			CreatedOn:        zone.CreatedOn,
+			Plan:             zone.Plan,
+			SecurityInsights: zone.SecurityInsights,
+			UniqueVisitors:   zone.UniqueVisitors,
+		})
+	}
+	sortOriginSSLDomainItems(items)
+	return items
+}
+
+func sortOriginSSLDomainItems(items []OriginSSLDomainItem) {
+	sort.Slice(items, func(i, j int) bool {
+		iToday := isTodayLocal(items[i].CreatedOn)
+		jToday := isTodayLocal(items[j].CreatedOn)
+		if iToday != jToday {
+			return iToday
+		}
+		if !items[i].CreatedOn.Equal(items[j].CreatedOn) {
+			return items[i].CreatedOn.After(items[j].CreatedOn)
+		}
+		return items[i].Name < items[j].Name
+	})
+}
+
+func isTodayLocal(t time.Time) bool {
+	if t.IsZero() {
+		return false
+	}
+	now := time.Now()
+	ny, nm, nd := now.Date()
+	ty, tm, td := t.Local().Date()
+	return ny == ty && nm == tm && nd == td
+}
+
 func (h *CommandHandler) handlePendingOriginSSLInput(msgText string, userID int64) bool {
 	req, ok := GetPendingOriginSSLInput(userID)
 	if !ok {
 		return false
+	}
+
+	switch req.Stage {
+	case OriginSSLInputBlockCountries:
+		h.handlePendingOriginSSLBlockCountries(msgText, userID, req)
+		return true
+	case OriginSSLInputDNSTarget:
+		h.handlePendingOriginSSLDNSTarget(msgText, userID, req)
+		return true
+	case OriginSSLInputDNSRecords:
+		h.handlePendingOriginSSLDNSRecords(msgText, userID, req)
+		return true
+	case "", OriginSSLInputDomains:
+	default:
+		ClearPendingOriginSSLInput(userID)
+		h.sendText("未知的 /ssl 交互状态，已取消。")
+		return true
 	}
 
 	domains, parseErrors := parseGetNSDomainsInput(msgText)
@@ -225,13 +481,128 @@ func (h *CommandHandler) handlePendingOriginSSLInput(msgText string, userID int6
 		return true
 	}
 
-	result := h.processOriginSSLBatch(req, domains)
-	result.ParseErrors = append(result.ParseErrors, parseErrors...)
-	if len(result.ParseErrors) == 0 && len(result.Failed) == 0 {
-		ClearPendingOriginSSLInput(userID)
-	}
-	h.sendOriginSSLResult(result)
+	ClearPendingOriginSSLInput(userID)
+	h.startOriginSSLBatchTask(req, domains, parseErrors)
 	return true
+}
+
+func (h *CommandHandler) handlePendingOriginSSLBlockCountries(msgText string, userID int64, req OriginSSLInputRequest) {
+	if isOriginSSLStopInput(msgText) {
+		ClearPendingOriginSSLInput(userID)
+		ClearOriginSSLDomainSelection(req.SessionID)
+		h.sendText("/ssl 交互已结束。")
+		return
+	}
+
+	countries, err := parseOriginSSLBlockCountriesInput(msgText)
+	if err != nil {
+		h.sendText(BuildOriginSSLBlockCountriesPrompt(req, err.Error()))
+		return
+	}
+	_, ok := SetOriginSSLDomainBlockCountries(req.SessionID, countries)
+	if !ok {
+		ClearPendingOriginSSLInput(userID)
+		h.sendText("/ssl 域名选择已过期，请重新执行 /ssl。")
+		return
+	}
+	items, ok := SelectedOriginSSLDomainItems(req.SessionID)
+	if !ok || len(items) == 0 {
+		ClearPendingOriginSSLInput(userID)
+		h.sendText("/ssl 域名选择已过期或未选择域名，请重新执行 /ssl。")
+		return
+	}
+	ClearPendingOriginSSLInput(userID)
+	page := BuildOriginSSLDomainConfirmView(req.SessionID, items)
+	if err := h.Sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
+		h.sendText(fmt.Sprintf("发送 /ssl 执行确认失败: %v", err))
+	}
+}
+
+func (h *CommandHandler) handlePendingOriginSSLDNSTarget(msgText string, userID int64, req OriginSSLInputRequest) {
+	if isOriginSSLStopInput(msgText) {
+		ClearPendingOriginSSLInput(userID)
+		ClearOriginSSLDomainSelection(req.SessionID)
+		h.sendText("/ssl 交互已结束。")
+		return
+	}
+
+	recordType, target, err := ParseOriginSSLDNSTarget(msgText)
+	if err != nil {
+		h.sendText(BuildOriginSSLDNSTargetPrompt(req.AccountLabel, len(req.SelectedDomains), err.Error()))
+		return
+	}
+
+	ClearPendingOriginSSLInput(userID)
+	page := BuildOriginSSLDNSProxyView(req.SessionID, req.AccountLabel, recordType, target)
+	if err := h.Sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
+		h.sendText(fmt.Sprintf("发送 /ssl DNS 代理选择失败: %v", err))
+	}
+}
+
+func (h *CommandHandler) handlePendingOriginSSLDNSRecords(msgText string, userID int64, req OriginSSLInputRequest) {
+	if isOriginSSLStopInput(msgText) {
+		ClearPendingOriginSSLInput(userID)
+		ClearOriginSSLDomainSelection(req.SessionID)
+		h.sendText("/ssl 交互已结束。")
+		return
+	}
+
+	if names, ok := parseOriginSSLDNSNamesOnly(msgText); ok {
+		h.handlePendingOriginSSLDNSNames(names, userID, req)
+		return
+	}
+
+	plan, parseErrors := BuildOriginSSLDNSPlan(req.AccountLabel, req.SessionID, req.SelectedDomains, req.DNSRecordType, req.DNSTarget, req.Proxied, msgText)
+	if len(plan.Records) == 0 {
+		h.sendText(BuildOriginSSLDNSRecordsPrompt(req, parseErrors))
+		return
+	}
+	plan.Records = mergeOriginSSLDNSRecords(req.PendingDNSRecords, plan.Records)
+
+	ClearPendingOriginSSLInput(userID)
+	planID := SetOriginSSLDNSPlan(plan)
+	page := BuildOriginSSLDNSPlanConfirmView(planID, plan)
+	if err := h.Sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
+		h.sendText(fmt.Sprintf("发送 /ssl DNS 创建确认失败: %v", err))
+	}
+}
+
+func (h *CommandHandler) handlePendingOriginSSLDNSNames(names []string, userID int64, req OriginSSLInputRequest) {
+	domains := normalizeOriginSSLSelectedDomains(req.SelectedDomains)
+	if len(domains) == 0 {
+		h.sendText(BuildOriginSSLDNSRecordsPrompt(req, []string{"没有剩余可创建解析的域名"}))
+		return
+	}
+	if len(domains) == 1 {
+		plan := BuildOriginSSLDNSNamePlan(req.AccountLabel, req.SessionID, domains, names, req.DNSRecordType, req.DNSTarget, req.Proxied)
+		plan.Records = mergeOriginSSLDNSRecords(req.PendingDNSRecords, plan.Records)
+		ClearPendingOriginSSLInput(userID)
+		planID := SetOriginSSLDNSPlan(plan)
+		page := BuildOriginSSLDNSPlanConfirmView(planID, plan)
+		if err := h.Sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
+			h.sendText(fmt.Sprintf("发送 /ssl DNS 创建确认失败: %v", err))
+		}
+		return
+	}
+
+	nameSessionID := SetOriginSSLDNSNameSelection(OriginSSLDNSNameSelection{
+		AccountLabel:      req.AccountLabel,
+		OriginSessionID:   req.SessionID,
+		DNSTarget:         req.DNSTarget,
+		DNSRecordType:     req.DNSRecordType,
+		Proxied:           req.Proxied,
+		Names:             names,
+		Domains:           domains,
+		Selected:          make(map[string]bool),
+		PendingDNSRecords: append([]OriginSSLDNSRecordPlan(nil), req.PendingDNSRecords...),
+		Page:              0,
+	})
+	ClearPendingOriginSSLInput(userID)
+	selection, _ := GetOriginSSLDNSNameSelection(nameSessionID)
+	page := BuildOriginSSLDNSNameDomainSelectionView(nameSessionID, selection)
+	if err := h.Sender.SendWithButtons(context.Background(), page.Message, page.Buttons); err != nil {
+		h.sendText(fmt.Sprintf("发送 /ssl 解析名适用域名选择失败: %v", err))
+	}
 }
 
 func (h *CommandHandler) originSSLInputPrompt(req OriginSSLInputRequest) string {
@@ -249,6 +620,63 @@ func BuildOriginSSLInputPrompt(req OriginSSLInputRequest) string {
 		sb.WriteString(strings.Join(formatAWSTargets(req.AWSAliases), ", "))
 	}
 	sb.WriteString("\n\n请直接发送一个或多个主域名，支持多行、空格、逗号或分号分隔。\n示例：\nexample.com\nexample.net")
+	return sb.String()
+}
+
+func BuildOriginSSLBlockCountriesPrompt(req OriginSSLInputRequest, errText string) string {
+	var sb strings.Builder
+	if errText != "" {
+		sb.WriteString("国家/地区代码格式错误: " + errText + "\n\n")
+	}
+	sb.WriteString("/ssl 将在创建证书后创建 WAF 国家/地区拦截规则。\n")
+	defaultCountries := config.DefaultBlockCountries()
+	if len(defaultCountries) > 0 {
+		sb.WriteString("发送 default 使用配置默认: " + strings.Join(defaultCountries, ",") + "\n")
+	}
+	sb.WriteString("请输入要拦截的 ISO 3166-1 alpha-2 代码，逗号分隔，例如 CN,RU,KP。\n")
+	sb.WriteString("发送 none 跳过国家/地区拦截。")
+	return sb.String()
+}
+
+func BuildOriginSSLDNSTargetPrompt(accountLabel string, selected int, errText string) string {
+	var sb strings.Builder
+	if strings.TrimSpace(errText) != "" {
+		sb.WriteString("解析目标无法识别: " + errText + "\n\n")
+	}
+	sb.WriteString(fmt.Sprintf("账号: %s\n已选择域名: %d\n", accountLabel, selected))
+	sb.WriteString("请发送一个解析目标，只能一条。\n")
+	sb.WriteString("IPv4 会创建 A 记录，域名会创建 CNAME 记录。\n")
+	sb.WriteString("发送 关闭、结束、exit 或 stop 可以结束本次流程。\n")
+	sb.WriteString("示例:\n1.2.3.4\norigin.example.com")
+	return sb.String()
+}
+
+func BuildOriginSSLDNSRecordsPrompt(req OriginSSLInputRequest, errs []string) string {
+	var sb strings.Builder
+	if len(errs) > 0 {
+		sb.WriteString("以下输入未识别或不属于已选域名:\n")
+		for i, item := range errs {
+			if i >= 20 {
+				sb.WriteString(fmt.Sprintf("- ... 其余 %d 条\n", len(errs)-i))
+				break
+			}
+			sb.WriteString("- " + item + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	proxy := "关闭"
+	if req.Proxied {
+		proxy = "开启"
+	}
+	sb.WriteString(fmt.Sprintf("账号: %s\n解析目标: %s %s\n代理: %s\n", req.AccountLabel, req.DNSRecordType, req.DNSTarget, proxy))
+	if len(req.SelectedDomains) > 0 {
+		sb.WriteString(fmt.Sprintf("剩余域名: %d\n", len(req.SelectedDomains)))
+	}
+	sb.WriteString("请发送要创建解析的完整域名，支持空格、换行、逗号或分号分隔。\n")
+	sb.WriteString("也可以只发送解析名，例如 @ a www，系统会再询问适用哪些域名。\n")
+	sb.WriteString("发送 关闭、结束、exit 或 stop 可以结束本次流程。\n")
+	sb.WriteString("示例:\na.123.com b.123.com fr.abc.com 123.com cad.com\n")
+	sb.WriteString("根域记录会自动额外创建 www CNAME 指向根域。")
 	return sb.String()
 }
 
@@ -289,9 +717,842 @@ func splitOriginSSLDirectArgs(args []string) ([]string, []string) {
 	return domains, aliases
 }
 
+func ParseOriginSSLDNSTarget(input string) (string, string, error) {
+	fields := splitOriginSSLFields(input)
+	if len(fields) != 1 {
+		return "", "", fmt.Errorf("只能输入一个目标")
+	}
+
+	target := strings.TrimSpace(strings.ToLower(fields[0]))
+	target = strings.TrimSuffix(target, ".")
+	if target == "" {
+		return "", "", fmt.Errorf("目标为空")
+	}
+	if strings.Contains(target, "/") || strings.Contains(target, "://") {
+		return "", "", fmt.Errorf("目标不能包含 URL、路径或 CIDR")
+	}
+
+	ip := net.ParseIP(target)
+	if ip != nil {
+		ip4 := ip.To4()
+		if ip4 == nil {
+			return "", "", fmt.Errorf("暂不支持 IPv6 作为本流程目标")
+		}
+		return "A", ip4.String(), nil
+	}
+	if looksLikeIPv4Literal(target) {
+		return "", "", fmt.Errorf("IPv4 地址格式不合法")
+	}
+
+	host, ok := normalizeOriginSSLHostname(target)
+	if !ok {
+		return "", "", fmt.Errorf("不是有效 IPv4 或域名")
+	}
+	return "CNAME", host, nil
+}
+
+func isOriginSSLStopInput(input string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(input))
+	switch normalized {
+	case "关闭", "结束", "exit", "stop":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseOriginSSLBlockCountriesInput(input string) ([]string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" || strings.EqualFold(input, "default") {
+		return cfclient.NormalizeCountryCodes(config.DefaultBlockCountries())
+	}
+	if isNoneValue(input) {
+		return nil, nil
+	}
+	return cfclient.NormalizeCountryCodes([]string{input})
+}
+
+func BuildOriginSSLDNSPlan(accountLabel string, sessionID string, selectedDomains []string, recordType string, target string, proxied bool, input string) (OriginSSLDNSPlan, []string) {
+	plan := OriginSSLDNSPlan{
+		AccountLabel: accountLabel,
+		SessionID:    sessionID,
+	}
+	recordType = strings.ToUpper(strings.TrimSpace(recordType))
+	target = strings.TrimSpace(target)
+	if recordType == "" || target == "" {
+		return plan, []string{"解析目标不完整"}
+	}
+	if recordType != "A" && recordType != "CNAME" {
+		return plan, []string{"不支持的解析类型: " + recordType}
+	}
+
+	zones := normalizeOriginSSLSelectedDomains(selectedDomains)
+	if len(zones) == 0 {
+		return plan, []string{"没有可用的已选域名"}
+	}
+
+	fields := splitOriginSSLFields(input)
+	if len(fields) == 0 {
+		return plan, []string{"输入为空"}
+	}
+
+	seen := make(map[string]struct{})
+	seenName := make(map[string]struct{})
+	rootDomains := make(map[string]struct{})
+	var errs []string
+	for _, field := range fields {
+		host, ok := normalizeOriginSSLHostname(field)
+		if !ok {
+			errs = append(errs, field)
+			continue
+		}
+
+		domain, name, ok := matchOriginSSLSelectedDomain(host, zones)
+		if !ok {
+			errs = append(errs, field)
+			continue
+		}
+
+		appendRecord := func(record OriginSSLDNSRecordPlan) {
+			if len(plan.Records) >= originSSLDNSRecordLimit {
+				return
+			}
+			key := strings.Join([]string{record.Domain, record.Name, record.Type}, "|")
+			if _, exists := seen[key]; exists {
+				return
+			}
+			seen[key] = struct{}{}
+			seenName[strings.Join([]string{record.Domain, record.Name}, "|")] = struct{}{}
+			plan.Records = append(plan.Records, record)
+		}
+
+		appendRecord(OriginSSLDNSRecordPlan{
+			AccountLabel: accountLabel,
+			Domain:       domain,
+			Name:         name,
+			FQDN:         fqdnFromOriginSSLName(domain, name),
+			Type:         recordType,
+			Content:      target,
+			Proxied:      proxied,
+		})
+
+		if name == "@" {
+			rootDomains[domain] = struct{}{}
+		}
+
+		if len(plan.Records) >= originSSLDNSRecordLimit {
+			errs = append(errs, fmt.Sprintf("记录数量超过上限 %d，本次已停止继续解析", originSSLDNSRecordLimit))
+			break
+		}
+	}
+
+	rootList := make([]string, 0, len(rootDomains))
+	for domain := range rootDomains {
+		rootList = append(rootList, domain)
+	}
+	sort.Strings(rootList)
+	for _, domain := range rootList {
+		if len(plan.Records) >= originSSLDNSRecordLimit {
+			errs = append(errs, fmt.Sprintf("记录数量超过上限 %d，部分自动 www 记录未加入", originSSLDNSRecordLimit))
+			break
+		}
+		if _, exists := seenName[strings.Join([]string{domain, "www"}, "|")]; exists {
+			continue
+		}
+		key := strings.Join([]string{domain, "www", "CNAME"}, "|")
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		seenName[strings.Join([]string{domain, "www"}, "|")] = struct{}{}
+		plan.Records = append(plan.Records, OriginSSLDNSRecordPlan{
+			AccountLabel: accountLabel,
+			Domain:       domain,
+			Name:         "www",
+			FQDN:         "www." + domain,
+			Type:         "CNAME",
+			Content:      domain,
+			Proxied:      proxied,
+			AutoWWW:      true,
+		})
+	}
+	return plan, errs
+}
+
+func BuildOriginSSLDNSNamePlan(accountLabel string, sessionID string, domains []string, names []string, recordType string, target string, proxied bool) OriginSSLDNSPlan {
+	plan := OriginSSLDNSPlan{
+		AccountLabel: accountLabel,
+		SessionID:    sessionID,
+	}
+	recordType = strings.ToUpper(strings.TrimSpace(recordType))
+	target = strings.TrimSpace(target)
+	seen := make(map[string]struct{})
+	seenName := make(map[string]struct{})
+	rootDomains := make(map[string]struct{})
+
+	appendRecord := func(record OriginSSLDNSRecordPlan) {
+		if len(plan.Records) >= originSSLDNSRecordLimit {
+			return
+		}
+		key := strings.Join([]string{record.Domain, record.Name, record.Type}, "|")
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		seenName[strings.Join([]string{record.Domain, record.Name}, "|")] = struct{}{}
+		plan.Records = append(plan.Records, record)
+	}
+
+	for _, domain := range normalizeOriginSSLSelectedDomains(domains) {
+		for _, name := range normalizeOriginSSLDNSNames(names) {
+			appendRecord(OriginSSLDNSRecordPlan{
+				AccountLabel: accountLabel,
+				Domain:       domain,
+				Name:         name,
+				FQDN:         fqdnFromOriginSSLName(domain, name),
+				Type:         recordType,
+				Content:      target,
+				Proxied:      proxied,
+			})
+			if name == "@" {
+				rootDomains[domain] = struct{}{}
+			}
+		}
+	}
+
+	rootList := make([]string, 0, len(rootDomains))
+	for domain := range rootDomains {
+		rootList = append(rootList, domain)
+	}
+	sort.Strings(rootList)
+	for _, domain := range rootList {
+		if _, exists := seenName[strings.Join([]string{domain, "www"}, "|")]; exists {
+			continue
+		}
+		appendRecord(OriginSSLDNSRecordPlan{
+			AccountLabel: accountLabel,
+			Domain:       domain,
+			Name:         "www",
+			FQDN:         "www." + domain,
+			Type:         "CNAME",
+			Content:      domain,
+			Proxied:      proxied,
+			AutoWWW:      true,
+		})
+	}
+	return plan
+}
+
+func mergeOriginSSLDNSRecords(existing []OriginSSLDNSRecordPlan, next []OriginSSLDNSRecordPlan) []OriginSSLDNSRecordPlan {
+	out := make([]OriginSSLDNSRecordPlan, 0, len(existing)+len(next))
+	seen := make(map[string]struct{}, len(existing)+len(next))
+	appendRecord := func(record OriginSSLDNSRecordPlan) {
+		if len(out) >= originSSLDNSRecordLimit {
+			return
+		}
+		key := strings.Join([]string{record.Domain, record.Name, record.Type}, "|")
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, record)
+	}
+	for _, record := range existing {
+		appendRecord(record)
+	}
+	for _, record := range next {
+		appendRecord(record)
+	}
+	return out
+}
+
+func remainingOriginSSLDNSDomains(all []string, selected []string) []string {
+	selectedSet := make(map[string]struct{}, len(selected))
+	for _, domain := range normalizeOriginSSLSelectedDomains(selected) {
+		selectedSet[domain] = struct{}{}
+	}
+	var remaining []string
+	for _, domain := range normalizeOriginSSLSelectedDomains(all) {
+		if _, ok := selectedSet[domain]; ok {
+			continue
+		}
+		remaining = append(remaining, domain)
+	}
+	return remaining
+}
+
+func splitOriginSSLFields(input string) []string {
+	fields := strings.FieldsFunc(input, func(r rune) bool {
+		return unicode.IsSpace(r) || r == ',' || r == ';' || r == '，' || r == '；'
+	})
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		out = append(out, field)
+	}
+	return out
+}
+
+func parseOriginSSLDNSNamesOnly(input string) ([]string, bool) {
+	fields := splitOriginSSLFields(input)
+	if len(fields) == 0 {
+		return nil, false
+	}
+	names := make([]string, 0, len(fields))
+	for _, field := range fields {
+		name, ok := normalizeOriginSSLDNSName(field)
+		if !ok {
+			return nil, false
+		}
+		names = append(names, name)
+	}
+	return normalizeOriginSSLDNSNames(names), true
+}
+
+func normalizeOriginSSLDNSNames(names []string) []string {
+	seen := make(map[string]struct{}, len(names))
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		normalized, ok := normalizeOriginSSLDNSName(name)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func normalizeOriginSSLDNSName(input string) (string, bool) {
+	name := strings.TrimSpace(strings.ToLower(input))
+	name = strings.TrimSuffix(name, ".")
+	if name == "@" {
+		return "@", true
+	}
+	if name == "" || strings.Contains(name, ".") || strings.Contains(name, "://") || strings.ContainsAny(name, "/?#[]@") {
+		return "", false
+	}
+	if len(name) > 63 || strings.HasPrefix(name, "-") || strings.HasSuffix(name, "-") {
+		return "", false
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return "", false
+	}
+	return name, true
+}
+
+func normalizeOriginSSLHostname(input string) (string, bool) {
+	host := strings.TrimSpace(strings.ToLower(input))
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 {
+		return "", false
+	}
+	if strings.Contains(host, "://") || strings.ContainsAny(host, "/?#[]@") {
+		return "", false
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return "", false
+	}
+	for _, label := range labels {
+		if label == "" || len(label) > 63 {
+			return "", false
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return "", false
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
+			return "", false
+		}
+	}
+	return host, true
+}
+
+func looksLikeIPv4Literal(input string) bool {
+	parts := strings.Split(input, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func normalizeOriginSSLSelectedDomains(domains []string) []string {
+	seen := make(map[string]struct{}, len(domains))
+	out := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		host, ok := normalizeOriginSSLHostname(domain)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[host]; exists {
+			continue
+		}
+		seen[host] = struct{}{}
+		out = append(out, host)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if len(out[i]) == len(out[j]) {
+			return out[i] < out[j]
+		}
+		return len(out[i]) > len(out[j])
+	})
+	return out
+}
+
+func matchOriginSSLSelectedDomain(host string, zones []string) (string, string, bool) {
+	for _, zone := range zones {
+		if host == zone {
+			return zone, "@", true
+		}
+		suffix := "." + zone
+		if strings.HasSuffix(host, suffix) {
+			name := strings.TrimSuffix(host, suffix)
+			if name == "" || strings.Contains(name, "..") {
+				return "", "", false
+			}
+			return zone, name, true
+		}
+	}
+	return "", "", false
+}
+
+func fqdnFromOriginSSLName(domain string, name string) string {
+	if name == "@" || strings.TrimSpace(name) == "" {
+		return domain
+	}
+	return name + "." + domain
+}
+
+func originSSLDomainNames(items []OriginSSLDomainItem) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		name := strings.TrimSpace(strings.ToLower(item.Name))
+		if name == "" {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+func OriginSSLDomainNames(items []OriginSSLDomainItem) []string {
+	return originSSLDomainNames(items)
+}
+
+func ProcessOriginSSLDomainItems(ctx context.Context, client cfclient.Client, account config.CF, items []OriginSSLDomainItem, awsAliases []string, blockCountries []string) OriginSSLInteractiveResult {
+	result := OriginSSLInteractiveResult{
+		AccountLabel: account.Label,
+		AWSAliases:   append([]string(nil), awsAliases...),
+	}
+	if client == nil {
+		client = cfclient.NewClient()
+	}
+	if len(items) == 0 {
+		return result
+	}
+	items = append([]OriginSSLDomainItem(nil), items...)
+	sort.SliceStable(items, func(i, j int) bool {
+		iActive := strings.EqualFold(strings.TrimSpace(items[i].Status), "active") && !items[i].Paused
+		jActive := strings.EqualFold(strings.TrimSpace(items[j].Status), "active") && !items[j].Paused
+		if iActive != jActive {
+			return iActive
+		}
+		return items[i].Name < items[j].Name
+	})
+
+	cfPacer := newBatchAPIPacerWithInterval(originSSLCFCallInterval)
+	awsPacer := newBatchAPIPacerWithInterval(originSSLAWSCallInterval)
+	sem := make(chan struct{}, originSSLTaskConcurrency)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, item := range items {
+		item := item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			domainResult, err := processOriginSSLDomainItem(ctx, client, account, item, cfPacer, awsPacer, awsAliases, blockCountries)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				result.Failed = append(result.Failed, fmt.Sprintf("%s: %v", item.Name, err))
+				return
+			}
+			result.Success = append(result.Success, domainResult)
+		}()
+	}
+
+	wg.Wait()
+	sort.Slice(result.Success, func(i, j int) bool {
+		return result.Success[i].Domain < result.Success[j].Domain
+	})
+	sort.Strings(result.Failed)
+	return result
+}
+
+func processOriginSSLDomainItem(ctx context.Context, client cfclient.Client, account config.CF, item OriginSSLDomainItem, cfPacer *batchAPIPacer, awsPacer *batchAPIPacer, awsAliases []string, blockCountries []string) (OriginSSLInteractiveDomainResult, error) {
+	zone, err := waitOriginSSLZoneActive(ctx, client, account, item)
+	if err != nil {
+		return OriginSSLInteractiveDomainResult{}, err
+	}
+
+	if err := cfPacer.Wait(ctx); err != nil {
+		return OriginSSLInteractiveDomainResult{}, fmt.Errorf("创建 Origin CA 前等待失败: %w", err)
+	}
+	cert, err := createOriginSSLCertWithRetry(ctx, client, account, item.Name)
+	if err != nil {
+		return OriginSSLInteractiveDomainResult{}, err
+	}
+	if rt := reminder.DefaultRuntime(); rt != nil {
+		rt.RecordOriginCert(ctx, item.Name, account.Label, cert)
+	}
+
+	domainResult := OriginSSLInteractiveDomainResult{
+		Domain:       item.Name,
+		AccountLabel: account.Label,
+		CertID:       cert.ID,
+	}
+
+	if err := cfPacer.Wait(ctx); err != nil {
+		domainResult.StrictErr = fmt.Errorf("设置 Full(Strict) 前等待失败: %w", err)
+	} else {
+		domainResult.StrictErr = setOriginSSLStrictWithRetry(ctx, client, account, zone.ID)
+	}
+
+	for _, awsAlias := range awsAliases {
+		target, ok := config.Cfg.AWSTargets[awsAlias]
+		if !ok {
+			domainResult.Imports = append(domainResult.Imports, OriginSSLAWSImportResult{
+				Alias: awsAlias,
+				Err:   fmt.Errorf("未知 AWS 目标别名"),
+			})
+			continue
+		}
+		if err := awsPacer.Wait(ctx); err != nil {
+			domainResult.Imports = append(domainResult.Imports, OriginSSLAWSImportResult{
+				Alias:  awsAlias,
+				Region: target.Region,
+				Err:    fmt.Errorf("导入 ACM 前等待失败: %w", err),
+			})
+			continue
+		}
+		arn, importErr := importToACM(ctx, target, cert.CertificatePEM, cert.PrivateKeyPEM)
+		domainResult.Imports = append(domainResult.Imports, OriginSSLAWSImportResult{
+			Alias:  awsAlias,
+			Region: target.Region,
+			ARN:    arn,
+			Err:    importErr,
+		})
+	}
+
+	if err := cfPacer.Wait(ctx); err != nil {
+		domainResult.PostInitErrors = append(domainResult.PostInitErrors, "post init wait: "+err.Error())
+		return domainResult, nil
+	}
+	applyOriginSSLPostInit(ctx, client, account, item.Name, zone.ID, blockCountries, &domainResult)
+
+	return domainResult, nil
+}
+
+func waitOriginSSLZoneActive(ctx context.Context, client cfclient.Client, account config.CF, item OriginSSLDomainItem) (cfclient.ZoneDetail, error) {
+	if strings.EqualFold(strings.TrimSpace(item.Status), "active") && strings.TrimSpace(item.ZoneID) != "" && !item.Paused {
+		return cfclient.ZoneDetail{
+			ID:     item.ZoneID,
+			Name:   item.Name,
+			Status: item.Status,
+			Paused: item.Paused,
+		}, nil
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < originSSLStatusPollAttempts; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(originSSLStatusPollInterval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return cfclient.ZoneDetail{}, ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		zone, err := client.GetZoneDetails(ctx, account, item.Name)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(zone.Status), "active") && !zone.Paused {
+			return zone, nil
+		}
+		lastErr = fmt.Errorf("zone status=%s paused=%v", zone.Status, zone.Paused)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("等待 zone active 超时")
+	}
+	return cfclient.ZoneDetail{}, fmt.Errorf("等待域名 active 超时: %w", lastErr)
+}
+
+func createOriginSSLCertWithRetry(ctx context.Context, client cfclient.Client, account config.CF, domain string) (cfclient.OriginCert, error) {
+	hostnames := []string{domain, "*." + domain}
+	var lastErr error
+	for attempt := 0; attempt < originSSLCertRetryAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, originSSLCertRequestTimeout)
+		cert, err := client.CreateOriginCertificate(attemptCtx, account, hostnames)
+		cancel()
+		if err == nil {
+			return cert, nil
+		}
+		lastErr = err
+		if !isRetryableCloudflareError(err) || attempt == originSSLCertRetryAttempts-1 {
+			break
+		}
+		log.Printf("[/ssl] create Origin CA retry domain=%s account=%s attempt=%d/%d err=%v", domain, account.Label, attempt+1, originSSLCertRetryAttempts, err)
+		if err := waitOriginSSLRetry(ctx, attempt); err != nil {
+			return cfclient.OriginCert{}, err
+		}
+	}
+	return cfclient.OriginCert{}, fmt.Errorf("创建 Origin CA 失败: %w", lastErr)
+}
+
+func setOriginSSLStrictWithRetry(ctx context.Context, client cfclient.Client, account config.CF, zoneID string) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		err := client.SetZoneSSLFullStrict(ctx, account, zoneID)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableCloudflareError(err) || attempt == 2 {
+			break
+		}
+		if err := waitOriginSSLRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
+type countryBlockRuleEnsurer interface {
+	EnsureCountryBlockRule(ctx context.Context, account config.CF, zoneID string, countries []string) (string, error)
+}
+
+func ensureOriginSSLCountryBlock(ctx context.Context, client cfclient.Client, account config.CF, zoneID string, countries []string) (string, []string, error) {
+	normalized, err := cfclient.NormalizeCountryCodes(countries)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(normalized) == 0 {
+		return "skipped", nil, nil
+	}
+	ensurer, ok := client.(countryBlockRuleEnsurer)
+	if !ok {
+		return "", normalized, fmt.Errorf("当前 Cloudflare 客户端不支持 WAF 国家/地区拦截初始化")
+	}
+	status, err := ensurer.EnsureCountryBlockRule(ctx, account, zoneID, normalized)
+	return status, normalized, err
+}
+
+func applyOriginSSLPostInit(ctx context.Context, client cfclient.Client, account config.CF, domain string, zoneID string, blockCountries []string, result *OriginSSLInteractiveDomainResult) {
+	initializer, ok := client.(cloudflarePostInitializer)
+	if !ok {
+		result.CountryBlockStatus = "skipped"
+		result.CountryBlockCountries = nil
+		for _, setting := range client.ApplyRecommendedSpeedSettings(ctx, account, zoneID) {
+			if setting.Err != nil {
+				result.SpeedFailed = append(result.SpeedFailed, fmt.Sprintf("%s: %v", setting.Name, setting.Err))
+				continue
+			}
+			result.SpeedApplied = append(result.SpeedApplied, setting.Name)
+		}
+		return
+	}
+
+	postResult, err := initializer.RunPostSSLInit(ctx, account, domain, zoneID, cfclient.PostInitOptions{
+		AccountID:           account.AccountID,
+		BlockCountries:      nil,
+		EnableSecurityRules: false,
+		EnableSpeedSettings: config.EnableSpeedRecommendations(),
+		EnableCacheRule:     config.EnableCacheRule(),
+		CloneCacheRule:      true,
+		EnableRUM:           config.EnableRUMAutoInstall(),
+		ZoneActiveTimeout:   originSSLPostInitZoneActiveTimeout,
+		SSLActiveTimeout:    originSSLPostInitSSLActiveTimeout,
+		PollInterval:        originSSLPostInitPollInterval,
+	})
+	if postResult != nil {
+		result.CountryBlockStatus = postResult.SecurityRuleStatus
+		result.CacheRuleStatus = postResult.CacheRuleStatus
+		result.RUMStatus = postResult.RUMStatus
+		for setting, status := range postResult.SpeedStatus {
+			if strings.HasPrefix(status, "failed:") || strings.HasPrefix(status, "skipped:") {
+				result.SpeedFailed = append(result.SpeedFailed, fmt.Sprintf("%s: %s", setting, status))
+				continue
+			}
+			result.SpeedApplied = append(result.SpeedApplied, setting)
+		}
+		result.PostInitErrors = append(result.PostInitErrors, postResult.Errors...)
+	}
+	if err != nil {
+		result.PostInitErrors = append(result.PostInitErrors, err.Error())
+		if result.CountryBlockStatus == "" {
+			result.CountryBlockStatus = "skipped"
+		}
+	}
+}
+
+func applyOriginSSLPostInitBatch(ctx context.Context, client cfclient.Client, account config.CF, domain string, zoneID string, blockCountries []string, result *originSSLDomainResult) {
+	initializer, ok := client.(cloudflarePostInitializer)
+	if !ok {
+		result.CountryBlockStatus = "skipped"
+		result.CountryBlockCountries = nil
+		_ = client.ApplyRecommendedSpeedSettings(ctx, account, zoneID)
+		return
+	}
+	postResult, err := initializer.RunPostSSLInit(ctx, account, domain, zoneID, cfclient.PostInitOptions{
+		AccountID:           account.AccountID,
+		BlockCountries:      nil,
+		EnableSecurityRules: false,
+		EnableSpeedSettings: config.EnableSpeedRecommendations(),
+		EnableCacheRule:     config.EnableCacheRule(),
+		CloneCacheRule:      true,
+		EnableRUM:           config.EnableRUMAutoInstall(),
+		ZoneActiveTimeout:   originSSLPostInitZoneActiveTimeout,
+		SSLActiveTimeout:    originSSLPostInitSSLActiveTimeout,
+		PollInterval:        originSSLPostInitPollInterval,
+	})
+	if postResult != nil {
+		result.CountryBlockStatus = postResult.SecurityRuleStatus
+		result.CacheRuleStatus = postResult.CacheRuleStatus
+		result.RUMStatus = postResult.RUMStatus
+	}
+	if err != nil && result.CountryBlockStatus == "" {
+		result.CountryBlockStatus = "skipped"
+	}
+}
+
+func formatOriginSSLCountryBlock(status string, countries []string) string {
+	status = strings.TrimSpace(status)
+	if status == "" || status == "skipped" {
+		return "skip"
+	}
+	if strings.HasPrefix(status, "failed:") {
+		return "failed"
+	}
+	if len(countries) == 0 {
+		return status
+	}
+	return status + " " + strings.Join(countries, ",")
+}
+
+func ProcessOriginSSLDNSPlan(ctx context.Context, client cfclient.Client, account config.CF, plan OriginSSLDNSPlan) OriginSSLDNSCreateResult {
+	result := OriginSSLDNSCreateResult{AccountLabel: account.Label}
+	if client == nil {
+		client = cfclient.NewClient()
+	}
+
+	pacer := newBatchAPIPacerWithInterval(1500 * time.Millisecond)
+	for _, record := range plan.Records {
+		if err := pacer.Wait(ctx); err != nil {
+			result.Failed = append(result.Failed, fmt.Sprintf("%s: 等待执行失败: %v", record.FQDN, err))
+			continue
+		}
+		if err := upsertOriginSSLDNSRecordWithRetry(ctx, client, account, record); err != nil {
+			result.Failed = append(result.Failed, fmt.Sprintf("%s %s: %v", record.Type, record.FQDN, err))
+			continue
+		}
+		result.Success = append(result.Success, record)
+	}
+	return result
+}
+
+func upsertOriginSSLDNSRecordWithRetry(ctx context.Context, client cfclient.Client, account config.CF, record OriginSSLDNSRecordPlan) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err := client.UpsertDNSRecord(ctx, account, record.Domain, cfclient.DNSRecordParams{
+			Type:    record.Type,
+			Name:    record.Name,
+			Content: record.Content,
+			Proxied: record.Proxied,
+			TTL:     3600,
+		})
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableCloudflareError(err) || attempt == 2 {
+			break
+		}
+		if err := waitOriginSSLRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
+func waitOriginSSLRetry(ctx context.Context, attempt int) error {
+	timer := time.NewTimer(time.Duration(attempt+1) * 3 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (h *CommandHandler) startOriginSSLBatchTask(req OriginSSLInputRequest, domains []string, parseErrors []string) {
+	domains = normalizeOriginSSLSelectedDomains(domains)
+	req.AWSAliases = append([]string(nil), req.AWSAliases...)
+	req.BlockCountries = append([]string(nil), req.BlockCountries...)
+	parseErrors = append([]string(nil), parseErrors...)
+	log.Printf("[/ssl] batch submitted domains=%d aws_targets=%d concurrency=%d poll=%s", len(domains), len(req.AWSAliases), originSSLTaskConcurrency, originSSLStatusPollInterval)
+
+	h.sendText(fmt.Sprintf("SSL 后台任务已提交\n域名: %d\nAWS 目标: %s\n并发: %d\n轮询: %s\n\n完成后会发送证书结果和 ARN 对照。",
+		len(domains), formatOriginSSLSubmittedAWSTargets(req.AWSAliases), originSSLTaskConcurrency, originSSLStatusPollInterval))
+
+	go func() {
+		result := h.processOriginSSLBatch(req, domains)
+		result.ParseErrors = append(result.ParseErrors, parseErrors...)
+		log.Printf("[/ssl] batch completed domains=%d success=%d failed=%d parse_errors=%d", len(domains), len(result.Success), len(result.Failed), len(result.ParseErrors))
+		h.sendOriginSSLResult(result)
+	}()
+}
+
+func formatOriginSSLSubmittedAWSTargets(aliases []string) string {
+	if len(aliases) == 0 {
+		return "未选择"
+	}
+	return strings.Join(formatAWSTargets(aliases), ", ")
+}
+
 func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domains []string) originSSLBatchResult {
 	result := originSSLBatchResult{
-		AWSAliases:    append([]string(nil), req.AWSAliases...),
+		AWSAliases: append([]string(nil), req.AWSAliases...),
 	}
 
 	accounts := append([]config.CF(nil), h.Accounts...)
@@ -301,69 +1562,155 @@ func (h *CommandHandler) processOriginSSLBatch(req OriginSSLInputRequest, domain
 	}
 
 	ctx := context.Background()
-	cfPacer := newBatchAPIPacer()
-	awsPacer := newBatchAPIPacer()
+	cfPacer := newBatchAPIPacerWithInterval(originSSLCFCallInterval)
+	awsPacer := newBatchAPIPacerWithInterval(originSSLAWSCallInterval)
+	sem := make(chan struct{}, originSSLTaskConcurrency)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
 	for _, domain := range domains {
-		acc, zone, err := h.findAccountByDomainInAccounts(ctx, domain, accounts)
-		if err != nil {
-			result.Failed = append(result.Failed, fmt.Sprintf("%s: %v", domain, err))
-			continue
-		}
+		domain := domain
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		hostnames := []string{domain, "*." + domain}
-		if err := cfPacer.Wait(ctx); err != nil {
-			result.Failed = append(result.Failed, fmt.Sprintf("%s: 创建源站证书前等待失败: %v", domain, err))
-			continue
-		}
-		cert, err := h.CFClient.CreateOriginCertificate(ctx, acc, hostnames)
-		if err != nil {
-			result.Failed = append(result.Failed, fmt.Sprintf("%s: 创建源站证书失败: %v", domain, err))
-			continue
-		}
-
-		domainResult := originSSLDomainResult{
-			Domain:       domain,
-			AccountLabel: acc.Label,
-		}
-
-		if err := cfPacer.Wait(ctx); err != nil {
-			domainResult.StrictErr = fmt.Errorf("设置 Full(Strict) 前等待失败: %w", err)
-		} else if serr := h.CFClient.SetZoneSSLFullStrict(ctx, acc, zone.ID); serr != nil {
-			domainResult.StrictErr = serr
-		}
-
-		for _, awsAlias := range req.AWSAliases {
-			target, ok := config.Cfg.AWSTargets[awsAlias]
-			if !ok {
-				domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
-					Alias: awsAlias,
-					Err:   fmt.Errorf("未知 AWS 目标别名"),
-				})
-				continue
+			log.Printf("[/ssl] domain task started domain=%s", domain)
+			domainResult, err := h.processOriginSSLDirectDomain(ctx, req, domain, accounts, cfPacer, awsPacer)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				log.Printf("[/ssl] domain task failed domain=%s err=%v", domain, err)
+				result.Failed = append(result.Failed, fmt.Sprintf("%s: %v", domain, err))
+				return
 			}
+			log.Printf("[/ssl] domain task completed domain=%s account=%s imports=%d waf=%s cache=%s", domainResult.Domain, domainResult.AccountLabel, len(domainResult.Imports), domainResult.CountryBlockStatus, domainResult.CacheRuleStatus)
+			result.Success = append(result.Success, domainResult)
+		}()
+	}
 
-			if err := awsPacer.Wait(ctx); err != nil {
-				domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
-					Alias:  awsAlias,
-					Region: target.Region,
-					Err:    fmt.Errorf("导入 ACM 前等待失败: %w", err),
-				})
-				continue
-			}
+	wg.Wait()
+	sort.Slice(result.Success, func(i, j int) bool {
+		return result.Success[i].Domain < result.Success[j].Domain
+	})
+	sort.Strings(result.Failed)
+	return result
+}
 
-			arn, importErr := importToACM(ctx, target, cert.CertificatePEM, cert.PrivateKeyPEM)
+func (h *CommandHandler) processOriginSSLDirectDomain(ctx context.Context, req OriginSSLInputRequest, domain string, accounts []config.CF, cfPacer *batchAPIPacer, awsPacer *batchAPIPacer) (originSSLDomainResult, error) {
+	acc, zone, err := h.findAccountByDomainInAccountsPaced(ctx, domain, accounts, cfPacer)
+	if err != nil {
+		return originSSLDomainResult{}, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(zone.Status), "active") || zone.Paused {
+		zone, err = waitOriginSSLZoneActive(ctx, h.CFClient, acc, OriginSSLDomainItem{
+			Name:   domain,
+			ZoneID: zone.ID,
+			Status: zone.Status,
+			Paused: zone.Paused,
+		})
+		if err != nil {
+			return originSSLDomainResult{}, err
+		}
+	}
+
+	if err := cfPacer.Wait(ctx); err != nil {
+		return originSSLDomainResult{}, fmt.Errorf("创建源站证书前等待失败: %w", err)
+	}
+	cert, err := createOriginSSLCertWithRetry(ctx, h.CFClient, acc, domain)
+	if err != nil {
+		return originSSLDomainResult{}, err
+	}
+	if rt := reminder.DefaultRuntime(); rt != nil {
+		rt.RecordOriginCert(ctx, domain, acc.Label, cert)
+	}
+
+	domainResult := originSSLDomainResult{
+		Domain:       domain,
+		AccountLabel: acc.Label,
+	}
+
+	if err := cfPacer.Wait(ctx); err != nil {
+		domainResult.StrictErr = fmt.Errorf("设置 Full(Strict) 前等待失败: %w", err)
+	} else if serr := setOriginSSLStrictWithRetry(ctx, h.CFClient, acc, zone.ID); serr != nil {
+		domainResult.StrictErr = serr
+	}
+
+	for _, awsAlias := range req.AWSAliases {
+		target, ok := config.Cfg.AWSTargets[awsAlias]
+		if !ok {
+			domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
+				Alias: awsAlias,
+				Err:   fmt.Errorf("未知 AWS 目标别名"),
+			})
+			continue
+		}
+
+		if err := awsPacer.Wait(ctx); err != nil {
 			domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
 				Alias:  awsAlias,
 				Region: target.Region,
-				ARN:    arn,
-				Err:    importErr,
+				Err:    fmt.Errorf("导入 ACM 前等待失败: %w", err),
 			})
+			continue
 		}
 
-		result.Success = append(result.Success, domainResult)
+		arn, importErr := importToACM(ctx, target, cert.CertificatePEM, cert.PrivateKeyPEM)
+		domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
+			Alias:  awsAlias,
+			Region: target.Region,
+			ARN:    arn,
+			Err:    importErr,
+		})
 	}
 
-	return result
+	if err := cfPacer.Wait(ctx); err != nil {
+		domainResult.CountryBlockStatus = "failed: " + err.Error()
+	} else {
+		applyOriginSSLPostInitBatch(ctx, h.CFClient, acc, domain, zone.ID, req.BlockCountries, &domainResult)
+	}
+
+	return domainResult, nil
+}
+
+func (h *CommandHandler) findAccountByDomainInAccountsPaced(ctx context.Context, domain string, accounts []config.CF, pacer *batchAPIPacer) (config.CF, cfclient.ZoneDetail, error) {
+	if pacer == nil {
+		return h.findAccountByDomainInAccounts(ctx, domain, accounts)
+	}
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名为空")
+	}
+
+	type matchedItem struct {
+		Account config.CF
+		Zone    cfclient.ZoneDetail
+	}
+	var matches []matchedItem
+	for _, acc := range accounts {
+		if err := pacer.Wait(ctx); err != nil {
+			return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("识别 Cloudflare 账号前等待失败: %w", err)
+		}
+		zone, err := h.CFClient.GetZoneDetails(ctx, acc, domain)
+		if err != nil {
+			if errors.Is(err, cfclient.ErrZoneNotFound) || strings.Contains(strings.ToLower(err.Error()), "zone not found") {
+				continue
+			}
+			return config.CF{}, cfclient.ZoneDetail{}, err
+		}
+		if !strings.EqualFold(strings.TrimSpace(zone.Name), domain) {
+			continue
+		}
+		matches = append(matches, matchedItem{Account: acc, Zone: zone})
+	}
+	if len(matches) == 0 {
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名 %s 不在任何可用 Cloudflare 账号中", domain)
+	}
+	if len(matches) > 1 {
+		return config.CF{}, cfclient.ZoneDetail{}, fmt.Errorf("域名 %s 在多个 Cloudflare 账号中重复，无法确定唯一来源", domain)
+	}
+	return matches[0].Account, matches[0].Zone, nil
 }
 
 func (h *CommandHandler) findAccountByDomainInAccounts(ctx context.Context, domain string, accounts []config.CF) (config.CF, cfclient.ZoneDetail, error) {
@@ -429,6 +1776,32 @@ func formatAWSTargets(aliases []string) []string {
 func (h *CommandHandler) sendOriginSSLResult(result originSSLBatchResult) {
 	h.sendText(result.SummaryText())
 	h.sendOriginSSLARNOutputs(result)
+}
+
+func SendOriginSSLInteractiveARNOutputs(sender Sender, result OriginSSLInteractiveResult) {
+	if sender == nil {
+		sender = DefaultSender()
+	}
+	batch := originSSLBatchResult{
+		AWSAliases: append([]string(nil), result.AWSAliases...),
+	}
+	for _, item := range result.Success {
+		domainResult := originSSLDomainResult{
+			Domain:       item.Domain,
+			AccountLabel: item.AccountLabel,
+		}
+		for _, imp := range item.Imports {
+			domainResult.Imports = append(domainResult.Imports, originSSLImportResult{
+				Alias:  imp.Alias,
+				Region: imp.Region,
+				ARN:    imp.ARN,
+				Err:    imp.Err,
+			})
+		}
+		batch.Success = append(batch.Success, domainResult)
+	}
+	h := &CommandHandler{Sender: sender}
+	h.sendOriginSSLARNOutputs(batch)
 }
 
 func (h *CommandHandler) sendOriginSSLARNOutputs(result originSSLBatchResult) {
@@ -680,14 +2053,15 @@ func (h *CommandHandler) originSSLPromptText() string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("生成 Cloudflare Origin CA 源站证书（15年）。\n")
-	sb.WriteString("Cloudflare 账号会按域名自动识别，只需要多选 AWS 目标，再输入一个或多个主域名。\n\n")
-	sb.WriteString("兼容直接命令：/ssl example.com example.net us-aws sg-aws\n")
-	sb.WriteString("说明：每个域名固定签发 domain.com + *.domain.com\n\n")
-	sb.WriteString("可选 AWS 目标：\n")
-	for _, alias := range sortedAWSTargetAliases() {
-		target := config.Cfg.AWSTargets[alias]
-		sb.WriteString(fmt.Sprintf("- %s (%s)\n", alias, target.Region))
+	sb.WriteString("/ssl 交互流程会先选择 Cloudflare 账号，再从该账号已有域名中分页选择。\n")
+	sb.WriteString("确认后可后台创建 Origin CA 证书、设置 Full(Strict)、启用可用加速建议，并可继续创建 DNS 解析。\n\n")
+	sb.WriteString("兼容直接命令：/ssl example.com example.net aws-alias\n\n")
+	sb.WriteString("请选择目标 Cloudflare 账号：\n")
+	for _, acc := range h.Accounts {
+		if strings.TrimSpace(acc.Label) == "" {
+			continue
+		}
+		sb.WriteString("- " + acc.Label + "\n")
 	}
 	return sb.String()
 }

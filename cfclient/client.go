@@ -1,6 +1,7 @@
 package cfclient
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -14,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +30,7 @@ type DomainInfo struct {
 	Domain string
 	Source string
 	IsCF   bool
+	ZoneID string
 	Status string
 	Paused bool
 }
@@ -37,6 +40,20 @@ type ZoneDetail struct {
 	NameServers []string
 	Status      string
 	Paused      bool
+}
+type ZoneSummary struct {
+	ID               string
+	Name             string
+	Status           string
+	Paused           bool
+	CreatedOn        time.Time
+	Plan             string
+	SecurityInsights string
+	UniqueVisitors   string
+}
+type ZoneSettingResult struct {
+	Name string
+	Err  error
 }
 type OriginCert struct {
 	ID             string
@@ -56,6 +73,30 @@ type OriginCACertInfo struct {
 	RequestType string
 }
 
+// AbuseReportInfo 是 Cloudflare 滥用报告的统一摘要结构。
+// Cloudflare 的滥用报告接口字段可能随报告类型变化，因此这里保留 Raw 供后续扩展，
+// 同时尽量提取日报通知里最有用的字段。
+type AbuseReportInfo struct {
+	ID           string
+	AccountLabel string
+	AccountID    string
+	Domain       string
+	ReportType   string
+	Status       string
+	Date         time.Time
+	Mitigation   string
+	Title        string
+	Summary      string
+	Reporter     string
+	URLs         []string
+	Raw          map[string]any
+}
+
+type AbuseReportListOptions struct {
+	PerPage  int
+	MaxPages int
+}
+
 // Client 定义了 Cloudflare 相关操作的抽象接口
 type Client interface {
 	FetchAllDomains(ctx context.Context, account config.CF) ([]DomainInfo, error)
@@ -65,8 +106,11 @@ type Client interface {
 	GetZoneDetails(ctx context.Context, account config.CF, domain string) (ZoneDetail, error)
 	CreateZone(ctx context.Context, account config.CF, domain string) (ZoneDetail, error)
 	UpsertDNSRecord(ctx context.Context, account config.CF, domain string, params DNSRecordParams) (cloudflare.DNSRecord, error)
+	UpdateDNSRecord(ctx context.Context, account config.CF, domain string, params DNSRecordUpdateParams) (cloudflare.DNSRecord, error)
 	DeleteDNSRecord(ctx context.Context, account config.CF, domain string, recordName string) (int, error)
 	ListZones(ctx context.Context, acc config.CF) ([]ZoneDetail, error)
+	ListZoneSummaries(ctx context.Context, account config.CF) ([]ZoneSummary, error)
+	ApplyRecommendedSpeedSettings(ctx context.Context, account config.CF, zoneID string) []ZoneSettingResult
 	CreateOriginCertificate(ctx context.Context, account config.CF, hostnames []string) (OriginCert, error)
 	ListOriginCACertificates(ctx context.Context, account config.CF) ([]OriginCACertInfo, error)
 	PurgeZoneCache(ctx context.Context, account config.CF, zoneID string) error
@@ -77,15 +121,21 @@ type Client interface {
 	DeleteCustomListItem(ctx context.Context, account config.CF, listID string, itemID string) ([]cloudflare.ListItem, error)
 	SetZoneSSLFullStrict(ctx context.Context, account config.CF, domain string) error
 	GetAbuseReportCount(ctx context.Context, account config.CF) (int, error)
+	ListAbuseReports(ctx context.Context, account config.CF, opts AbuseReportListOptions) ([]AbuseReportInfo, error)
 }
 
 type apiClient struct {
 	accountIDMu    sync.RWMutex
 	accountIDCache map[string]string
+	baseURL        string
+	httpClient     *http.Client
 }
 
 type abuseReportsResponse struct {
 	ResultInfo struct {
+		Page       int `json:"page"`
+		PerPage    int `json:"per_page"`
+		TotalPages int `json:"total_pages"`
 		TotalCount int `json:"total_count"`
 	} `json:"result_info"`
 	Result json.RawMessage `json:"result"`
@@ -96,10 +146,59 @@ type abuseReportsResponse struct {
 	Success bool `json:"success"`
 }
 
+type zoneListResponse struct {
+	Result []struct {
+		ID        string    `json:"id"`
+		Name      string    `json:"name"`
+		Status    string    `json:"status"`
+		Paused    bool      `json:"paused"`
+		CreatedOn time.Time `json:"created_on"`
+		Plan      struct {
+			Name string `json:"name"`
+		} `json:"plan"`
+	} `json:"result"`
+	ResultInfo struct {
+		Page       int `json:"page"`
+		PerPage    int `json:"per_page"`
+		TotalPages int `json:"total_pages"`
+	} `json:"result_info"`
+	Errors []struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"errors"`
+	Success bool `json:"success"`
+}
+
+type zoneOverviewGraphQLResponse struct {
+	Data struct {
+		Viewer struct {
+			Zones []struct {
+				ZoneTag string `json:"zoneTag"`
+				HTTP    []struct {
+					Uniq struct {
+						Uniques int `json:"uniques"`
+					} `json:"uniq"`
+					Sum struct {
+						Threats int `json:"threats"`
+					} `json:"sum"`
+				} `json:"httpRequests1dGroups"`
+				Firewall []struct {
+					Count int `json:"count"`
+				} `json:"firewallEventsAdaptiveGroups"`
+			} `json:"zones"`
+		} `json:"viewer"`
+	} `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
 // NewClient 返回默认的 Cloudflare API 客户端实现
 func NewClient() Client {
 	return &apiClient{
 		accountIDCache: make(map[string]string),
+		baseURL:        "https://api.cloudflare.com/client/v4",
+		httpClient:     http.DefaultClient,
 	}
 }
 
@@ -112,6 +211,15 @@ type DNSRecordParams struct {
 	Name    string
 	Content string
 	Proxied bool
+	TTL     int
+}
+
+type DNSRecordUpdateParams struct {
+	ID      string
+	Type    string
+	Name    string
+	Content string
+	Proxied *bool
 	TTL     int
 }
 
@@ -205,6 +313,308 @@ func (c *apiClient) GetAbuseReportCount(ctx context.Context, account config.CF) 
 	}
 	return 0, lastErr
 }
+func (c *apiClient) ListAbuseReports(ctx context.Context, account config.CF, opts AbuseReportListOptions) ([]AbuseReportInfo, error) {
+	ctx, cancel := ensureTimeout(ctx)
+	defer cancel()
+
+	accountID, err := c.GetAccountID(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+
+	perPage := opts.PerPage
+	if perPage <= 0 {
+		perPage = 50
+	}
+	if perPage > 100 {
+		perPage = 100
+	}
+	maxPages := opts.MaxPages
+	if maxPages <= 0 {
+		maxPages = 5
+	}
+
+	reports := make([]AbuseReportInfo, 0)
+	for page := 1; page <= maxPages; page++ {
+		endpoint := fmt.Sprintf("%s/accounts/%s/abuse-reports", strings.TrimRight(c.baseURL, "/"), accountID)
+		q := url.Values{}
+		q.Set("page", fmt.Sprintf("%d", page))
+		q.Set("per_page", fmt.Sprintf("%d", perPage))
+		endpoint += "?" + q.Encode()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("构建滥用报告请求失败 [%s]: %v", account.Label, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+account.APIToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		client := c.httpClient
+		if client == nil {
+			client = http.DefaultClient
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("查询滥用报告失败 [%s]: %v", account.Label, err)
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("读取滥用报告响应失败 [%s]: %v", account.Label, readErr)
+		}
+
+		var result abuseReportsResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, fmt.Errorf("解析滥用报告响应失败 [%s]: %v", account.Label, err)
+		}
+		if resp.StatusCode >= http.StatusBadRequest || !result.Success {
+			detail := strings.TrimSpace(string(body))
+			if len(result.Errors) > 0 {
+				detail = result.Errors[0].Message
+			}
+			return nil, fmt.Errorf("查询滥用报告失败 [%s]: HTTP %d %s", account.Label, resp.StatusCode, strings.TrimSpace(detail))
+		}
+
+		items, err := parseAbuseReportItems(result.Result)
+		if err != nil {
+			return nil, fmt.Errorf("解析滥用报告列表失败 [%s]: %v", account.Label, err)
+		}
+		for _, item := range items {
+			info := normalizeAbuseReport(account.Label, accountID, item)
+			reports = append(reports, info)
+		}
+
+		if len(items) == 0 {
+			break
+		}
+		if result.ResultInfo.TotalPages > 0 && page >= result.ResultInfo.TotalPages {
+			break
+		}
+		if len(items) < perPage && result.ResultInfo.TotalPages == 0 {
+			break
+		}
+	}
+	return reports, nil
+}
+
+func parseAbuseReportItems(raw json.RawMessage) ([]map[string]any, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+
+	var arr []map[string]any
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return arr, nil
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, err
+	}
+	for _, key := range []string{"reports", "items", "data", "result"} {
+		if items := anyToMapSlice(obj[key]); len(items) > 0 {
+			return items, nil
+		}
+	}
+	return []map[string]any{obj}, nil
+}
+
+func anyToMapSlice(v any) []map[string]any {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(arr))
+	for _, item := range arr {
+		if m, ok := item.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func normalizeAbuseReport(accountLabel, accountID string, raw map[string]any) AbuseReportInfo {
+	info := AbuseReportInfo{
+		AccountLabel: accountLabel,
+		AccountID:    accountID,
+		Raw:          raw,
+	}
+	info.ID = firstString(raw, "id", "report_id", "reportId", "uuid", "identifier", "case_id", "caseId")
+	info.Domain = firstDomain(raw)
+	info.ReportType = firstString(raw, "report_type", "reportType", "abuse_type", "abuseType", "type", "category", "reason")
+	info.Status = firstString(raw, "status", "state", "report_status", "reportStatus")
+	info.Mitigation = firstString(raw, "mitigation", "mitigations", "mitigation_status", "mitigationStatus", "mitigation_action", "mitigationAction", "mitigation_actions", "mitigationActions", "action", "actions", "cloudflare_mitigation", "cloudflareMitigation", "cloudflare_mitigations", "cloudflareMitigations")
+	info.Title = firstString(raw, "title", "subject", "name")
+	info.Summary = firstString(raw, "summary", "description", "detail", "message", "notes")
+	info.Reporter = firstString(raw, "reporter", "reporter_email", "reporterEmail", "submitter", "submitted_by", "submittedBy")
+	info.URLs = firstStringList(raw, "urls", "url", "reported_urls", "reportedUrls", "evidence_urls", "evidenceUrls", "evidence", "content_urls", "contentUrls", "reported_content", "reportedContent", "websites", "links")
+	info.Date = firstTime(raw, "created_at", "createdAt", "created", "reported_at", "reportedAt", "date", "timestamp", "submitted_at", "submittedAt")
+	return info
+}
+
+func firstDomain(raw map[string]any) string {
+	if value := firstString(raw, "zone_name", "zoneName", "zone", "domain", "hostname", "host", "offending_host", "offendingHost"); value != "" {
+		return strings.Trim(strings.TrimSpace(value), ".")
+	}
+	for _, candidate := range firstStringList(raw, "urls", "url", "reported_urls", "reportedUrls", "evidence_urls", "evidenceUrls", "evidence", "content_urls", "contentUrls", "reported_content", "reportedContent", "websites", "links") {
+		if host := hostFromURL(candidate); host != "" {
+			return host
+		}
+	}
+	return ""
+}
+
+func hostFromURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.Trim(strings.TrimSpace(parsed.Hostname()), ".")
+}
+
+func firstString(raw map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringFromAny(raw[key]); value != "" {
+			return value
+		}
+	}
+	for _, v := range raw {
+		if child, ok := v.(map[string]any); ok {
+			if value := firstString(child, keys...); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func firstStringList(raw map[string]any, keys ...string) []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	keySet := map[string]struct{}{}
+	for _, key := range keys {
+		keySet[strings.ToLower(key)] = struct{}{}
+	}
+	var add func(string)
+	add = func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	var walk func(any, string)
+	walk = func(v any, key string) {
+		key = strings.ToLower(key)
+		_, wanted := keySet[key]
+		switch x := v.(type) {
+		case string:
+			if wanted {
+				add(x)
+			}
+		case []string:
+			if wanted {
+				for _, item := range x {
+					add(item)
+				}
+			}
+		case []any:
+			for _, item := range x {
+				walk(item, key)
+			}
+		case map[string]any:
+			if wanted {
+				if value := stringFromAny(x); value != "" {
+					add(value)
+				}
+			}
+			for childKey, child := range x {
+				walk(child, childKey)
+			}
+		}
+	}
+	for key, value := range raw {
+		walk(value, key)
+	}
+	return out
+}
+
+func stringFromAny(v any) string {
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case fmt.Stringer:
+		return strings.TrimSpace(x.String())
+	case float64:
+		if x == float64(int64(x)) {
+			return fmt.Sprintf("%d", int64(x))
+		}
+		return fmt.Sprintf("%v", x)
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case map[string]any:
+		return firstString(x, "url", "href", "link", "hostname", "host", "domain", "name", "title", "value", "status", "type", "description", "action")
+	case []string:
+		return strings.Join(x, ", ")
+	case []any:
+		parts := make([]string, 0, len(x))
+		for _, item := range x {
+			if value := stringFromAny(item); value != "" {
+				parts = append(parts, value)
+			}
+		}
+		return strings.Join(parts, ", ")
+	default:
+		return ""
+	}
+}
+
+func firstTime(raw map[string]any, keys ...string) time.Time {
+	for _, key := range keys {
+		if t := parseAnyTime(raw[key]); !t.IsZero() {
+			return t
+		}
+	}
+	for _, v := range raw {
+		if child, ok := v.(map[string]any); ok {
+			if t := firstTime(child, keys...); !t.IsZero() {
+				return t
+			}
+		}
+	}
+	return time.Time{}
+}
+
+func parseAnyTime(v any) time.Time {
+	value := stringFromAny(v)
+	if value == "" {
+		return time.Time{}
+	}
+	formats := []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"}
+	for _, layout := range formats {
+		if t, err := time.Parse(layout, value); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 func parseAbuseResultCount(raw json.RawMessage) (int, error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
@@ -253,6 +663,11 @@ func parseAbuseResultCount(raw json.RawMessage) (int, error) {
 func (c *apiClient) GetAccountID(ctx context.Context, account config.CF) (string, error) {
 	ctx, cancel := ensureTimeout(ctx)
 	defer cancel()
+
+	if accountID := strings.TrimSpace(account.AccountID); accountID != "" {
+		c.storeAccountID(account, accountID)
+		return accountID, nil
+	}
 
 	if accountID, ok := c.cachedAccountID(account); ok {
 		return accountID, nil
@@ -699,6 +1114,55 @@ func (c *apiClient) UpsertDNSRecord(ctx context.Context, account config.CF, doma
 	return record, nil
 }
 
+func (c *apiClient) UpdateDNSRecord(ctx context.Context, account config.CF, domain string, params DNSRecordUpdateParams) (cloudflare.DNSRecord, error) {
+	ctx, cancel := ensureTimeout(ctx)
+	defer cancel()
+
+	if strings.TrimSpace(params.ID) == "" {
+		return cloudflare.DNSRecord{}, errors.New("record ID is empty")
+	}
+	if strings.TrimSpace(params.Type) == "" {
+		return cloudflare.DNSRecord{}, errors.New("record type is empty")
+	}
+	if strings.TrimSpace(params.Name) == "" {
+		return cloudflare.DNSRecord{}, errors.New("record name is empty")
+	}
+	if strings.TrimSpace(params.Content) == "" {
+		return cloudflare.DNSRecord{}, errors.New("record content is empty")
+	}
+
+	api, err := cloudflare.NewWithAPIToken(account.APIToken)
+	if err != nil {
+		return cloudflare.DNSRecord{}, fmt.Errorf("初始化客户端失败 [%s]: %v", account.Label, err)
+	}
+
+	zones, err := api.ListZonesContext(ctx, cloudflare.WithZoneFilters(domain, "", ""))
+	if err != nil {
+		return cloudflare.DNSRecord{}, fmt.Errorf("获取 Zone 失败: %v", err)
+	}
+	if len(zones.Result) == 0 {
+		return cloudflare.DNSRecord{}, fmt.Errorf("%w: %s", ErrZoneNotFound, domain)
+	}
+
+	ttl := params.TTL
+	if ttl <= 0 {
+		ttl = 1
+	}
+
+	record, err := api.UpdateDNSRecord(ctx, cloudflare.ZoneIdentifier(zones.Result[0].ID), cloudflare.UpdateDNSRecordParams{
+		ID:      params.ID,
+		Type:    strings.ToUpper(params.Type),
+		Name:    params.Name,
+		Content: params.Content,
+		TTL:     ttl,
+		Proxied: params.Proxied,
+	})
+	if err != nil {
+		return cloudflare.DNSRecord{}, fmt.Errorf("更新解析记录失败: %v", err)
+	}
+	return record, nil
+}
+
 func (c *apiClient) FetchAllDomains(ctx context.Context, account config.CF) ([]DomainInfo, error) {
 
 	ctx, cancel := ensureTimeout(ctx)
@@ -727,6 +1191,7 @@ func (c *apiClient) FetchAllDomains(ctx context.Context, account config.CF) ([]D
 			Domain: z.Name,
 			Source: account.Label,
 			IsCF:   true,
+			ZoneID: z.ID,
 			Status: z.Status,
 			Paused: z.Paused,
 		})
@@ -785,6 +1250,311 @@ func (c *apiClient) ListZones(ctx context.Context, account config.CF) ([]ZoneDet
 		})
 	}
 	return out, nil
+}
+
+func (c *apiClient) ListZoneSummaries(ctx context.Context, account config.CF) ([]ZoneSummary, error) {
+	var cancel context.CancelFunc
+	if _, ok := ctx.Deadline(); ok {
+		cancel = func() {}
+	} else {
+		ctx, cancel = context.WithTimeout(ctx, 3*time.Minute)
+	}
+	defer cancel()
+
+	accountID, err := c.GetAccountID(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]ZoneSummary, 0)
+	for page := 1; ; page++ {
+		q := url.Values{}
+		q.Set("account.id", accountID)
+		q.Set("page", fmt.Sprintf("%d", page))
+		q.Set("per_page", "50")
+		endpoint := "https://api.cloudflare.com/client/v4/zones?" + q.Encode()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("构建 Zone 列表请求失败 [%s]: %v", account.Label, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+account.APIToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("列出 Zone 失败 [%s]: %v", account.Label, err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("读取 Zone 列表响应失败 [%s]: %v", account.Label, readErr)
+		}
+
+		var result zoneListResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, fmt.Errorf("解析 Zone 列表响应失败 [%s]: %v", account.Label, err)
+		}
+		if resp.StatusCode >= http.StatusBadRequest || !result.Success {
+			detail := ""
+			if len(result.Errors) > 0 {
+				detail = result.Errors[0].Message
+			}
+			return nil, fmt.Errorf("列出 Zone 失败 [%s]: HTTP %d %s", account.Label, resp.StatusCode, strings.TrimSpace(detail))
+		}
+
+		for _, z := range result.Result {
+			plan := compactZonePlan(z.Plan.Name)
+			out = append(out, ZoneSummary{
+				ID:               z.ID,
+				Name:             z.Name,
+				Status:           z.Status,
+				Paused:           z.Paused,
+				CreatedOn:        z.CreatedOn,
+				Plan:             plan,
+				SecurityInsights: "0",
+				UniqueVisitors:   "0",
+			})
+		}
+
+		if result.ResultInfo.TotalPages <= 0 || page >= result.ResultInfo.TotalPages {
+			break
+		}
+	}
+	c.hydrateZoneOverviewMetrics(ctx, account, out)
+	return out, nil
+}
+
+func compactZonePlan(plan string) string {
+	plan = strings.TrimSpace(plan)
+	if plan == "" {
+		return "-"
+	}
+	lower := strings.ToLower(plan)
+	switch {
+	case strings.Contains(lower, "free"):
+		return "Free"
+	case strings.Contains(lower, "pro"):
+		return "Pro"
+	case strings.Contains(lower, "business"):
+		return "Business"
+	case strings.Contains(lower, "enterprise"):
+		return "Enterprise"
+	}
+	if len(plan) > 16 {
+		return plan[:16]
+	}
+	return plan
+}
+
+func (c *apiClient) hydrateZoneOverviewMetrics(ctx context.Context, account config.CF, zones []ZoneSummary) {
+	if len(zones) == 0 {
+		return
+	}
+	metrics, err := c.fetchZoneOverviewMetrics(ctx, account, zones)
+	if err != nil {
+		log.Printf("[ListZoneSummaries] overview metrics unavailable account=%s: %v", account.Label, err)
+		return
+	}
+	for i := range zones {
+		metric, ok := metrics[zones[i].ID]
+		if !ok {
+			continue
+		}
+		zones[i].SecurityInsights = fmt.Sprintf("%d", metric.SecurityInsights)
+		zones[i].UniqueVisitors = fmt.Sprintf("%d", metric.UniqueVisitors)
+	}
+}
+
+type zoneOverviewMetric struct {
+	SecurityInsights int
+	UniqueVisitors   int
+}
+
+func (c *apiClient) fetchZoneOverviewMetrics(ctx context.Context, account config.CF, zones []ZoneSummary) (map[string]zoneOverviewMetric, error) {
+	zoneTags := make([]string, 0, len(zones))
+	for _, zone := range zones {
+		if strings.TrimSpace(zone.ID) != "" {
+			zoneTags = append(zoneTags, strings.TrimSpace(zone.ID))
+		}
+	}
+	if len(zoneTags) == 0 {
+		return nil, nil
+	}
+
+	out := make(map[string]zoneOverviewMetric, len(zoneTags))
+	for start := 0; start < len(zoneTags); start += 10 {
+		end := start + 10
+		if end > len(zoneTags) {
+			end = len(zoneTags)
+		}
+		chunkMetrics, err := c.fetchZoneOverviewMetricsChunk(ctx, account, zoneTags[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for zoneTag, metric := range chunkMetrics {
+			out[zoneTag] = metric
+		}
+	}
+	return out, nil
+}
+
+func (c *apiClient) fetchZoneOverviewMetricsChunk(ctx context.Context, account config.CF, zoneTags []string) (map[string]zoneOverviewMetric, error) {
+	end := time.Now().UTC()
+	start := end.Add(-24 * time.Hour)
+	query := `query($zoneTags: [string], $dateStart: Date, $dateEnd: Date, $dtStart: Time, $dtEnd: Time) {
+viewer {
+zones(filter: {zoneTag_in: $zoneTags}) {
+zoneTag
+httpRequests1dGroups(limit: 1, filter: {date_geq: $dateStart, date_leq: $dateEnd}) {
+uniq { uniques }
+sum { threats }
+}
+firewallEventsAdaptiveGroups(limit: 1, filter: {datetime_geq: $dtStart, datetime_leq: $dtEnd}) {
+count
+}
+}
+}
+}`
+	vars := map[string]interface{}{
+		"zoneTags":  zoneTags,
+		"dateStart": start.Format("2006-01-02"),
+		"dateEnd":   end.Format("2006-01-02"),
+		"dtStart":   start.Format(time.RFC3339),
+		"dtEnd":     end.Format(time.RFC3339),
+	}
+
+	var resp zoneOverviewGraphQLResponse
+	if err := c.doCloudflareGraphQL(ctx, account, query, vars, &resp); err != nil {
+		return nil, err
+	}
+	if len(resp.Errors) > 0 {
+		return nil, errors.New(resp.Errors[0].Message)
+	}
+
+	out := make(map[string]zoneOverviewMetric, len(resp.Data.Viewer.Zones))
+	for _, zone := range resp.Data.Viewer.Zones {
+		metric := zoneOverviewMetric{}
+		if len(zone.HTTP) > 0 {
+			metric.UniqueVisitors = zone.HTTP[0].Uniq.Uniques
+			metric.SecurityInsights = zone.HTTP[0].Sum.Threats
+		}
+		if len(zone.Firewall) > 0 && zone.Firewall[0].Count > metric.SecurityInsights {
+			metric.SecurityInsights = zone.Firewall[0].Count
+		}
+		if strings.TrimSpace(zone.ZoneTag) != "" {
+			out[zone.ZoneTag] = metric
+		}
+	}
+	return out, nil
+}
+
+func (c *apiClient) doCloudflareGraphQL(ctx context.Context, account config.CF, query string, variables map[string]interface{}, out interface{}) error {
+	body, err := json.Marshal(map[string]interface{}{
+		"query":     query,
+		"variables": variables,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.cloudflare.com/client/v4/graphql", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+account.APIToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("GraphQL HTTP %d: %s", resp.StatusCode, truncateForLog(string(respBody), 512))
+	}
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *apiClient) ApplyRecommendedSpeedSettings(ctx context.Context, account config.CF, zoneID string) []ZoneSettingResult {
+	settings := map[string]any{
+		"brotli":      "on",
+		"early_hints": "on",
+		"http2":       "on",
+		"http3":       "on",
+		"0rtt":        "on",
+		"minify":      map[string]string{"css": "on", "html": "on", "js": "on"},
+	}
+
+	status := c.EnableSpeedRecommendations(ctx, account, zoneID, settings)
+	keys := make([]string, 0, len(status))
+	for key := range status {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	results := make([]ZoneSettingResult, 0, len(keys))
+	for _, key := range keys {
+		var err error
+		if strings.HasPrefix(status[key], statusFailedPrefix) {
+			err = errors.New(strings.TrimPrefix(status[key], statusFailedPrefix))
+		}
+		results = append(results, ZoneSettingResult{Name: key, Err: err})
+	}
+	return results
+}
+
+func (c *apiClient) updateZoneSettingValueWithRetry(ctx context.Context, account config.CF, zoneID string, name string, value interface{}) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		err := c.updateZoneSettingValue(ctx, account, zoneID, name, value)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !shouldRetryCreateZone(err) || attempt == 2 {
+			break
+		}
+
+		timer := time.NewTimer(time.Duration(attempt+1) * 3 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
+}
+
+func (c *apiClient) updateZoneSettingValue(ctx context.Context, account config.CF, zoneID string, name string, value interface{}) error {
+	ctx, cancel := ensureTimeout(ctx)
+	defer cancel()
+
+	api, err := cloudflare.NewWithAPIToken(account.APIToken)
+	if err != nil {
+		return fmt.Errorf("初始化 Cloudflare 客户端失败 [%s]: %v", account.Label, err)
+	}
+
+	rc := &cloudflare.ResourceContainer{
+		Level:      cloudflare.ZoneRouteLevel,
+		Identifier: zoneID,
+	}
+
+	_, err = api.UpdateZoneSetting(ctx, rc, cloudflare.UpdateZoneSettingParams{
+		Name:  name,
+		Value: value,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %v", name, err)
+	}
+	return nil
 }
 
 func (c *apiClient) CreateOriginCertificate(ctx context.Context, account config.CF, hostnames []string) (OriginCert, error) {

@@ -7,7 +7,9 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"sort"
 	"strings"
+	"time"
 
 	"DomainC/cfclient"
 
@@ -35,7 +37,7 @@ func (h *CommandHandler) handleDNSCommand(_ string, args []string) {
 	if err != nil {
 		log.Printf("[/dns] findZone failed: q=%q err=%v", q, err)
 		if errors.Is(err, cfclient.ErrZoneNotFound) {
-			h.sendText(fmt.Sprintf("域名 %s 不属于任何 Cloudflare 账号。", q))
+			h.sendDigLikeDNSFallback(q, fmt.Sprintf("域名 %s 未在已配置的 Cloudflare 账号中找到，已执行类似 dig 的 DNS 查询。", q))
 			return
 		}
 		h.sendText(fmt.Sprintf("查询域名失败: %v", err))
@@ -53,7 +55,7 @@ func (h *CommandHandler) handleDNSCommand(_ string, args []string) {
 
 	if len(records) == 0 {
 		log.Printf("[/dns] no records: q=%q zone=%q account=%q", q, zone.Name, account.Label)
-		h.sendText(fmt.Sprintf("域名 %s 没有 DNS 记录。", q))
+		h.sendDigLikeDNSFallback(q, fmt.Sprintf("Cloudflare Zone %s 中暂未读取到 DNS 记录，已执行类似 dig 的 DNS 查询。", zone.Name))
 		return
 	}
 
@@ -66,7 +68,7 @@ func (h *CommandHandler) handleDNSCommand(_ string, args []string) {
 	log.Printf("[/dns] records: total=%d filtered=%d q=%q zone=%q", len(records), len(filtered), q, zone.Name)
 
 	if len(filtered) == 0 {
-		h.sendText(fmt.Sprintf("在 Zone %s 中没有找到与 %s 相关的 DNS 记录。", zone.Name, q))
+		h.sendDigLikeDNSFallback(q, fmt.Sprintf("在 Cloudflare Zone %s 中没有找到与 %s 相关的 DNS 记录，已执行类似 dig 的 DNS 查询。", zone.Name, q))
 		return
 	}
 
@@ -81,6 +83,153 @@ func (h *CommandHandler) handleDNSCommand(_ string, args []string) {
 			r.Type, r.Name, r.Content, proxied, r.TTL))
 	}
 	h.sendText(sb.String())
+}
+
+const dnsFallbackLookupTimeout = 10 * time.Second
+
+type digLikeDNSResult struct {
+	A      []string
+	AAAA   []string
+	CNAME  []string
+	MX     []string
+	NS     []string
+	TXT    []string
+	Errors []string
+}
+
+func (h *CommandHandler) sendDigLikeDNSFallback(host, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), dnsFallbackLookupTimeout)
+	defer cancel()
+
+	result := lookupDigLikeDNS(ctx, host)
+	h.sendText(formatDigLikeDNSFallback(host, reason, result))
+}
+
+func lookupDigLikeDNS(ctx context.Context, host string) digLikeDNSResult {
+	resolver := net.DefaultResolver
+	var result digLikeDNSResult
+
+	if ips, err := resolver.LookupIPAddr(ctx, host); err != nil {
+		appendDNSLookupError(&result, "A/AAAA", err)
+	} else {
+		for _, ip := range ips {
+			if ip.IP.To4() != nil {
+				result.A = append(result.A, ip.IP.String())
+			} else {
+				result.AAAA = append(result.AAAA, ip.IP.String())
+			}
+		}
+		sort.Strings(result.A)
+		sort.Strings(result.AAAA)
+	}
+
+	if cname, err := resolver.LookupCNAME(ctx, host); err != nil {
+		appendDNSLookupError(&result, "CNAME", err)
+	} else if cname = strings.TrimSuffix(strings.TrimSpace(cname), "."); cname != "" && !strings.EqualFold(cname, strings.TrimSuffix(host, ".")) {
+		result.CNAME = []string{cname}
+	}
+
+	if mxs, err := resolver.LookupMX(ctx, host); err != nil {
+		appendDNSLookupError(&result, "MX", err)
+	} else {
+		sort.Slice(mxs, func(i, j int) bool {
+			if mxs[i].Pref == mxs[j].Pref {
+				return mxs[i].Host < mxs[j].Host
+			}
+			return mxs[i].Pref < mxs[j].Pref
+		})
+		for _, mx := range mxs {
+			result.MX = append(result.MX, fmt.Sprintf("%d %s", mx.Pref, strings.TrimSuffix(mx.Host, ".")))
+		}
+	}
+
+	if nss, err := resolver.LookupNS(ctx, host); err != nil {
+		appendDNSLookupError(&result, "NS", err)
+	} else {
+		for _, ns := range nss {
+			result.NS = append(result.NS, strings.TrimSuffix(ns.Host, "."))
+		}
+		sort.Strings(result.NS)
+	}
+
+	if txts, err := resolver.LookupTXT(ctx, host); err != nil {
+		appendDNSLookupError(&result, "TXT", err)
+	} else {
+		for _, txt := range txts {
+			result.TXT = append(result.TXT, truncateDNSValue(txt, 500))
+		}
+		sort.Strings(result.TXT)
+	}
+
+	return result
+}
+
+func formatDigLikeDNSFallback(host, reason string, result digLikeDNSResult) string {
+	var sb strings.Builder
+	sb.WriteString(reason)
+	sb.WriteString("\n\n")
+	sb.WriteString(fmt.Sprintf("DIG 查询结果（系统 DNS）：%s\n", host))
+
+	appendDNSLookupSection(&sb, "A", result.A)
+	appendDNSLookupSection(&sb, "AAAA", result.AAAA)
+	appendDNSLookupSection(&sb, "CNAME", result.CNAME)
+	appendDNSLookupSection(&sb, "MX", result.MX)
+	appendDNSLookupSection(&sb, "NS", result.NS)
+	appendDNSLookupSection(&sb, "TXT", result.TXT)
+
+	if !result.hasRecords() {
+		sb.WriteString("\n未查询到 A/AAAA/CNAME/MX/NS/TXT 记录。\n")
+	}
+	if len(result.Errors) > 0 {
+		sb.WriteString("\n查询异常：\n")
+		for _, errText := range result.Errors {
+			sb.WriteString("- ")
+			sb.WriteString(errText)
+			sb.WriteString("\n")
+		}
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+func (r digLikeDNSResult) hasRecords() bool {
+	return len(r.A)+len(r.AAAA)+len(r.CNAME)+len(r.MX)+len(r.NS)+len(r.TXT) > 0
+}
+
+func appendDNSLookupSection(sb *strings.Builder, title string, values []string) {
+	if len(values) == 0 {
+		return
+	}
+	sb.WriteString("\n")
+	sb.WriteString(title)
+	sb.WriteString(":\n")
+	for _, value := range values {
+		sb.WriteString("- ")
+		sb.WriteString(value)
+		sb.WriteString("\n")
+	}
+}
+
+func appendDNSLookupError(result *digLikeDNSResult, recordType string, err error) {
+	if err == nil {
+		return
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		result.Errors = append(result.Errors, fmt.Sprintf("%s: 查询超时", recordType))
+		return
+	}
+	result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", recordType, err))
+}
+
+func truncateDNSValue(value string, maxRunes int) string {
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 // extractDomainOrHost 从用户输入中提取“可用于查 Cloudflare zone 的 host/domain”。
